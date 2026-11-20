@@ -302,10 +302,11 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
     let mut out = String::new();
     if html {
         out.push_str(concat!(
-            "<!doctype html>\n<meta charset=\"utf-8\">\n<style>\n",
-            "article { overflow-wrap: break-word; print-color-adjust: exact; -webkit-print-color-adjust: exact; }\n",
-            "article table { border-collapse: collapse; max-width: 100%; margin-block: 0.5em; }\n",
-            "article td, article th { border: 1px solid #a0a0a0; padding: 0.25em 0.45em; vertical-align: top; white-space: pre-wrap; }\n",
+            "<!doctype html>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<style>\n",
+            "article { box-sizing: border-box; max-width: 76rem; margin-inline: auto; padding: 1.25rem; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 18px; line-height: 1.65; overflow-wrap: break-word; print-color-adjust: exact; -webkit-print-color-adjust: exact; }\n",
+            "article span[style*=\"font-size\"] { zoom: 1.2; }\n",
+            "article table { border-collapse: collapse; max-width: 100%; margin-block: 0.5em; font: inherit; }\n",
+            "article td, article th { border: 1px solid #a0a0a0; padding: 0.3em 0.5em; vertical-align: top; white-space: pre-wrap; }\n",
             "article .source-borders > tbody > tr > :is(td, th) { border: none; }\n",
             "article td > :first-child { margin-top: 0; }\n",
             "article td > :last-child { margin-bottom: 0; }\n",
@@ -338,7 +339,10 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         }
         if let Some(number) = slide_number {
             if html {
-                writeln!(out, "<p class=\"slide-number\"><strong>Slide {number}</strong></p>")?;
+                writeln!(
+                    out,
+                    "<p class=\"slide-number\"><strong>Slide {number}</strong></p>"
+                )?;
             } else {
                 writeln!(out, "**Slide {number}**\n")?;
             }

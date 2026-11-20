@@ -11,6 +11,7 @@ pub(super) struct Fragment {
     pub runs: Vec<Run>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct HorizontalRule {
     pub left: f32,
     pub right: f32,
@@ -18,6 +19,23 @@ pub(super) struct HorizontalRule {
     pub width: f32,
     pub color: [u8; 3],
     pub style: &'static str,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct VerticalRule {
+    pub x: f32,
+    pub bottom: f32,
+    pub top: f32,
+    pub width: f32,
+    pub color: [u8; 3],
+    pub style: &'static str,
+}
+
+impl VerticalRule {
+    fn border(&self) -> String {
+        let [r, g, b] = self.color;
+        format!("{}pt {} #{r:02X}{g:02X}{b:02X}", self.width, self.style)
+    }
 }
 
 impl HorizontalRule {
@@ -639,6 +657,550 @@ fn ruled_tables(bands: &mut [Vec<Fragment>], rules: &[HorizontalRule]) -> Vec<It
     tables
 }
 
+#[derive(Clone)]
+struct HorizontalLevel {
+    y: f32,
+    segments: Vec<(f32, f32)>,
+    border: String,
+}
+
+#[derive(Clone)]
+struct VerticalSegment {
+    x: f32,
+    bottom: f32,
+    top: f32,
+    border: String,
+}
+
+fn horizontal_levels(rules: &[HorizontalRule]) -> Vec<HorizontalLevel> {
+    let mut sorted = rules.to_vec();
+    sorted.sort_by(|a, b| b.y.total_cmp(&a.y));
+    let mut levels: Vec<(f32, Vec<&HorizontalRule>)> = Vec::new();
+    for rule in &sorted {
+        if let Some((y, items)) = levels.last_mut()
+            && (*y - rule.y).abs() <= 1.5
+        {
+            *y = (*y + rule.y) * 0.5;
+            items.push(rule);
+        } else {
+            levels.push((rule.y, vec![rule]));
+        }
+    }
+    levels
+        .into_iter()
+        .map(|(y, items)| {
+            let mut segments: Vec<_> = items.iter().map(|r| (r.left, r.right)).collect();
+            segments.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut merged: Vec<(f32, f32)> = Vec::new();
+            for (left, right) in segments {
+                if let Some(last) = merged.last_mut()
+                    && left <= last.1 + 2.5
+                {
+                    last.1 = last.1.max(right);
+                } else {
+                    merged.push((left, right));
+                }
+            }
+            HorizontalLevel {
+                y,
+                segments: merged,
+                border: items[0].border(),
+            }
+        })
+        .collect()
+}
+
+fn vertical_segments(rules: &[VerticalRule]) -> Vec<VerticalSegment> {
+    let mut sorted = rules.to_vec();
+    sorted.sort_by(|a, b| a.x.total_cmp(&b.x));
+    let mut columns: Vec<(f32, Vec<&VerticalRule>)> = Vec::new();
+    for rule in &sorted {
+        if let Some((x, items)) = columns.last_mut()
+            && (*x - rule.x).abs() <= 1.5
+        {
+            *x = (*x + rule.x) * 0.5;
+            items.push(rule);
+        } else {
+            columns.push((rule.x, vec![rule]));
+        }
+    }
+    let mut segments = Vec::new();
+    for (x, items) in columns {
+        let mut intervals: Vec<_> = items
+            .iter()
+            .map(|r| (r.bottom, r.top, r.border()))
+            .collect();
+        intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut merged: Vec<(f32, f32, String)> = Vec::new();
+        for (bottom, top, border) in intervals {
+            if let Some(last) = merged.last_mut()
+                && bottom <= last.1 + 2.5
+            {
+                last.1 = last.1.max(top);
+            } else {
+                merged.push((bottom, top, border));
+            }
+        }
+        segments.extend(
+            merged
+                .into_iter()
+                .map(|(bottom, top, border)| VerticalSegment {
+                    x,
+                    bottom,
+                    top,
+                    border,
+                }),
+        );
+    }
+    segments
+}
+
+fn interval_covers(intervals: &[(f32, f32)], left: f32, right: f32, tolerance: f32) -> bool {
+    let mut intervals = intervals.to_vec();
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut covered = left;
+    let end = right;
+    for (start, finish) in intervals {
+        if finish < covered - tolerance {
+            continue;
+        }
+        if start > covered + tolerance {
+            return false;
+        }
+        covered = covered.max(finish);
+        if covered >= end - tolerance {
+            return true;
+        }
+    }
+    covered >= end - tolerance
+}
+
+fn horizontal_edge(levels: &[HorizontalLevel], y: f32, left: f32, right: f32) -> Option<String> {
+    levels.iter().find_map(|level| {
+        ((level.y - y).abs() <= 1.5 && interval_covers(&level.segments, left, right, 1.5))
+            .then(|| level.border.clone())
+    })
+}
+
+fn vertical_edge(segments: &[VerticalSegment], x: f32, bottom: f32, top: f32) -> Option<String> {
+    segments.iter().find_map(|segment| {
+        ((segment.x - x).abs() <= 1.5
+            && interval_covers(&[(segment.bottom, segment.top)], bottom, top, 1.5))
+        .then(|| segment.border.clone())
+    })
+}
+
+fn root(parent: &mut [usize], mut node: usize) -> usize {
+    while parent[node] != node {
+        parent[node] = parent[parent[node]];
+        node = parent[node];
+    }
+    node
+}
+
+fn join(parent: &mut [usize], a: usize, b: usize) {
+    let (a, b) = (root(parent, a), root(parent, b));
+    if a != b {
+        parent[b] = a;
+    }
+}
+
+fn grid_components(
+    horizontal: &[HorizontalLevel],
+    vertical: &[VerticalSegment],
+) -> Vec<(Vec<usize>, Vec<usize>)> {
+    let mut parent: Vec<_> = (0..horizontal.len() + vertical.len()).collect();
+    for (j, segment) in vertical.iter().enumerate() {
+        let first = horizontal.partition_point(|line| line.y > segment.top + 2.);
+        let last = horizontal.partition_point(|line| line.y >= segment.bottom - 2.);
+        for i in first..last {
+            let level = &horizontal[i];
+            let crosses_x = level
+                .segments
+                .iter()
+                .any(|(left, right)| segment.x >= left - 2. && segment.x <= right + 2.);
+            let crosses_y = level.y >= segment.bottom - 2. && level.y <= segment.top + 2.;
+            if crosses_x && crosses_y {
+                join(&mut parent, i, horizontal.len() + j);
+            }
+        }
+    }
+    let mut components = BTreeMap::<usize, (Vec<usize>, Vec<usize>)>::new();
+    for i in 0..horizontal.len() {
+        let key = root(&mut parent, i);
+        components.entry(key).or_default().0.push(i);
+    }
+    for j in 0..vertical.len() {
+        let key = root(&mut parent, horizontal.len() + j);
+        components.entry(key).or_default().1.push(j);
+    }
+    components
+        .into_values()
+        .filter(|(h, v)| h.len() >= 2 && !v.is_empty())
+        .collect()
+}
+
+fn fragment_cell(mut fragments: Vec<Fragment>) -> Cell {
+    fragments.sort_by(|a, b| b.y.total_cmp(&a.y).then_with(|| a.x.total_cmp(&b.x)));
+    let mut lines: Vec<Vec<Fragment>> = Vec::new();
+    for fragment in fragments {
+        if let Some(line) = lines.last_mut()
+            && line[0].y - fragment.y <= 1.15
+        {
+            line.push(fragment);
+        } else {
+            lines.push(vec![fragment]);
+        }
+    }
+    for line in &mut lines {
+        line.sort_by(|a, b| a.x.total_cmp(&b.x));
+    }
+    let fragments: Vec<_> = lines.into_iter().flatten().collect();
+    let Some(first) = fragments.first() else {
+        return Cell::default();
+    };
+    let position = coordinates(first.x, first.y);
+    let mut runs = Vec::new();
+    let mut previous_y = None;
+    let mut previous_hyphen = false;
+    for mut fragment in fragments {
+        clean_line(&mut fragment.runs);
+        if runs.is_empty() {
+            runs = fragment.runs;
+        } else {
+            let korean_continuation =
+                last_korean_syllable(&runs) && single_korean_syllable(&fragment.runs);
+            if korean_continuation {
+                join_runs(&mut runs, fragment.runs, false);
+            } else if previous_y.is_some_and(|y: f32| (y - fragment.y).abs() <= 1.15) {
+                join_runs(&mut runs, fragment.runs, true);
+            } else {
+                join_wrapped_line(&mut runs, fragment.runs, previous_hyphen);
+            }
+        }
+        previous_y = Some(fragment.y);
+        previous_hyphen = fragment.discretionary_hyphen;
+    }
+    Cell {
+        runs,
+        properties: position,
+        ..Cell::default()
+    }
+}
+
+fn last_korean_syllable(runs: &[Run]) -> bool {
+    runs.iter()
+        .rev()
+        .filter_map(|run| run.text.trim_end().chars().next_back())
+        .next()
+        .is_some_and(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c))
+}
+
+fn single_korean_syllable(runs: &[Run]) -> bool {
+    let text: String = runs.iter().map(|run| run.text.as_str()).collect();
+    let mut chars = text.trim().chars();
+    chars
+        .next()
+        .is_some_and(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c))
+        && chars.next().is_none()
+}
+
+fn split_runs_at(runs: Vec<Run>, char_index: usize) -> Option<(Vec<Run>, Vec<Run>)> {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut remaining = char_index;
+    for run in runs {
+        if run.image.is_some() || run.mathml.is_some() {
+            return None;
+        }
+        let count = run.text.chars().count();
+        if remaining >= count {
+            if !run.text.is_empty() {
+                remaining -= count;
+                left.push(run);
+            }
+        } else if remaining == 0 {
+            right.push(run);
+        } else {
+            let byte_index = run
+                .text
+                .char_indices()
+                .nth(remaining)
+                .map(|(index, _)| index)
+                .unwrap_or(run.text.len());
+            let mut before = run.clone();
+            before.text = run.text[..byte_index].to_owned();
+            let mut after = run;
+            after.text = after.text[byte_index..].to_owned();
+            if !before.text.is_empty() {
+                left.push(before);
+            }
+            if !after.text.is_empty() {
+                right.push(after);
+            }
+            remaining = 0;
+        }
+    }
+    (remaining == 0 && !left.is_empty() && !right.is_empty()).then_some((left, right))
+}
+
+fn split_fragment_at(fragment: Fragment, boundary: f32) -> Vec<Fragment> {
+    let width = fragment.end - fragment.x;
+    if !fragment.horizontal || boundary <= fragment.x + 1. || boundary >= fragment.end - 1. {
+        return vec![fragment];
+    }
+    let chars: Vec<_> = fragment
+        .runs
+        .iter()
+        .flat_map(|run| run.text.chars())
+        .collect();
+    if chars.len() < 3 {
+        return vec![fragment];
+    }
+    let weights: Vec<_> = chars
+        .iter()
+        .map(|&c| approximate_width(&c.to_string()))
+        .collect();
+    let total: f32 = weights.iter().sum();
+    if total <= 0. {
+        return vec![fragment];
+    }
+    let target = total * ((boundary - fragment.x) / width).clamp(0., 1.);
+    let mut cumulative = 0.;
+    let mut split = None;
+    let mut distance = f32::INFINITY;
+    for index in 1..chars.len() {
+        cumulative += weights[index - 1];
+        if chars[index - 1].is_whitespace() || chars[index].is_whitespace() {
+            let current = (cumulative - target).abs();
+            if current < distance {
+                distance = current;
+                split = Some(index);
+            }
+        }
+    }
+    if distance > (total * 0.18).max(1.25) {
+        return vec![fragment];
+    }
+    let Some((left_runs, right_runs)) = split.and_then(|i| split_runs_at(fragment.runs.clone(), i))
+    else {
+        return vec![fragment];
+    };
+    let right = Fragment {
+        x: boundary,
+        end: fragment.end,
+        y: fragment.y,
+        size: fragment.size,
+        horizontal: fragment.horizontal,
+        discretionary_hyphen: fragment.discretionary_hyphen,
+        runs: right_runs,
+    };
+    let left = Fragment {
+        x: fragment.x,
+        end: boundary,
+        y: fragment.y,
+        size: fragment.size,
+        horizontal: fragment.horizontal,
+        discretionary_hyphen: fragment.discretionary_hyphen,
+        runs: left_runs,
+    };
+    vec![left, right]
+}
+
+fn grid_tables(
+    bands: &mut [Vec<Fragment>],
+    rules: &[HorizontalRule],
+    vertical_rules: &[VerticalRule],
+) -> Vec<Item> {
+    let horizontal = horizontal_levels(rules);
+    let vertical = vertical_segments(vertical_rules);
+    let components = grid_components(&horizontal, &vertical);
+    let mut tables = Vec::new();
+    for (horizontal_ids, vertical_ids) in components {
+        let component_horizontal: Vec<_> = horizontal_ids
+            .iter()
+            .map(|&i| horizontal[i].clone())
+            .collect();
+        let component_vertical: Vec<_> =
+            vertical_ids.iter().map(|&i| vertical[i].clone()).collect();
+        let mut levels: Vec<_> = horizontal_ids.iter().map(|&i| &horizontal[i]).collect();
+        levels.sort_by(|a, b| b.y.total_cmp(&a.y));
+        let mut y_edges = Vec::new();
+        for level in levels {
+            if y_edges
+                .last()
+                .is_none_or(|y: &f32| (*y - level.y).abs() > 1.5)
+            {
+                y_edges.push(level.y);
+            }
+        }
+        let mut x_edges: Vec<_> = horizontal_ids
+            .iter()
+            .flat_map(|&i| horizontal[i].segments.iter().flat_map(|(a, b)| [*a, *b]))
+            .chain(vertical_ids.iter().map(|&i| vertical[i].x))
+            .collect();
+        x_edges.sort_by(f32::total_cmp);
+        x_edges.dedup_by(|a, b| (*a - *b).abs() <= 1.5);
+        if x_edges.len() < 3 || y_edges.len() < 2 {
+            continue;
+        }
+        let (left, right) = (x_edges[0], *x_edges.last().unwrap());
+        let (top, bottom) = (y_edges[0], *y_edges.last().unwrap());
+        if right - left < 30. || top - bottom < 8. {
+            continue;
+        }
+        let columns = x_edges.len() - 1;
+        let row_count = y_edges.len() - 1;
+        if columns == 0
+            || row_count == 0
+            || columns.saturating_mul(row_count) > crate::model::CELL_LIMIT
+            || vertical_ids
+                .iter()
+                .filter(|&&i| {
+                    let line = &vertical[i];
+                    line.x > left + 2.
+                        && line.x < right - 2.
+                        && line.top - line.bottom >= (top - bottom) * 0.2
+                })
+                .count()
+                == 0
+        {
+            continue;
+        }
+
+        let mut contents: Vec<Vec<Vec<Fragment>>> = (0..row_count)
+            .map(|_| (0..columns).map(|_| Vec::new()).collect())
+            .collect();
+        for band in bands.iter_mut() {
+            let mut remaining = Vec::new();
+            for fragment in std::mem::take(band) {
+                let Some(row) = (0..row_count).find(|&row| {
+                    fragment.y <= y_edges[row] + 2. && fragment.y >= y_edges[row + 1] - 2.
+                }) else {
+                    remaining.push(fragment);
+                    continue;
+                };
+                let split_edges: Vec<_> = (1..columns)
+                    .filter_map(|column| {
+                        vertical_edge(
+                            &component_vertical,
+                            x_edges[column],
+                            y_edges[row + 1],
+                            y_edges[row],
+                        )
+                        .map(|_| x_edges[column])
+                    })
+                    .collect();
+                let fragments = split_edges.into_iter().fold(vec![fragment], |parts, edge| {
+                    parts
+                        .into_iter()
+                        .flat_map(|fragment| split_fragment_at(fragment, edge))
+                        .collect()
+                });
+                for fragment in fragments {
+                    let x = (fragment.x + fragment.end) * 0.5;
+                    if let Some(column) = (0..columns)
+                        .find(|&column| x >= x_edges[column] - 1. && x <= x_edges[column + 1] + 1.)
+                    {
+                        contents[row][column].push(fragment);
+                    } else {
+                        remaining.push(fragment);
+                    }
+                }
+            }
+            *band = remaining;
+        }
+
+        let mut occupied = vec![vec![false; columns]; row_count];
+        let mut rows = Vec::new();
+        for row in 0..row_count {
+            let mut cells = Vec::new();
+            for column in 0..columns {
+                if occupied[row][column] {
+                    continue;
+                }
+                let mut end_column = column + 1;
+                while end_column < columns
+                    && vertical_edge(
+                        &component_vertical,
+                        x_edges[end_column],
+                        y_edges[row + 1],
+                        y_edges[row],
+                    )
+                    .is_none()
+                {
+                    end_column += 1;
+                }
+                let mut end_row = row + 1;
+                while end_row < row_count
+                    && (column..end_column).all(|col| {
+                        horizontal_edge(
+                            &component_horizontal,
+                            y_edges[end_row],
+                            x_edges[col],
+                            x_edges[col + 1],
+                        )
+                        .is_none()
+                    })
+                {
+                    end_row += 1;
+                }
+                let mut fragments = Vec::new();
+                for row_index in row..end_row {
+                    for column_index in column..end_column {
+                        occupied[row_index][column_index] = true;
+                        fragments.append(&mut contents[row_index][column_index]);
+                    }
+                }
+                let mut cell = fragment_cell(fragments);
+                if end_column - column > 1 {
+                    cell.colspan = Some(end_column - column);
+                }
+                if end_row - row > 1 {
+                    cell.rowspan = Some(end_row - row);
+                }
+                let cell_left = x_edges[column];
+                let cell_right = x_edges[end_column];
+                let cell_top = y_edges[row];
+                let cell_bottom = y_edges[end_row];
+                if let Some(border) =
+                    horizontal_edge(&component_horizontal, cell_top, cell_left, cell_right)
+                {
+                    cell.properties.insert("border-top".into(), border);
+                }
+                if let Some(border) =
+                    horizontal_edge(&component_horizontal, cell_bottom, cell_left, cell_right)
+                {
+                    cell.properties.insert("border-bottom".into(), border);
+                }
+                if let Some(border) =
+                    vertical_edge(&component_vertical, cell_left, cell_bottom, cell_top)
+                {
+                    cell.properties.insert("border-left".into(), border);
+                }
+                if let Some(border) =
+                    vertical_edge(&component_vertical, cell_right, cell_bottom, cell_top)
+                {
+                    cell.properties.insert("border-right".into(), border);
+                }
+                cells.push(cell);
+            }
+            rows.push(cells);
+        }
+        tables.push(Item {
+            x: left,
+            end: right,
+            y: top,
+            content: Content::Table {
+                prefix: Vec::new(),
+                rows,
+                suffix: Vec::new(),
+            },
+        });
+    }
+    tables
+}
+
 // Some PDFs draw each column's horizontal border separately. Repeated sets
 // of touching segments give us both the table bounds and the column edges.
 fn segmented_tables(
@@ -776,6 +1338,198 @@ fn segmented_table(
             suffix: Vec::new(),
         },
     })
+}
+
+fn fragment_text(fragment: &Fragment) -> String {
+    fragment.runs.iter().map(|run| run.text.as_str()).collect()
+}
+
+fn numeric_value(fragment: &Fragment) -> bool {
+    let text = fragment_text(fragment);
+    let text = text.trim();
+    text.chars().any(char::is_numeric)
+        && text.chars().all(|c| {
+            c.is_numeric()
+                || matches!(
+                    c,
+                    ',' | '.'
+                        | ' '
+                        | '\u{3000}'
+                        | '円'
+                        | '¥'
+                        | '￥'
+                        | '$'
+                        | '€'
+                        | '£'
+                        | '₩'
+                        | '('
+                        | ')'
+                        | '+'
+                        | '-'
+                        | '−'
+                        | '%'
+                )
+        })
+}
+
+fn origin_clusters(fragments: &[&Fragment], tolerance: f32) -> Vec<(f32, usize)> {
+    let mut positions: Vec<_> = fragments.iter().map(|f| f.x).collect();
+    positions.sort_by(f32::total_cmp);
+    let mut clusters: Vec<(f32, usize)> = Vec::new();
+    for x in positions {
+        if let Some((center, count)) = clusters.last_mut()
+            && (x - *center).abs() <= tolerance
+        {
+            *center = (*center * *count as f32 + x) / (*count + 1) as f32;
+            *count += 1;
+        } else {
+            clusters.push((x, 1));
+        }
+    }
+    clusters
+}
+
+fn value_clusters(fragments: &[&Fragment], tolerance: f32) -> Vec<(f32, usize)> {
+    let mut positions: Vec<_> = fragments.iter().map(|f| f.end).collect();
+    positions.sort_by(f32::total_cmp);
+    let mut clusters: Vec<(f32, usize)> = Vec::new();
+    for x in positions {
+        if let Some((center, count)) = clusters.last_mut()
+            && (x - *center).abs() <= tolerance
+        {
+            *center = (*center * *count as f32 + x) / (*count + 1) as f32;
+            *count += 1;
+        } else {
+            clusters.push((x, 1));
+        }
+    }
+    clusters
+}
+
+fn table_row_from_band(band: &mut Vec<Fragment>, labels: [f32; 2], values: [f32; 2]) -> Vec<Cell> {
+    let mut columns: [Vec<Fragment>; 4] = std::array::from_fn(|_| Vec::new());
+    for fragment in std::mem::take(band) {
+        let column = if numeric_value(&fragment) {
+            1 + usize::from((fragment.end - values[1]).abs() < (fragment.end - values[0]).abs()) * 2
+        } else {
+            usize::from((fragment.x - labels[1]).abs() < (fragment.x - labels[0]).abs()) * 2
+        };
+        columns[column].push(fragment);
+    }
+    columns.into_iter().map(fragment_cell).collect()
+}
+
+fn parallel_value_tables(bands: &mut [Vec<Fragment>]) -> Vec<Item> {
+    let value_fragments: Vec<_> = bands
+        .iter()
+        .flatten()
+        .filter(|f| numeric_value(f))
+        .collect();
+    if value_fragments.len() < 6 {
+        return Vec::new();
+    }
+    let mut value_groups: Vec<_> = value_clusters(&value_fragments, 18.)
+        .into_iter()
+        .filter(|(_, count)| *count >= 3)
+        .collect();
+    value_groups.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    value_groups.truncate(2);
+    if value_groups.len() != 2 || (value_groups[0].0 - value_groups[1].0).abs() < 50. {
+        return Vec::new();
+    }
+    value_groups.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let value_edges = [value_groups[0].0, value_groups[1].0];
+
+    let labels: Vec<_> = bands
+        .iter()
+        .flatten()
+        .filter(|f| !numeric_value(f))
+        .collect();
+    let mut label_groups: Vec<_> = origin_clusters(&labels, 8.)
+        .into_iter()
+        .filter(|(_, count)| *count >= 4)
+        .collect();
+    label_groups.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    label_groups.truncate(2);
+    if label_groups.len() != 2 || (label_groups[0].0 - label_groups[1].0).abs() < 60. {
+        return Vec::new();
+    }
+    label_groups.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let label_edges = [label_groups[0].0, label_groups[1].0];
+
+    let mut sizes: Vec<_> = value_fragments.iter().map(|f| f.size).collect();
+    sizes.sort_by(f32::total_cmp);
+    let value_size = sizes[sizes.len() / 2];
+    let mut headings = Vec::new();
+    let mut value_rows = Vec::new();
+    for (i, band) in bands.iter().enumerate() {
+        let has_value = band.iter().any(|f| {
+            numeric_value(f) && value_edges.iter().any(|edge| (f.end - edge).abs() <= 18.)
+        });
+        if has_value {
+            value_rows.push(i);
+            continue;
+        }
+        let left = band.iter().any(|f| {
+            !numeric_value(f) && f.size >= value_size * 1.2 && (f.x - label_edges[0]).abs() <= 8.
+        });
+        let right = band.iter().any(|f| {
+            !numeric_value(f) && f.size >= value_size * 1.2 && (f.x - label_edges[1]).abs() <= 8.
+        });
+        if left && right {
+            headings.push(i);
+        }
+    }
+    if headings.is_empty() {
+        return Vec::new();
+    }
+    let band_y: Vec<_> = bands
+        .iter()
+        .map(|band| band.first().map_or(f32::NAN, |f| f.y))
+        .collect();
+    headings.sort_by(|a, b| band_y[*b].total_cmp(&band_y[*a]));
+    value_rows.sort_by(|a, b| band_y[*b].total_cmp(&band_y[*a]));
+
+    let mut tables = Vec::new();
+    for (index, &heading) in headings.iter().enumerate() {
+        let top = band_y[heading];
+        let bottom = headings
+            .get(index + 1)
+            .map(|&i| band_y[i])
+            .unwrap_or(f32::NEG_INFINITY);
+        let rows_for_table: Vec<_> = value_rows
+            .iter()
+            .copied()
+            .filter(|&i| band_y[i] < top && band_y[i] > bottom)
+            .collect();
+        if rows_for_table.len() < 2 {
+            continue;
+        }
+        let y = band_y[heading];
+        let mut rows = vec![table_row_from_band(
+            &mut bands[heading],
+            label_edges,
+            value_edges,
+        )];
+        for row in rows_for_table {
+            rows.push(table_row_from_band(
+                &mut bands[row],
+                label_edges,
+                value_edges,
+            ));
+        }
+        tables.push(Item {
+            x: label_edges[0],
+            end: value_edges[1],
+            y,
+            content: Content::Table {
+                prefix: Vec::new(),
+                rows,
+                suffix: Vec::new(),
+            },
+        });
+    }
+    tables
 }
 
 fn page_items(bands: Vec<Vec<Fragment>>, rules: &[HorizontalRule]) -> Vec<Item> {
@@ -1156,7 +1910,12 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
     }
 }
 
-pub(super) fn layout(mut pieces: Vec<Fragment>, mut rules: Vec<HorizontalRule>, sec: &mut Section) {
+pub(super) fn layout(
+    mut pieces: Vec<Fragment>,
+    mut rules: Vec<HorizontalRule>,
+    verticals: Vec<VerticalRule>,
+    sec: &mut Section,
+) {
     pieces.retain(|f| {
         f.runs
             .iter()
@@ -1166,7 +1925,11 @@ pub(super) fn layout(mut pieces: Vec<Fragment>, mut rules: Vec<HorizontalRule>, 
     attach_labels(&mut bands);
     bands.retain(|band| !band.is_empty());
     rules.sort_by(|a, b| b.y.total_cmp(&a.y));
-    let mut items = ruled_tables(&mut bands, &rules);
+    let mut items = grid_tables(&mut bands, &rules, &verticals);
+    bands.retain(|band| !band.is_empty());
+    items.extend(parallel_value_tables(&mut bands));
+    bands.retain(|band| !band.is_empty());
+    items.extend(ruled_tables(&mut bands, &rules));
     items.extend(page_items(bands, &rules));
     items.sort_by(|a, b| b.y.total_cmp(&a.y).then_with(|| a.x.total_cmp(&b.x)));
     // Separate isolated running headers and page numbers from the column flow.

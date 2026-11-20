@@ -107,7 +107,7 @@ The shared model in `src/model.rs` stores documents, sections, paragraphs, text 
 | Input file | Regular files up to 256 MiB. Format identified by signature and internal structure |
 | ZIP | Up to 32,768 entries, 512 MiB each for the declared total uncompressed size and for cumulative reads, up to 64 MiB per entry read |
 | XML and RTF | XML tree depth and RTF group depth of 128, 1.5 million nodes per XML part. No external entity resolution and no macro execution |
-| Tables | A 250,000-cell threshold applies to XML tables or spreadsheet expansion. Repeated data has separate byte limits |
+| Tables | A 250,000-cell threshold applies to XML tables, spreadsheet expansion, and recovered PDF grids. Repeated data has separate byte limits |
 | PDF | Stream and page decoding limits, Form nesting and cycle checks, total content budget |
 | MCP | Request frames of 1 MiB. The default access scope is the configured root and can be widened at server start with `--allow-outside-root` |
 

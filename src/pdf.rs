@@ -27,7 +27,7 @@ impl Matrix {
     }
 }
 mod layout;
-use layout::{Fragment, HorizontalRule, approximate_width, layout};
+use layout::{Fragment, HorizontalRule, VerticalRule, approximate_width, layout};
 
 const PDF_RULE_LIMIT: usize = 4096;
 const TRACKED_GLYPH_LIMIT: usize = 65536;
@@ -76,6 +76,102 @@ fn resolve_object<'a>(pdf: &'a Pdf, obj: &'a Object) -> Option<&'a Object> {
     match obj {
         Object::Reference(id) => pdf.get_object(*id).ok(),
         _ => Some(obj),
+    }
+}
+
+fn thin_rectangle(points: &[(f32, f32)]) -> Option<(f32, f32, f32, f32)> {
+    if points.len() != 4 {
+        return None;
+    }
+    let (left, right) = points
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |b, p| {
+            (b.0.min(p.0), b.1.max(p.0))
+        });
+    let (bottom, top) = points
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |b, p| {
+            (b.0.min(p.1), b.1.max(p.1))
+        });
+    if !left.is_finite() || !bottom.is_finite() || right - left <= 0. || top - bottom <= 0. {
+        return None;
+    }
+    let mut corners = 0u8;
+    for &(x, y) in points {
+        let column = if (x - left).abs() <= 0.5 {
+            0
+        } else if (x - right).abs() <= 0.5 {
+            1
+        } else {
+            return None;
+        };
+        let row = if (y - bottom).abs() <= 0.5 {
+            0
+        } else if (y - top).abs() <= 0.5 {
+            1
+        } else {
+            return None;
+        };
+        let corner = 1 << (row * 2 + column);
+        if corners & corner != 0 {
+            return None;
+        }
+        corners |= corner;
+    }
+    if corners != 0b1111 {
+        return None;
+    }
+    let width = right - left;
+    let height = top - bottom;
+    ((width >= 8. && height <= 2.5) || (height >= 8. && width <= 2.5))
+        .then_some((left, right, bottom, top))
+}
+
+fn filled_path_rules(
+    shapes: &[Vec<(f32, f32)>],
+    stroke: Stroke,
+    rules: &mut Vec<HorizontalRule>,
+    verticals: &mut Vec<VerticalRule>,
+) {
+    for points in shapes {
+        let Some((left, right, bottom, top)) = thin_rectangle(points) else {
+            continue;
+        };
+        if rules.len() + verticals.len() >= PDF_RULE_LIMIT {
+            break;
+        }
+        let (width, height) = (right - left, top - bottom);
+        let thickness = width.min(height).clamp(0.25, 100.);
+        if height <= 2.5 {
+            rules.push(HorizontalRule {
+                left,
+                right,
+                y: (bottom + top) * 0.5,
+                width: thickness,
+                color: stroke.color,
+                style: "solid",
+            });
+        } else {
+            verticals.push(VerticalRule {
+                x: (left + right) * 0.5,
+                bottom,
+                top,
+                width: thickness,
+                color: stroke.color,
+                style: "solid",
+            });
+        }
+    }
+}
+
+fn finish_path_shape(shape: &mut Vec<(f32, f32)>, shapes: &mut Vec<Vec<(f32, f32)>>) {
+    if shape.is_empty() {
+        return;
+    }
+    if shape.len() <= 4 && shapes.len() < PDF_RULE_LIMIT {
+        shapes.push(std::mem::take(shape));
+    } else {
+        shape.clear();
     }
 }
 
@@ -352,6 +448,7 @@ struct PageReader<'a> {
     total: &'a mut usize,
     fragments: Vec<Fragment>,
     rules: Vec<HorizontalRule>,
+    verticals: Vec<VerticalRule>,
     active: Vec<lopdf::ObjectId>,
 }
 impl PageReader<'_> {
@@ -397,6 +494,9 @@ impl PageReader<'_> {
         let mut state = TextState::default();
         let mut path_point: Option<(f32, f32)> = None;
         let mut path_rules = Vec::new();
+        let mut path_vertical_rules = Vec::new();
+        let mut path_shape = Vec::new();
+        let mut path_shapes = Vec::<Vec<(f32, f32)>>::new();
         let mut marked_spans = Vec::new();
 
         let mut moved = true;
@@ -476,37 +576,101 @@ impl PageReader<'_> {
                 }
                 "m" | "l" => {
                     let next = num(0).ok().zip(num(1).ok()).map(|(x, y)| ctm.point(x, y));
+                    if op.operator == "m" {
+                        finish_path_shape(&mut path_shape, &mut path_shapes);
+                    }
                     if op.operator == "l"
-                        && path_rules.len() + self.rules.len() < PDF_RULE_LIMIT
+                        && path_rules.len()
+                            + path_vertical_rules.len()
+                            + self.rules.len()
+                            + self.verticals.len()
+                            < PDF_RULE_LIMIT
                         && let (Some((x, y)), Some((end, end_y))) = (path_point, next)
                         && x.is_finite()
                         && end.is_finite()
-                        && (y - end_y).abs() <= 0.5
-                        && (x - end).abs() >= 10.
                     {
-                        path_rules.push((x.min(end), x.max(end), y));
+                        if (y - end_y).abs() <= 0.5 && (x - end).abs() >= 10. {
+                            path_rules.push((x.min(end), x.max(end), y));
+                        } else if (x - end).abs() <= 0.5 && (y - end_y).abs() >= 10. {
+                            path_vertical_rules.push((x, y.min(end_y), y.max(end_y)));
+                        }
+                    }
+                    if let Some(point) = next {
+                        if path_shape.len() <= 4 {
+                            path_shape.push(point);
+                        }
                     }
                     path_point = next;
                 }
-                "c" | "v" | "y" | "h" | "re" => path_point = None,
+                "h" => {
+                    finish_path_shape(&mut path_shape, &mut path_shapes);
+                    path_point = None;
+                }
+                "re" => {
+                    finish_path_shape(&mut path_shape, &mut path_shapes);
+                    if let (Ok(x), Ok(y), Ok(w), Ok(h)) = (num(0), num(1), num(2), num(3)) {
+                        if path_shapes.len() < PDF_RULE_LIMIT {
+                            path_shapes.push(vec![
+                                ctm.point(x, y),
+                                ctm.point(x + w, y),
+                                ctm.point(x + w, y + h),
+                                ctm.point(x, y + h),
+                            ]);
+                        }
+                    }
+                    path_point = None;
+                }
+                "c" | "v" | "y" => {
+                    finish_path_shape(&mut path_shape, &mut path_shapes);
+                    path_point = None;
+                }
                 "S" | "s" | "B" | "B*" | "b" | "b*" => {
-                    let remaining = PDF_RULE_LIMIT - self.rules.len();
-                    let scale = ctm.0[2].hypot(ctm.0[3]);
-                    let width = (stroke.width * scale).clamp(0.25, 100.);
-                    self.rules.extend(path_rules.drain(..).take(remaining).map(
-                        |(left, right, y)| HorizontalRule {
+                    finish_path_shape(&mut path_shape, &mut path_shapes);
+                    filled_path_rules(&path_shapes, stroke, &mut self.rules, &mut self.verticals);
+                    path_shapes.clear();
+                    let horizontal_scale = ctm.0[2].hypot(ctm.0[3]);
+                    let vertical_scale = ctm.0[0].hypot(ctm.0[1]);
+                    for (left, right, y) in path_rules.drain(..) {
+                        if self.rules.len() + self.verticals.len() >= PDF_RULE_LIMIT {
+                            break;
+                        }
+                        self.rules.push(HorizontalRule {
                             left,
                             right,
                             y,
-                            width,
+                            width: (stroke.width * horizontal_scale).clamp(0.25, 100.),
                             color: stroke.color,
                             style: stroke.style,
-                        },
-                    ));
+                        });
+                    }
+                    for (x, bottom, top) in path_vertical_rules.drain(..) {
+                        if self.rules.len() + self.verticals.len() >= PDF_RULE_LIMIT {
+                            break;
+                        }
+                        self.verticals.push(VerticalRule {
+                            x,
+                            bottom,
+                            top,
+                            width: (stroke.width * vertical_scale).clamp(0.25, 100.),
+                            color: stroke.color,
+                            style: stroke.style,
+                        });
+                    }
                     path_point = None;
                 }
-                "f" | "F" | "f*" | "n" => {
+                "f" | "F" | "f*" => {
+                    finish_path_shape(&mut path_shape, &mut path_shapes);
+                    filled_path_rules(&path_shapes, stroke, &mut self.rules, &mut self.verticals);
+                    path_shapes.clear();
                     path_rules.clear();
+                    path_vertical_rules.clear();
+                    path_point = None;
+                }
+                "n" => {
+                    path_rules.clear();
+                    path_vertical_rules.clear();
+                    path_shapes.clear();
+                    path_shape.clear();
                     path_point = None;
                 }
                 "BT" => {
@@ -811,6 +975,7 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
             total: &mut total,
             fragments: Vec::new(),
             rules: Vec::new(),
+            verticals: Vec::new(),
             active: Vec::new(),
         };
         reader.content(&bytes, resources, Matrix::ID, Stroke::default())?;
@@ -825,7 +990,7 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
                 .doc
                 .warn("A PDF page has no extractable text. OCR is unavailable.");
         }
-        layout(reader.fragments, reader.rules, &mut sec);
+        layout(reader.fragments, reader.rules, reader.verticals, &mut sec);
 
         doc.sections.push(sec)
     }
