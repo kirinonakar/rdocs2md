@@ -43,7 +43,12 @@ jobs:
             throw 'Add the WINGET_CREATE_GITHUB_TOKEN repository secret before submitting the initial WinGet manifest.'
           }
 
-          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'winget/manifests/k/kirinonakar/rdocs2md/1.0.0'
+          $manifestPath = [System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'winget/manifests/k/kirinonakar/rdocs2md/1.0.0'))
+          $manifestPath = $manifestPath.TrimEnd([char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar))
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Container)) {
+            throw "Initial WinGet manifest folder does not exist: $manifestPath"
+          }
+
           & (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe') submit `
             --no-open `
             --prtitle 'New package: kirinonakar.rdocs2md version 1.0.0' `
