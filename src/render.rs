@@ -6,15 +6,28 @@ pub fn escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
+
+fn literal_angle_open(tail: &str) -> bool {
+    let mut chars = tail.chars();
+    match chars.next() {
+        Some(first) if first.is_whitespace() => true,
+        // These labels cannot start a Markdown HTML tag or autolink.
+        Some(first) if !first.is_ascii() && first.is_alphabetic() => {
+            chars.find(|c| !(c.is_alphanumeric() || matches!(c, ' ' | '-' | '·'))) == Some('>')
+        }
+        _ => false,
+    }
+}
+
 fn markdown(s: &str) -> String {
     let mut out = String::new();
     for line in s.split_inclusive('\n') {
         let mut margin = true;
-        for c in line.chars() {
+        for (i, c) in line.char_indices() {
             match c {
                 '&' => out.push_str("&amp;"),
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
+                '<' if !literal_angle_open(&line[i + 1..]) => out.push_str("\\<"),
+                '>' if margin => out.push_str("\\>"),
                 '\\' | '*' | '_' | '[' | ']' | '|' | '~' | '\u{60}' => {
                     out.push('\\');
                     out.push(c)
@@ -164,7 +177,7 @@ fn html_table(out: &mut String, rows: &[Vec<Cell>], links: &Properties) -> Resul
         }
         out.push_str("</tr>\n")
     }
-    out.push_str("</table>\n\n");
+    out.push_str("</table>\n");
     Ok(())
 }
 pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> Result<String> {
@@ -352,6 +365,9 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                         || rows.len().saturating_mul(width) > CELL_LIMIT
                     {
                         html_table(&mut out, rows, links)?;
+                        // A blank line ends the Markdown HTML block, so only
+                        // add one after the outermost table.
+                        out.push('\n');
                     } else {
                         for (n, row) in rows.iter().enumerate() {
                             out.push('|');

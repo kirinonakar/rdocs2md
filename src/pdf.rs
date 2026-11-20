@@ -27,7 +27,10 @@ impl Matrix {
     }
 }
 mod layout;
-use layout::{Fragment, approximate_width, layout};
+use layout::{Fragment, HorizontalRule, approximate_width, layout};
+
+const PDF_RULE_LIMIT: usize = 4096;
+const TRACKED_GLYPH_LIMIT: usize = 65536;
 
 #[derive(Clone, Copy)]
 struct TextState {
@@ -331,6 +334,7 @@ struct PageReader<'a> {
     images: bool,
     total: &'a mut usize,
     fragments: Vec<Fragment>,
+    rules: Vec<HorizontalRule>,
     active: Vec<lopdf::ObjectId>,
 }
 impl PageReader<'_> {
@@ -373,6 +377,8 @@ impl PageReader<'_> {
         let mut position = line;
         let mut font = Vec::new();
         let mut state = TextState::default();
+        let mut path_point: Option<(f32, f32)> = None;
+        let mut path_rules = Vec::new();
 
         let mut moved = true;
         for op in Content::decode_iter(bytes) {
@@ -407,6 +413,34 @@ impl PageReader<'_> {
                         position = line;
                     }
                     moved = true
+                }
+                "m" | "l" => {
+                    let next = num(0).ok().zip(num(1).ok()).map(|(x, y)| ctm.point(x, y));
+                    if op.operator == "l"
+                        && path_rules.len() + self.rules.len() < PDF_RULE_LIMIT
+                        && let (Some((x, y)), Some((end, end_y))) = (path_point, next)
+                        && x.is_finite()
+                        && end.is_finite()
+                        && (y - end_y).abs() <= 0.5
+                        && (x - end).abs() >= 10.
+                    {
+                        path_rules.push(HorizontalRule {
+                            left: x.min(end),
+                            right: x.max(end),
+                            y,
+                        });
+                    }
+                    path_point = next;
+                }
+                "c" | "v" | "y" | "h" | "re" => path_point = None,
+                "S" | "s" | "B" | "B*" | "b" | "b*" => {
+                    let remaining = PDF_RULE_LIMIT - self.rules.len();
+                    self.rules.extend(path_rules.drain(..).take(remaining));
+                    path_point = None;
+                }
+                "f" | "F" | "f*" | "n" => {
+                    path_rules.clear();
+                    path_point = None;
                 }
                 "BT" => {
                     line = Matrix::ID;
@@ -465,6 +499,15 @@ impl PageReader<'_> {
                     let mut start = 0.;
                     let mut advance = 0.;
                     let mut pending_space = false;
+                    // Some tables space individual glyphs an entire column apart
+                    // with Tc, even when several cells share one PDF string.
+                    let tracking = state.char_spacing * state.scale;
+                    let separate_glyphs = state.scale > 0. && state.char_spacing > state.size.abs();
+                    let code_width = if font_metrics.cid_default.is_some() {
+                        2
+                    } else {
+                        1
+                    };
                     for part in parts {
                         if let Ok(b) = part.as_str() {
                             let decoded = if let Some(e) = enc.get(&font) {
@@ -475,6 +518,24 @@ impl PageReader<'_> {
                                     .map(|code| mapping.get(code).copied().unwrap_or('\u{fffd}'))
                                     .collect()
                             };
+                            if separate_glyphs
+                                && self.fragments.len() + segments.len() + b.len() / code_width
+                                    <= TRACKED_GLYPH_LIMIT
+                                && decoded.chars().count() * code_width == b.len()
+                            {
+                                if !text.is_empty() {
+                                    segments.push((std::mem::take(&mut text), start, advance));
+                                }
+                                for (code, glyph) in b.chunks_exact(code_width).zip(decoded.chars())
+                                {
+                                    let start = advance;
+                                    let glyph = glyph.to_string();
+                                    advance += font_metrics.advance(code, &glyph, state);
+                                    segments.push((glyph, start, advance - tracking));
+                                }
+                                pending_space = false;
+                                continue;
+                            }
                             if text.is_empty() {
                                 start = advance;
                             }
@@ -531,6 +592,7 @@ impl PageReader<'_> {
                             ..Run::default()
                         };
                         if !moved
+                            && !separate_glyphs
                             && start == 0.
                             && let Some(f) = self.fragments.last_mut()
                         {
@@ -546,7 +608,7 @@ impl PageReader<'_> {
                                 runs: vec![run],
                             });
                         }
-                        moved = false;
+                        moved = separate_glyphs;
                     }
                 }
                 "Do" => {
@@ -655,6 +717,7 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
             images,
             total: &mut total,
             fragments: Vec::new(),
+            rules: Vec::new(),
             active: Vec::new(),
         };
         reader.content(&bytes, resources, Matrix::ID)?;
@@ -669,7 +732,7 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
                 .doc
                 .warn("A PDF page has no extractable text. OCR is unavailable.");
         }
-        layout(reader.fragments, &mut sec);
+        layout(reader.fragments, reader.rules, &mut sec);
 
         doc.sections.push(sec)
     }

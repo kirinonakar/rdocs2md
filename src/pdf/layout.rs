@@ -10,6 +10,12 @@ pub(super) struct Fragment {
     pub runs: Vec<Run>,
 }
 
+pub(super) struct HorizontalRule {
+    pub left: f32,
+    pub right: f32,
+    pub y: f32,
+}
+
 impl Fragment {
     fn first_text(&self) -> &str {
         self.runs.first().map_or("", |r| r.text.as_str())
@@ -355,7 +361,79 @@ fn table_heading(items: &mut Vec<Item>, row: &[Fragment]) -> (Vec<Item>, Option<
     (items.split_off(cursor), headings)
 }
 
-fn page_items(bands: Vec<Vec<Fragment>>) -> Vec<Item> {
+fn ruled_headings(
+    items: &mut Vec<Item>,
+    row: &[Fragment],
+    rules: &[HorizontalRule],
+) -> (f32, Vec<Vec<Cell>>) {
+    let mut baseline = row[0].y;
+    let mut headings = Vec::new();
+    if rules.is_empty() {
+        return (baseline, headings);
+    }
+    let gap = row[0].size * 2.5;
+    let mut boundaries = vec![true; row.len() + 1];
+    while let Some(last) = items.last() {
+        if !(0. < last.y - baseline && last.y - baseline <= gap) || headings.len() == 4 {
+            break;
+        }
+        let band = items.partition_point(|i| i.y > last.y + 1.15);
+        // Require multiple labels, each above a separate rule covering its columns.
+        if !(2..row.len()).contains(&(items.len() - band)) {
+            break;
+        }
+        let top = rules.partition_point(|r| r.y > last.y);
+        let minimum_y = baseline.max(last.y - row[0].size * 0.8);
+        let bottom = rules.partition_point(|r| r.y > minimum_y);
+        let mut spans = Vec::new();
+        for item in &items[band..] {
+            if item.line_size().is_none() {
+                break;
+            }
+            let span = rules[top..bottom].iter().find_map(|rule| {
+                if item.x < rule.left - 1. || item.end > rule.right + 1. {
+                    return None;
+                }
+                let start = row.partition_point(|f| f.x < rule.left - 1.);
+                let end = row.partition_point(|f| f.x <= rule.right + 1.);
+                (end >= start + 2 && boundaries[start] && boundaries[end]).then_some((start, end))
+            });
+            let Some((start, end)) = span else { break };
+            if spans.last().is_some_and(|&(_, previous)| previous > start) {
+                break;
+            }
+            spans.push((start, end));
+        }
+        if spans.len() != items.len() - band {
+            break;
+        }
+
+        baseline = last.y;
+        let mut cells = Vec::new();
+        let mut column = 0;
+        for ((start, end), item) in spans.into_iter().zip(items.drain(band..)) {
+            cells.extend((column..start).map(|_| Cell::default()));
+            let Content::Line { mut runs, .. } = item.content else {
+                unreachable!();
+            };
+            clean_line(&mut runs);
+            cells.push(Cell {
+                runs,
+                colspan: Some(end - start),
+                properties: coordinates(item.x, item.y),
+                ..Cell::default()
+            });
+            boundaries[start + 1..end].fill(false);
+            column = end;
+        }
+        cells.extend((column..row.len()).map(|_| Cell::default()));
+        headings.push(cells);
+    }
+    headings.reverse();
+    (baseline, headings)
+}
+
+fn page_items(bands: Vec<Vec<Fragment>>, rules: &[HorizontalRule]) -> Vec<Item> {
     let mut items = Vec::new();
     let mut bands = bands.into_iter().filter(|b| !b.is_empty()).peekable();
     while let Some(first) = bands.next() {
@@ -364,7 +442,6 @@ fn page_items(bands: Vec<Vec<Fragment>>) -> Vec<Item> {
             let y = first[0].y;
             let mut end = first.last().unwrap().end;
             let mut previous_y = y;
-            let mut rows = Vec::new();
             let mut rest = Vec::new();
             while let Some(row) = bands.next_if(|row| {
                 previous_y - row[0].y <= first[0].size * 2.5 && table_row(row, &first)
@@ -375,8 +452,13 @@ fn page_items(bands: Vec<Vec<Fragment>>) -> Vec<Item> {
             }
             // Require vertically adjacent rows. Widely spaced text can start at the same x.
             if !rest.is_empty() {
-                let (prefix, heading) = table_heading(&mut items, &first);
-                rows.extend(heading);
+                let (y, mut rows) = ruled_headings(&mut items, &first, rules);
+                let mut prefix = Vec::new();
+                if rows.is_empty() {
+                    let (preceding, heading) = table_heading(&mut items, &first);
+                    prefix = preceding;
+                    rows.extend(heading);
+                }
                 let y = prefix.first().map_or(y, |item| item.y);
                 for row in std::iter::once(first).chain(rest) {
                     rows.push(
@@ -698,7 +780,7 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
     }
 }
 
-pub(super) fn layout(mut pieces: Vec<Fragment>, sec: &mut Section) {
+pub(super) fn layout(mut pieces: Vec<Fragment>, mut rules: Vec<HorizontalRule>, sec: &mut Section) {
     pieces.retain(|f| {
         f.runs
             .iter()
@@ -706,7 +788,8 @@ pub(super) fn layout(mut pieces: Vec<Fragment>, sec: &mut Section) {
     });
     let mut bands = baseline_bands(pieces);
     attach_labels(&mut bands);
-    let mut items = page_items(bands);
+    rules.sort_by(|a, b| b.y.total_cmp(&a.y));
+    let mut items = page_items(bands, &rules);
     items.sort_by(|a, b| b.y.total_cmp(&a.y).then_with(|| a.x.total_cmp(&b.x)));
     // Separate isolated running headers and page numbers from the column flow.
     let mut gaps: Vec<_> = items

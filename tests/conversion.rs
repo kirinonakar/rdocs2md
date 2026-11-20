@@ -183,6 +183,86 @@ fn pdf_columns_coordinates_and_page_range() {
 }
 
 #[test]
+fn pdf_spaced_glyphs_and_ruled_headings_form_a_table() {
+    use lopdf::{Document as Pdf, Stream, dictionary};
+
+    let mut pdf = Pdf::with_version("1.4");
+    let tree = pdf.new_object_id();
+    let font =
+        pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
+    let resources = dictionary! {"Font"=>dictionary! {"F"=>font}};
+    let mut content = String::from(
+        "84 167 m 180 167 l 196 167 m 292 167 l S\n\
+         84 156 m 124 156 l 140 156 m 180 156 l 196 156 m 236 156 l 252 156 m 292 156 l S\n\
+         BT /F 8 Tf\n\
+         1 0 0 1 40 185 Tm (Results) Tj\n\
+         1 0 0 1 112 170 Tm (Reader A) Tj 1 0 0 1 224 170 Tm (Reader B) Tj\n\
+         1 0 0 1 88 159 Tm (First) Tj 1 0 0 1 144 159 Tm (Second) Tj\n\
+         1 0 0 1 200 159 Tm (First) Tj 1 0 0 1 256 159 Tm (Second) Tj\n",
+    );
+    for (x, label) in [40, 84, 112, 140, 168, 196, 224, 252, 280]
+        .into_iter()
+        .zip(["No.", "TP", "FP", "TP", "FP", "TP", "FP", "TP", "FP"])
+    {
+        content.push_str(&format!("1 0 0 1 {x} 148 Tm ({label}) Tj\n"));
+    }
+    content.push_str(
+        "24 Tc\n\
+         1 0 0 1 40 134 Tm [(9) -2000 (01234567)] TJ\n\
+         1 0 0 1 36 123 Tm [(1) 3000 (0) -2000 (76543210)] TJ\n\
+         0 Tc 1 0 0 1 40 108 Tm (Table note) Tj ET\n",
+    );
+    let stream = pdf.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let page = pdf.add_object(dictionary! {
+        "Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources,
+        "MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]
+    });
+    pdf.objects.insert(
+        tree,
+        dictionary! {"Type"=>"Pages","Kids"=>vec![lopdf::Object::Reference(page)],"Count"=>1}
+            .into(),
+    );
+    let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree});
+    pdf.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    pdf.save_to(&mut bytes).unwrap();
+
+    let doc = convert(&bytes, false).unwrap();
+    let [
+        Block::Paragraph { .. },
+        Block::Table { rows },
+        Block::Paragraph { .. },
+    ] = doc.sections[0].blocks.as_slice()
+    else {
+        panic!("expected caption, table and note: {}", md(&doc));
+    };
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0][1].colspan, Some(4));
+    assert_eq!(rows[0][2].colspan, Some(4));
+    assert!(rows[1][1..].iter().all(|cell| cell.colspan == Some(2)));
+    assert!(rows[2..].iter().all(|row| row.len() == 9));
+    let values = |row: &[Cell]| {
+        row.iter()
+            .map(|cell| {
+                cell.runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values(&rows[0]), ["", "Reader A", "Reader B"]);
+    assert_eq!(
+        values(&rows[3]),
+        ["9", "0", "1", "2", "3", "4", "5", "6", "7"]
+    );
+    assert_eq!(
+        values(&rows[4]),
+        ["10", "7", "6", "5", "4", "3", "2", "1", "0"]
+    );
+}
+
+#[test]
 fn hwp_tables_keep_merged_cells_and_nested_answers() {
     fn record(out: &mut Vec<u8>, tag: u32, level: u32, data: &[u8]) {
         let header = (data.len() as u32) << 20 | level << 10 | tag;
@@ -241,8 +321,34 @@ fn hwp_tables_keep_merged_cells_and_nested_answers() {
     assert!(text.contains("<td rowspan=\"2\">1</td><td colspan=\"2\">Question and answer</td>"));
     assert!(text.contains("<td>Question</td><td><p>Answer</p>\n<table>"));
     assert!(text.contains("<td>Nested answer</td>"));
-    assert!(text.contains("<p>Answer continued</p>\n</td>"));
+    assert!(text.contains("</table>\n<p>Answer continued</p>\n</td>"));
+    assert_eq!(text.matches("\n\n").count(), 3);
     assert!(text.starts_with("Before\n\n<table>") && text.ends_with("After\n\n"));
+}
+
+#[test]
+fn hwpx_bold_labels_keep_literal_angle_brackets_in_markdown() {
+    let doc = convert(
+        &package(&[
+            ("Contents/content.hpf", "<package/>"),
+            (
+                "Contents/header.xml",
+                r#"<head><charPr id="1"><bold/></charPr></head>"#,
+            ),
+            (
+                "Contents/section0.xml",
+                r#"<sec><p><run charPrIDRef="1"><t>&lt;공통&gt;</t></run></p><p><run><t>1 &lt; 2 &gt; 0</t></run></p><p><run><t>&lt;script&gt;</t></run></p></sec>"#,
+            ),
+        ]),
+        false,
+    )
+    .unwrap();
+    assert_eq!(md(&doc), "**<공통>**\n\n1 < 2 > 0\n\n\\<script>\n\n");
+    assert!(
+        render(&doc, "html", "hybrid", &Properties::new())
+            .unwrap()
+            .contains("<strong>&lt;공통&gt;</strong>")
+    );
 }
 
 #[test]
