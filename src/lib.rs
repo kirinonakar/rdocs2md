@@ -1,6 +1,7 @@
 mod epub;
 mod flow;
 mod formatting;
+mod hwp3;
 mod legacy;
 mod math;
 pub mod mcp;
@@ -36,6 +37,8 @@ pub fn convert(b: &[u8], images: bool) -> Result<Document> {
         pdf::parse(b, images)?
     } else if b.starts_with(b"{\\rtf") {
         rtf::parse(b, images)?
+    } else if hwp3::matches(b) {
+        hwp3::parse(b)?
     } else if b.starts_with(b"PK\x03\x04") {
         office::package(b, images)?
     } else if b.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") {
@@ -56,8 +59,8 @@ pub const FORMATS: &[(&str, &str, &str)] = &[
     ),
     (
         "hwp",
-        "HWP 5 BodyText, raw DEFLATE, Unicode paragraphs, tables and embedded raster pictures",
-        "No distribution-protected files, general vector drawings or full character styles",
+        "HWP 3.x raw DEFLATE, KSSM text and controls; HWP 5 BodyText, Unicode paragraphs, tables and embedded raster pictures",
+        "HWP 3.x image extraction and detailed layout/style restoration are partial; HWP 5 distribution-protected files and general vector drawings are unsupported",
     ),
     (
         "hwpx",
