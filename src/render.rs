@@ -183,8 +183,18 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         out.push_str("<!doctype html>\n<meta charset=\"utf-8\">\n<article>\n")
     }
     for (i, s) in doc.sections.iter().enumerate() {
-        if i > 0 {
-            out.push_str(if html { "\n<hr>\n" } else { "\n---\n\n" })
+        if i > 0 && !out.is_empty() {
+            if html {
+                out.push_str("\n<hr>\n")
+            } else {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                if !out.ends_with("\n\n") {
+                    out.push('\n');
+                }
+                out.push_str("---\n\n");
+            }
         }
         if let Some(anchor) = s.properties.get("anchor") {
             writeln!(out, "<a id=\"{}\"></a>\n", escape(anchor))?;
@@ -211,6 +221,21 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         let mut html_list = None;
         let mut in_list = false;
         for block in &s.blocks {
+            if matches!(doc.format.as_str(), "pdf" | "docx" | "hwpx")
+                && let Block::Paragraph {
+                    runs, properties, ..
+                } = block
+                && !properties.contains_key("anchor")
+                && runs.iter().all(|r| {
+                    r.text.trim().is_empty()
+                        && r.mathml.is_none()
+                        && r.image
+                            .as_ref()
+                            .is_none_or(|image| !links.contains_key(image))
+                })
+            {
+                continue;
+            }
             let list_type = if html
                 && let Block::Paragraph {
                     list: Some(list), ..

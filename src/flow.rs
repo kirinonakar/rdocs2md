@@ -71,6 +71,9 @@ pub fn style_props(n: N, st: &mut Style) {
         match tag(c) {
             "b" | "bold" => st.bold = on,
             "italic" | "i" => st.italic = on,
+            "underline" if attr(c, "type").is_some() => {
+                st.underline = attr(c, "type") == Some("BOTTOM");
+            }
             "u" | "underline" => st.underline = on,
             "strike" => st.strike = on,
             "vertAlign" => {
@@ -457,10 +460,19 @@ impl Flow<'_> {
             c.runs = self.runs(n)?
         } else {
             for (i, p) in ps.into_iter().enumerate() {
-                if i > 0 {
+                let runs = self.runs(p)?;
+                let discard_spacers = matches!(self.kind, "hwpx" | "docx");
+                if discard_spacers && !has_content(&runs) {
+                    continue;
+                }
+                if if discard_spacers {
+                    !c.runs.is_empty()
+                } else {
+                    i > 0
+                } {
                     push_run(&mut c.runs, Run::text("\n"))
                 }
-                for r in self.runs(p)? {
+                for r in runs {
                     push_run(&mut c.runs, r)
                 }
             }
@@ -622,7 +634,10 @@ impl Flow<'_> {
             return Ok(());
         }
         if matches!(name, "table" | "tbl") {
-            out.push(self.table(n)?);
+            let table = self.table(n)?;
+            if self.kind != "docx" || !word_spacer_table(n, &table) {
+                out.push(table);
+            }
             return Ok(());
         }
         if matches!(
@@ -630,11 +645,18 @@ impl Flow<'_> {
             "p" | "h" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre"
         ) {
             if self.kind == "hwpx" && desc(n, "tbl").next().is_some() {
-                for c in n.children().filter(|c| c.is_element()) {
-                    self.hwpx_mixed(c, out)?
+                let mut runs = Vec::new();
+                self.hwpx_mixed(n, &Run::default(), &mut runs, out)?;
+                if has_content(&runs) {
+                    out.push(Block::flow(runs));
                 }
             } else {
-                out.push(self.paragraph(n)?)
+                let block = self.paragraph(n)?;
+                if !matches!(self.kind, "hwpx" | "docx")
+                    || matches!(&block, Block::Paragraph { runs, .. } if has_content(runs))
+                {
+                    out.push(block);
+                }
             }
             return Ok(());
         }
@@ -701,16 +723,62 @@ impl Flow<'_> {
         });
         Ok(())
     }
-    fn hwpx_mixed(&self, n: N, out: &mut Vec<Block>) -> Result<()> {
+    fn hwpx_mixed(
+        &self,
+        n: N,
+        state: &Run,
+        runs: &mut Vec<Run>,
+        out: &mut Vec<Block>,
+    ) -> Result<()> {
         if tag(n) == "tbl" {
+            let preceding = std::mem::take(runs);
+            if has_content(&preceding) {
+                out.push(Block::flow(preceding));
+            }
             out.push(self.table(n)?)
-        } else if tag(n) == "t" {
-            out.push(Block::flow(self.runs(n)?))
+        } else if desc(n, "tbl").next().is_none() {
+            self.inline(n, state, runs)?;
         } else {
-            for c in n.children().filter(|c| c.is_element()) {
-                self.hwpx_mixed(c, out)?
+            let mut state = state.clone();
+            if let Some(style) = attr(n, "charPrIDRef").and_then(|id| self.rules.styles.get(id)) {
+                apply_style(&mut state.style, style);
+            }
+            for c in n.children() {
+                self.hwpx_mixed(c, &state, runs, out)?
             }
         }
         Ok(())
     }
+}
+
+fn has_content(runs: &[Run]) -> bool {
+    runs.iter().any(|r| {
+        !r.text.trim().is_empty() || r.image.is_some() || r.mathml.is_some() || r.page_break
+    })
+}
+
+fn word_spacer_table(n: N, table: &Block) -> bool {
+    let Block::Table { rows } = table else {
+        return false;
+    };
+    let [row] = rows.as_slice() else {
+        return false;
+    };
+    let [cell] = row.as_slice() else {
+        return false;
+    };
+    if has_content(&cell.runs) || !cell.blocks.is_empty() {
+        return false;
+    }
+    !n.descendants().any(|item| match tag(item) {
+        "tblStyle" => true,
+        "tblBorders" | "tcBorders" => item.children().filter(|c| c.is_element()).any(|border| {
+            attr(border, "val").is_some_and(|style| !matches!(style, "none" | "nil"))
+        }),
+        "shd" => {
+            attr(item, "fill").is_some_and(|fill| fill != "auto")
+                || attr(item, "themeFill").is_some()
+        }
+        _ => false,
+    })
 }

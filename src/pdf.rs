@@ -26,105 +26,178 @@ impl Matrix {
         self.concat(Self([1., 0., 0., 1., x, y]))
     }
 }
-struct Fragment {
-    x: f32,
-    y: f32,
-    runs: Vec<Run>,
+mod layout;
+use layout::{Fragment, approximate_width, layout};
+
+#[derive(Clone, Copy)]
+struct TextState {
     size: f32,
+    leading: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+    scale: f32,
+    rise: f32,
 }
-fn layout(mut pieces: Vec<Fragment>, sec: &mut Section) {
-    if pieces.is_empty() {
-        return;
-    }
-    // Three or more consistent cell origins over consecutive baselines form a simple grid.
-    pieces.sort_by(|a, b| b.y.total_cmp(&a.y).then_with(|| a.x.total_cmp(&b.x)));
-    let mut bands: Vec<Vec<Fragment>> = Vec::new();
-    for f in pieces {
-        if bands
-            .last()
-            .and_then(|b| b.first())
-            .is_none_or(|first| (first.y - f.y).abs() > 1.0)
-        {
-            bands.push(Vec::new())
+
+impl Default for TextState {
+    fn default() -> Self {
+        Self {
+            size: 0.,
+            leading: 0.,
+            char_spacing: 0.,
+            word_spacing: 0.,
+            scale: 1.,
+            rise: 0.,
         }
-        bands.last_mut().unwrap().push(f);
     }
-    for band in &mut bands {
-        band.sort_by(|a, b| a.x.total_cmp(&b.x))
+}
+
+fn resolve_object<'a>(pdf: &'a Pdf, obj: &'a Object) -> Option<&'a Object> {
+    match obj {
+        Object::Reference(id) => pdf.get_object(*id).ok(),
+        _ => Some(obj),
     }
-    let anchors: Vec<_> = bands[0].iter().map(|f| f.x).collect();
-    let grid = (3..=32).contains(&anchors.len())
-        && bands.len() >= 2
-        && anchors.windows(2).all(|w| w[1] - w[0] > 24.)
-        && bands.iter().all(|row| {
-            row.len() == anchors.len()
-                && row.iter().zip(&anchors).all(|(f, x)| (f.x - x).abs() < 2.)
-        });
-    if grid {
-        let rows = bands
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|f| Cell {
-                        runs: f.runs,
-                        properties: Properties::from([
-                            ("x_pt".into(), f.x.to_string()),
-                            ("y_pt".into(), f.y.to_string()),
-                        ]),
-                        ..Cell::default()
-                    })
-                    .collect()
-            })
-            .collect();
-        sec.blocks.push(Block::Table { rows });
-        return;
+}
+
+fn math_pi_encoding(pdf: &Pdf, font: &lopdf::Dictionary) -> Option<HashMap<u8, char>> {
+    let base = font.get(b"BaseFont").ok()?.as_name().ok()?;
+    if !base.ends_with(b"Universal-GreekwithMathPi") {
+        return None;
     }
-    let mut pieces: Vec<_> = bands.into_iter().flatten().collect();
-    // A repeated gutter between text origins can distinguish two balanced columns.
-    let mut xs: Vec<_> = pieces.iter().map(|s| s.x).collect();
-    xs.sort_by(f32::total_cmp);
-    let split = xs
-        .windows(2)
-        .enumerate()
-        .filter(|(i, w)| *i >= 2 && *i + 3 < xs.len() && w[1] - w[0] > 105.)
-        .max_by(|(_, a), (_, b)| (a[1] - a[0]).total_cmp(&(b[1] - b[0])))
-        .map(|(_, w)| (w[0] + w[1]) / 2.);
-    pieces.sort_by(|a, b| {
-        split
-            .map(|mid| (a.x >= mid).cmp(&(b.x >= mid)))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.y.total_cmp(&a.y))
-            .then_with(|| a.x.total_cmp(&b.x))
-    });
-    let mut last: Option<(f32, f32)> = None;
-    for f in pieces {
-        if last.is_some_and(|(x, y)| {
-            (y - f.y).abs() < 1.0 && f.x >= x && split.is_none_or(|mid| (f.x >= mid) == (x >= mid))
-        }) && let Some(Block::Paragraph { runs, .. }) = sec.blocks.last_mut()
+    let encoding = dictionary(pdf, font.get(b"Encoding").ok()?)?;
+    let differences = encoding.get(b"Differences").ok()?.as_array().ok()?;
+    let mut code = 0u8;
+    let mut mapping = HashMap::new();
+    for value in differences {
+        if let Ok(n) = value.as_i64() {
+            code = u8::try_from(n).ok()?;
+        } else if let Ok(name) = value.as_name() {
+            let character = match name {
+                b"H11001" => '+',
+                b"H11002" => '−',
+                b"H11003" => '×',
+                b"H11005" => '=',
+                b"H11021" => '<',
+                b"H11022" => '>',
+                b"H9260" => 'κ',
+                _ => '\u{fffd}',
+            };
+            mapping.insert(code, character);
+            code = code.wrapping_add(1);
+        }
+    }
+    Some(mapping)
+}
+
+struct FontMetrics<'a> {
+    widths: &'a [Object],
+    first: i64,
+    cid_default: Option<f32>,
+    cid_widths: Vec<CidWidth<'a>>,
+}
+
+struct CidWidth<'a> {
+    first: i64,
+    last: i64,
+    widths: &'a [Object],
+    constant: f32,
+}
+
+fn cid_widths(spec: &[Object]) -> Vec<CidWidth<'_>> {
+    let mut ranges = Vec::new();
+    let mut items = spec.iter();
+    while let Some(first) = items.next().and_then(|item| item.as_i64().ok()) {
+        let Some(range) = items.next() else { break };
+        if let Ok(widths) = range.as_array() {
+            if !widths.is_empty() {
+                ranges.push(CidWidth {
+                    first,
+                    last: first.saturating_add(widths.len() as i64 - 1),
+                    widths,
+                    constant: 0.,
+                });
+            }
+        } else if let Ok(last) = range.as_i64()
+            && let Some(constant) = items.next().and_then(|item| item.as_float().ok())
         {
-            if last.is_some_and(|(x, _)| f.x > x + f.size * 1.5)
-                && !runs
-                    .last()
-                    .is_some_and(|r| r.text.ends_with(char::is_whitespace))
-            {
-                push_run(runs, Run::text(" "))
-            }
-            for run in f.runs {
-                push_run(runs, run)
-            }
+            ranges.push(CidWidth {
+                first,
+                last,
+                widths: &[],
+                constant,
+            });
         } else {
-            let props = Properties::from([
-                ("x_pt".into(), f.x.to_string()),
-                ("y_pt".into(), f.y.to_string()),
-            ]);
-            sec.blocks.push(Block::Paragraph {
-                heading: 0,
-                list: None,
-                runs: f.runs,
-                properties: props,
-            })
+            break;
         }
-        last = Some((f.x, f.y));
+    }
+    ranges.sort_by_key(|range| range.first);
+    ranges
+}
+
+impl<'a> FontMetrics<'a> {
+    fn new(pdf: &'a Pdf, font: &'a lopdf::Dictionary) -> Self {
+        let array = |dict: &'a lopdf::Dictionary, key: &[u8]| {
+            resolve_object(pdf, dict.get(key).ok()?)?.as_array().ok()
+        };
+        if font.get(b"Encoding").and_then(Object::as_name).ok() == Some(b"Identity-H")
+            && let Some(cid) = array(font, b"DescendantFonts")
+                .and_then(|a| a.first())
+                .and_then(|d| dictionary(pdf, d))
+        {
+            return Self {
+                widths: &[],
+                first: 0,
+                cid_default: Some(cid.get(b"DW").and_then(Object::as_float).unwrap_or(1000.)),
+                cid_widths: cid_widths(array(cid, b"W").map_or(&[], Vec::as_slice)),
+            };
+        }
+        Self {
+            widths: array(font, b"Widths").map_or(&[], Vec::as_slice),
+            first: font.get(b"FirstChar").and_then(Object::as_i64).unwrap_or(0),
+            cid_default: None,
+            cid_widths: Vec::new(),
+        }
+    }
+
+    fn advance(&self, bytes: &[u8], decoded: &str, state: TextState) -> f32 {
+        let (width, count, spaces) = if let Some(default) = self.cid_default {
+            let (codes, _) = bytes.as_chunks::<2>();
+            let width: f32 = codes
+                .iter()
+                .map(|b| {
+                    self.cid_width(i64::from(u16::from_be_bytes(*b)))
+                        .unwrap_or(default)
+                })
+                .sum();
+            (width / 1000., codes.len(), 0)
+        } else {
+            let width = bytes.iter().try_fold(0., |sum, &b| {
+                let index = usize::try_from(i64::from(b).checked_sub(self.first)?).ok()?;
+                Some(sum + self.widths.get(index)?.as_float().ok()?)
+            });
+            (
+                width.map_or_else(|| approximate_width(decoded), |width| width / 1000.),
+                bytes.len(),
+                bytes.iter().filter(|&&b| b == b' ').count(),
+            )
+        };
+        (width * state.size
+            + count as f32 * state.char_spacing
+            + spaces as f32 * state.word_spacing)
+            * state.scale
+    }
+
+    fn cid_width(&self, code: i64) -> Option<f32> {
+        let index = self.cid_widths.partition_point(|range| range.first <= code);
+        let range = self.cid_widths.get(index.checked_sub(1)?)?;
+        if code > range.last {
+            return None;
+        }
+        if range.widths.is_empty() {
+            return Some(range.constant);
+        }
+        let offset = usize::try_from(code.checked_sub(range.first)?).ok()?;
+        range.widths.get(offset)?.as_float().ok()
     }
 }
 fn raster(stream: &lopdf::Stream) -> Result<Option<Vec<u8>>> {
@@ -280,17 +353,26 @@ impl PageReader<'_> {
             }
         }
         let mut enc = HashMap::new();
+        let mut math_pi = HashMap::new();
+        let mut metrics = HashMap::new();
         for (key, font) in &fonts {
-            if let Ok(e) = font.get_font_encoding_with_limit(self.pdf, 4 * MIB) {
+            if !font.has(b"ToUnicode")
+                && let Some(mapping) = math_pi_encoding(self.pdf, font)
+            {
+                math_pi.insert(key.clone(), mapping);
+            } else if let Ok(e) = font.get_font_encoding_with_limit(self.pdf, 4 * MIB) {
                 enc.insert(key.clone(), e);
+            }
+            if enc.contains_key(key) || math_pi.contains_key(key) {
+                metrics.insert(key.clone(), FontMetrics::new(self.pdf, font));
             }
         }
 
         let mut stack = Vec::new();
         let mut line = Matrix::ID;
-        let mut leading = 0.;
+        let mut position = line;
         let mut font = Vec::new();
-        let mut size = 0.;
+        let mut state = TextState::default();
 
         let mut moved = true;
         for op in Content::decode_iter(bytes) {
@@ -306,14 +388,14 @@ impl PageReader<'_> {
                     if stack.len() > 128 {
                         return Err("PDF graphics state depth exceeded".into());
                     }
-                    stack.push((ctm, font.clone(), size, leading))
+                    stack.push((ctm, font.clone(), state))
                 }
                 "Q" => {
-                    if let Some((m, f, s, l)) = stack.pop() {
+                    if let Some((m, f, s)) = stack.pop() {
                         ctm = m;
                         font = f;
-                        size = s;
-                        leading = l
+                        state = s;
+                        moved = true;
                     }
                 }
                 "cm" | "Tm" => {
@@ -321,37 +403,53 @@ impl PageReader<'_> {
                     if op.operator == "cm" {
                         ctm = ctm.concat(matrix)
                     } else {
-                        line = matrix
+                        line = matrix;
+                        position = line;
                     }
                     moved = true
                 }
                 "BT" => {
                     line = Matrix::ID;
+                    position = line;
                     moved = true
                 }
                 "Tf" => {
                     font = args.first().ok_or("PDF font missing")?.as_name()?.to_vec();
-                    size = num(1)?
+                    state.size = num(1)?
                 }
-                "TL" => leading = num(0)?,
+                "TL" => state.leading = num(0)?,
+                "Tc" => state.char_spacing = num(0)?,
+                "Tw" => state.word_spacing = num(0)?,
+                "Tz" => state.scale = num(0)? / 100.,
+                "Ts" => {
+                    state.rise = num(0)?;
+                    moved = true;
+                }
                 "Td" | "TD" => {
                     let dy = num(1)?;
                     line = line.shift(num(0)?, dy);
                     if op.operator == "TD" {
-                        leading = -dy
+                        state.leading = -dy
                     }
+                    position = line;
                     moved = true
                 }
                 "T*" => {
-                    line = line.shift(0., -leading);
+                    line = line.shift(0., -state.leading);
+                    position = line;
                     moved = true
                 }
                 "Tj" | "TJ" | "'" | "\"" => {
                     if matches!(op.operator.as_str(), "'" | "\"") {
-                        line = line.shift(0., -leading);
+                        if op.operator == "\"" {
+                            state.word_spacing = num(0)?;
+                            state.char_spacing = num(1)?;
+                        }
+                        line = line.shift(0., -state.leading);
+                        position = line;
                         moved = true
                     }
-                    let Some(e) = enc.get(&font) else {
+                    let Some(font_metrics) = metrics.get(&font) else {
                         self.doc
                             .warn("Text using an unmapped PDF font was skipped.");
                         continue;
@@ -363,15 +461,45 @@ impl PageReader<'_> {
                         std::slice::from_ref(obj)
                     };
                     let mut text = String::new();
+                    let mut segments = Vec::new();
+                    let mut start = 0.;
+                    let mut advance = 0.;
+                    let mut pending_space = false;
                     for part in parts {
                         if let Ok(b) = part.as_str() {
-                            text.push_str(&Pdf::decode_text(e, b)?)
-                        } else if part.as_float().is_ok_and(|v| v < -150.) && !text.ends_with(' ') {
-                            text.push(' ')
+                            let decoded = if let Some(e) = enc.get(&font) {
+                                Pdf::decode_text(e, b)?
+                            } else {
+                                let mapping = &math_pi[&font];
+                                b.iter()
+                                    .map(|code| mapping.get(code).copied().unwrap_or('\u{fffd}'))
+                                    .collect()
+                            };
+                            if text.is_empty() {
+                                start = advance;
+                            }
+                            if pending_space
+                                && !text.is_empty()
+                                && !text.ends_with(char::is_whitespace)
+                                && !decoded.starts_with(char::is_whitespace)
+                            {
+                                text.push(' ');
+                            }
+                            text.push_str(&decoded);
+                            advance += font_metrics.advance(b, &decoded, state);
+                            pending_space = false;
+                        } else if let Ok(offset) = part.as_float() {
+                            if offset < -1100. && !text.is_empty() {
+                                segments.push((std::mem::take(&mut text), start, advance));
+                            }
+                            advance -= offset * state.size * state.scale / 1000.;
+                            pending_space |= offset < -120.;
                         }
                     }
-                    if text.is_empty() {
-                        continue;
+                    let basis = ctm.concat(position);
+                    position = position.shift(advance, 0.);
+                    if !text.is_empty() {
+                        segments.push((text, start, advance));
                     }
                     let base = fonts
                         .get(&font)
@@ -379,33 +507,46 @@ impl PageReader<'_> {
                         .and_then(|n| n.as_name().ok())
                         .map(|n| String::from_utf8_lossy(n).into_owned());
                     let lower = base.as_deref().unwrap_or("").to_ascii_lowercase();
-                    let basis = ctm.concat(line);
-                    let effective_size = size.abs() * basis.0[2].hypot(basis.0[3]);
-                    let run = Run {
-                        text,
-                        style: Style {
-                            bold: lower.contains("bold"),
-                            italic: lower.contains("italic") || lower.contains("oblique"),
-                            font: base,
-                            size: Some(format!("{effective_size}pt")),
-                            ..Style::default()
-                        },
-                        ..Run::default()
+                    let effective_size = state.size.abs() * basis.0[2].hypot(basis.0[3]);
+                    let style = Style {
+                        bold: lower.contains("bold") || lower.contains("heavy"),
+                        italic: lower.contains("italic") || lower.contains("oblique"),
+                        font: base,
+                        size: Some(format!("{effective_size}pt")),
+                        ..Style::default()
                     };
-                    if moved || self.fragments.is_empty() {
-                        let (x, y) = ctm.point(line.0[4], line.0[5]);
-                        if !x.is_finite() || !y.is_finite() {
+                    for (text, start, end) in segments {
+                        let (x, y) = basis.point(start, state.rise);
+                        let (end, _) = basis.point(end, state.rise);
+                        if !x.is_finite()
+                            || !y.is_finite()
+                            || !end.is_finite()
+                            || !effective_size.is_finite()
+                        {
                             return Err("non-finite PDF coordinates".into());
                         }
-                        self.fragments.push(Fragment {
-                            x,
-                            y,
-                            size: effective_size,
-                            runs: vec![run],
-                        });
+                        let run = Run {
+                            text,
+                            style: style.clone(),
+                            ..Run::default()
+                        };
+                        if !moved
+                            && start == 0.
+                            && let Some(f) = self.fragments.last_mut()
+                        {
+                            f.end = f.end.max(end);
+                            push_run(&mut f.runs, run);
+                        } else {
+                            self.fragments.push(Fragment {
+                                x,
+                                end: x.max(end),
+                                y,
+                                size: effective_size,
+                                horizontal: basis.0[0] > 0. && basis.0[1].abs() < basis.0[0] * 0.15,
+                                runs: vec![run],
+                            });
+                        }
                         moved = false;
-                    } else if let Some(f) = self.fragments.last_mut() {
-                        push_run(&mut f.runs, run)
                     }
                 }
                 "Do" => {
@@ -457,8 +598,10 @@ impl PageReader<'_> {
                                 let (x, y) = ctm.point(0., 0.);
                                 self.fragments.push(Fragment {
                                     x,
+                                    end: x.max(ctm.point(1., 0.).0).max(ctm.point(1., 1.).0),
                                     y,
                                     size: 0.,
+                                    horizontal: false,
                                     runs: vec![Run {
                                         image: Some(name),
                                         ..Run::default()

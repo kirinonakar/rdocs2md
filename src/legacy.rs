@@ -83,6 +83,175 @@ fn hwp_text(data: &[u8]) -> Result<String> {
     }
     Ok(String::from_utf16_lossy(&units))
 }
+
+#[derive(Clone, Copy)]
+struct HwpRecord<'a> {
+    tag: u32,
+    level: u32,
+    data: &'a [u8],
+}
+
+fn hwp_record<'a>(raw: &mut &'a [u8]) -> Result<HwpRecord<'a>> {
+    let header = u32le(raw, 0)?;
+    let mut offset = 4;
+    let mut size = (header >> 20) as usize;
+    if size == 4095 {
+        size = u32le(raw, offset)? as usize;
+        offset += 4;
+    }
+    let (data, rest) = raw[offset..]
+        .split_at_checked(size)
+        .ok_or("truncated HWP record")?;
+    *raw = rest;
+    Ok(HwpRecord {
+        tag: header & 1023,
+        level: (header >> 10) & 1023,
+        data,
+    })
+}
+
+fn hwp_table<'a>(
+    records: &mut std::iter::Peekable<impl Iterator<Item = Result<HwpRecord<'a>>>>,
+    level: u32,
+    depth: usize,
+    out: &mut Vec<Block>,
+) -> Result<()> {
+    if depth >= 32 {
+        return Err("HWP table nesting limit exceeded".into());
+    }
+    let child_level = level + 1;
+    let mut grid = Vec::new();
+    let mut columns = 0;
+    let mut current = None;
+    let mut trailing = Vec::new();
+    while let Some(record) = records.next_if(|r| r.as_ref().map_or(true, |r| r.level > level)) {
+        let record = record?;
+        if record.level == child_level {
+            match record.tag {
+                77 => {
+                    current = None;
+                    let rows = u16le(record.data, 4)? as usize;
+                    columns = u16le(record.data, 6)? as usize;
+                    if rows * columns > CELL_LIMIT {
+                        return Err("HWP table too large".into());
+                    }
+                    grid = (0..rows * columns)
+                        .map(|_| None)
+                        .collect::<Vec<Option<Cell>>>();
+                }
+                // Cell bodies share this level with their list headers. Captions have a
+                // shorter list header and can occur before the table definition.
+                72 => {
+                    current = None;
+                    if columns == 0 || record.data.len() < 34 {
+                        continue;
+                    }
+                    // HWP 5 cell lists store two 16-bit fields before the
+                    // 32-bit list flags. The cell address starts at byte eight.
+                    let column = u16le(record.data, 8)? as usize;
+                    let row = u16le(record.data, 10)? as usize;
+                    let colspan = u16le(record.data, 12)? as usize;
+                    let rowspan = u16le(record.data, 14)? as usize;
+                    if colspan == 0
+                        || rowspan == 0
+                        || column + colspan > columns
+                        || row + rowspan > grid.len() / columns
+                    {
+                        return Err("invalid HWP table cell bounds".into());
+                    }
+                    let index = row * columns + column;
+                    if grid[index].is_some() {
+                        return Err("duplicate HWP table cell".into());
+                    }
+                    grid[index] = Some(Cell {
+                        colspan: (colspan > 1).then_some(colspan),
+                        rowspan: (rowspan > 1).then_some(rowspan),
+                        ..Cell::default()
+                    });
+                    current = Some(index);
+                }
+                _ => {}
+            }
+        } else if let Some(index) = current {
+            let cell = grid[index].as_mut().unwrap();
+            hwp_block(records, record, depth + 1, &mut cell.blocks)?;
+        } else {
+            let blocks = if columns == 0 {
+                &mut *out
+            } else {
+                &mut trailing
+            };
+            hwp_block(records, record, depth + 1, blocks)?;
+        }
+    }
+    if columns > 0 && !grid.is_empty() {
+        let mut covered = vec![false; grid.len()];
+        let mut rows = Vec::new();
+        for (row, cells) in grid.chunks_mut(columns).enumerate() {
+            let mut items = Vec::new();
+            for (column, slot) in cells.iter_mut().enumerate() {
+                if covered[row * columns + column] {
+                    if slot.is_some() {
+                        return Err("overlapping HWP table cells".into());
+                    }
+                    continue;
+                }
+                let mut cell = slot.take().unwrap_or_default();
+                for r in row..row + cell.rowspan.unwrap_or(1) {
+                    let start = r * columns + column;
+                    let end = start + cell.colspan.unwrap_or(1);
+                    if covered[start..end].iter().any(|&occupied| occupied) {
+                        return Err("overlapping HWP table spans".into());
+                    }
+                    covered[start..end].fill(true);
+                }
+                // Unnested cells can use a Markdown table, with line breaks inside cells.
+                if cell
+                    .blocks
+                    .iter()
+                    .all(|b| matches!(b, Block::Paragraph { .. }))
+                {
+                    for block in std::mem::take(&mut cell.blocks) {
+                        if let Block::Paragraph { runs, .. } = block {
+                            if !cell.runs.is_empty() {
+                                push_run(&mut cell.runs, Run::text("\n"));
+                            }
+                            for run in runs {
+                                push_run(&mut cell.runs, run);
+                            }
+                        }
+                    }
+                }
+                items.push(cell);
+            }
+            rows.push(items);
+        }
+        out.push(Block::Table { rows });
+    }
+    out.extend(trailing);
+    Ok(())
+}
+
+fn hwp_block<'a>(
+    records: &mut std::iter::Peekable<impl Iterator<Item = Result<HwpRecord<'a>>>>,
+    record: HwpRecord<'a>,
+    depth: usize,
+    out: &mut Vec<Block>,
+) -> Result<()> {
+    match record.tag {
+        67 => {
+            let text = hwp_text(record.data)?;
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push(Block::text(text));
+            }
+        }
+        71 if record.data.starts_with(b" lbt") => hwp_table(records, record.level, depth, out)?,
+        _ => {}
+    }
+    Ok(())
+}
+
 fn hwp(ole: &mut Ole) -> Result<Document> {
     let head = stream(ole, "/FileHeader")?;
     if !head.starts_with(b"HWP Document File") || head.get(35) != Some(&5) {
@@ -123,70 +292,16 @@ fn hwp(ole: &mut Ole) -> Result<Document> {
             return Err("HWP expansion limit exceeded".into());
         }
         let mut sec = Section::new("section", &path);
-        let mut pos = 0;
-        let mut table: Option<(u32, Vec<Vec<Cell>>)> = None;
-        let mut current = None;
-        while pos < raw.len() {
-            let h = u32le(&raw, pos)?;
-            pos += 4;
-            let tag = h & 1023;
-            let level = (h >> 10) & 1023;
-            let mut size = (h >> 20) as usize;
-            if size == 4095 {
-                size = u32le(&raw, pos)? as usize;
-                pos += 4
+        let mut remaining = raw.as_slice();
+        let mut records = std::iter::from_fn(|| {
+            if remaining.is_empty() {
+                return None;
             }
-            let b = raw.get(pos..pos + size).ok_or("truncated HWP record")?;
-            pos += size;
-            if table.as_ref().is_some_and(|(l, _)| level < *l) {
-                sec.blocks.push(Block::Table {
-                    rows: table.take().unwrap().1,
-                });
-                current = None
-            }
-            match tag {
-                77 if table.is_none() => {
-                    let nr = u16le(b, 4)? as usize;
-                    let nc = u16le(b, 6)? as usize;
-                    if nr * nc > CELL_LIMIT {
-                        return Err("HWP table too large".into());
-                    }
-                    table = Some((level, vec![vec![Cell::default(); nc]; nr]));
-                    current = None
-                }
-                72 if table.is_some() && b.len() >= 16 => {
-                    let c = u16le(b, 6)? as usize;
-                    let r = u16le(b, 8)? as usize;
-                    current = None;
-                    if let Some(cell) = table
-                        .as_mut()
-                        .and_then(|(_, rows)| rows.get_mut(r))
-                        .and_then(|row| row.get_mut(c))
-                    {
-                        let w = u16le(b, 10)? as usize;
-                        let h = u16le(b, 12)? as usize;
-                        cell.colspan = (w > 1).then_some(w);
-                        cell.rowspan = (h > 1).then_some(h);
-                        current = Some((r, c));
-                    }
-                }
-                67 => {
-                    let t = hwp_text(b)?;
-                    if let (Some((_, rows)), Some((r, c))) = (&mut table, current) {
-                        let cell = &mut rows[r][c];
-                        if !cell.runs.is_empty() {
-                            cell.runs.push(Run::text("\n"))
-                        }
-                        cell.runs.push(Run::text(t))
-                    } else {
-                        sec.paragraph(t)
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some((_, rows)) = table {
-            sec.blocks.push(Block::Table { rows })
+            Some(hwp_record(&mut remaining))
+        })
+        .peekable();
+        while let Some(record) = records.next() {
+            hwp_block(&mut records, record?, 0, &mut sec.blocks)?;
         }
         doc.sections.push(sec)
     }

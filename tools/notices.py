@@ -9,15 +9,23 @@ metadata = json.loads(subprocess.check_output([
     "cargo", "metadata", "--locked", "--offline", "--format-version", "1",
     "--filter-platform", "x86_64-pc-windows-msvc",
 ], cwd=root))
-packages = {p["name"]: p for p in metadata["packages"] if p["source"]}
+packages = sorted(
+    (p for p in metadata["packages"] if p["source"]),
+    key=lambda p: (p["name"], p["version"], p["source"]),
+)
 parts = ["rdocs2md third-party notices (Windows x64 build)\n"]
-for name, package in sorted(packages.items()):
+for package in packages:
+    name = package["name"]
     directory = Path(package["manifest_path"]).parent
     files = [p for p in directory.rglob("*") if p.is_file() and
              p.name.upper().startswith(("LICENSE", "LICENCE", "COPYRIGHT", "NOTICE", "COPYING"))
              and p.suffix not in (".rs", ".toml")]
     if name == "alloc-stdlib":
-        files.append(Path(packages["alloc-no-stdlib"]["manifest_path"]).with_name("LICENSE"))
+        dependencies = next(node["deps"] for node in metadata["resolve"]["nodes"]
+                            if node["id"] == package["id"])
+        dependency_id = next(dep["pkg"] for dep in dependencies if dep["name"] == "alloc_no_stdlib")
+        dependency = next(p for p in packages if p["id"] == dependency_id)
+        files.append(Path(dependency["manifest_path"]).with_name("LICENSE"))
     if not files:
         raise ValueError(f"No license found in {directory}")
     parts.append(f'\n{name} {package["version"]} | {package["license"]}\n{package["repository"]}\n')
@@ -26,7 +34,11 @@ for name, package in sorted(packages.items()):
 (root / "THIRD-PARTY-NOTICES.txt").write_text("".join(parts), encoding="utf-8", newline="\n")
 sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
 stdlib = (sysroot / "share/doc/rust/COPYRIGHT-library.html").read_bytes()
-notices = (root / "LICENSE").read_bytes() + b"\n" + "".join(parts).encode("utf-8")
+attribution = (
+    "This product was developed with reference to Hancom's published "
+    "documentation for the HWP document file format (.hwp).\n"
+)
+notices = (root / "LICENSE").read_bytes() + b"\n" + attribution.encode("utf-8") + b"\n" + "".join(parts).encode("utf-8")
 destination = root / "licenses"
 destination.mkdir(exist_ok=True)
 (destination / "distribution-notices.gz").write_bytes(

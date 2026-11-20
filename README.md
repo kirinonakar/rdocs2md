@@ -150,4 +150,6 @@ There are 8 direct dependencies. Versions are pinned in `Cargo.lock`.
 | serde | Serialization of the shared document model |
 | serde_json | JSON output and MCP messages |
 
-The project source is under the [MIT license](LICENSE). For the 70 external packages (including build tools) in the Windows target Cargo metadata, the declared licenses and notice files were verified. None of these packages require GPL or AGPL. The original texts, including BSD and Unicode data notices, are in [third-party notices](THIRD-PARTY-NOTICES.txt). The distributed EXE prints the project license, Cargo dependency notices, and Rust standard library notices with `--licenses`. After updating versions, regenerate the notices with `python tools/notices.py`.
+The project source is under the [MIT license](LICENSE). For the 76 external packages (including build tools) in the Windows target Cargo metadata, the declared licenses and notice files were verified. None of these packages require GPL or AGPL. The original texts, including BSD and Unicode data notices, are in [third-party notices](THIRD-PARTY-NOTICES.txt). The distributed EXE prints the project license, Cargo dependency notices, and Rust standard library notices with `--licenses`. After updating versions, regenerate the notices with `python tools/notices.py`.
+
+This product was developed with reference to Hancom's published documentation for the HWP document file format (.hwp).

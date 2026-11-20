@@ -119,10 +119,41 @@ fn pdf_columns_coordinates_and_page_range() {
     let resource = p.add_object(dictionary! {"Font"=>dictionary!{"F"=>f}});
     let mut pages = Vec::new();
     for _ in 0..2 {
-        let mut content = String::new();
-        for y in [700, 650, 600] {
-            for (x, col) in [(40, "left"), (350, "right")] {
-                content += &format!("BT /F 12 Tf 1 0 0 1 {x} {y} Tm ({col}{y}) Tj ET\n")
+        let mut content = String::from(
+            "BT /F 18 Tf 1 0 0 1 40 750 Tm (A full-width heading across the three text columns) Tj ET\n",
+        );
+        for (x, offset, lines) in [
+            (
+                40,
+                0,
+                [
+                    "This is the first para-",
+                    "graph in the left column.",
+                    "Another left paragraph.",
+                ],
+            ),
+            (
+                220,
+                2,
+                [
+                    "The middle column starts",
+                    "separately from the left.",
+                    "Another middle paragraph.",
+                ],
+            ),
+            (
+                400,
+                1,
+                [
+                    "The right column begins",
+                    "under the same heading.",
+                    "Another right paragraph.",
+                ],
+            ),
+        ] {
+            for (i, line) in lines.iter().enumerate() {
+                let y = 700 - offset - (i as i32 * 14) - i.saturating_sub(1) as i32 * 12;
+                content += &format!("BT /F 12 Tf 1 0 0 1 {x} {y} Tm ({line}) Tj ET\n");
             }
         }
         let stream = p.add_object(Stream::new(dictionary! {}, content.into_bytes()));
@@ -140,8 +171,101 @@ fn pdf_columns_coordinates_and_page_range() {
     let mut d = convert(&bytes, false).unwrap();
     d.select("2").unwrap();
     let s = md(&d);
-    assert!(s.find("left600").unwrap() < s.find("right700").unwrap());
+    assert!(
+        s.contains("This is the first paragraph in the left column.\n\nAnother left paragraph.")
+    );
+    assert!(s.contains("The middle column starts separately from the left."));
+    assert!(s.contains("The right column begins under the same heading."));
+    assert!(s.find("Another left paragraph.").unwrap() < s.find("The middle column").unwrap());
+    assert!(s.find("Another middle paragraph.").unwrap() < s.find("The right column").unwrap());
+    assert!(s.find("A full-width heading").unwrap() < s.find("This is the first").unwrap());
     assert!(serde_json::to_string(&d).unwrap().contains("x_pt"));
+}
+
+#[test]
+fn hwp_tables_keep_merged_cells_and_nested_answers() {
+    fn record(out: &mut Vec<u8>, tag: u32, level: u32, data: &[u8]) {
+        let header = (data.len() as u32) << 20 | level << 10 | tag;
+        out.extend_from_slice(&header.to_le_bytes());
+        out.extend_from_slice(data);
+    }
+    fn table(out: &mut Vec<u8>, level: u32, rows: u16, columns: u16) {
+        record(out, 71, level, b" lbt");
+        let mut data = [0; 8];
+        data[4..6].copy_from_slice(&rows.to_le_bytes());
+        data[6..8].copy_from_slice(&columns.to_le_bytes());
+        record(out, 77, level + 1, &data);
+    }
+    fn cell(out: &mut Vec<u8>, level: u32, address: [u16; 4]) {
+        let mut data = vec![1, 0, 0, 0, 0, 0, 5, 0];
+        data.extend(address.into_iter().flat_map(u16::to_le_bytes));
+        data.resize(47, 0);
+        record(out, 72, level, &data);
+    }
+    fn paragraph(out: &mut Vec<u8>, level: u32, text: &str) {
+        record(out, 66, level, &[]);
+        let text: Vec<_> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        record(out, 67, level + 1, &text);
+    }
+    let mut raw = Vec::new();
+    paragraph(&mut raw, 0, "Before");
+    table(&mut raw, 1, 2, 3);
+    cell(&mut raw, 2, [0, 0, 1, 2]);
+    paragraph(&mut raw, 2, "1");
+    cell(&mut raw, 2, [1, 0, 2, 1]);
+    paragraph(&mut raw, 2, "Question and answer");
+    cell(&mut raw, 2, [1, 1, 1, 1]);
+    paragraph(&mut raw, 2, "Question");
+    cell(&mut raw, 2, [2, 1, 1, 1]);
+    paragraph(&mut raw, 2, "Answer");
+    table(&mut raw, 3, 1, 1);
+    cell(&mut raw, 4, [0, 0, 1, 1]);
+    paragraph(&mut raw, 4, "Nested answer");
+    paragraph(&mut raw, 2, "Answer continued");
+    paragraph(&mut raw, 0, "After");
+    let mut file = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+    let mut header = [0; 40];
+    header[..17].copy_from_slice(b"HWP Document File");
+    header[35] = 5;
+    file.create_stream("/FileHeader")
+        .unwrap()
+        .write_all(&header)
+        .unwrap();
+    file.create_storage("/BodyText").unwrap();
+    file.create_stream("/BodyText/Section0")
+        .unwrap()
+        .write_all(&raw)
+        .unwrap();
+    let doc = convert(&file.into_inner().into_inner(), false).unwrap();
+    let text = md(&doc);
+    assert!(text.contains("<td rowspan=\"2\">1</td><td colspan=\"2\">Question and answer</td>"));
+    assert!(text.contains("<td>Question</td><td><p>Answer</p>\n<table>"));
+    assert!(text.contains("<td>Nested answer</td>"));
+    assert!(text.contains("<p>Answer continued</p>\n</td>"));
+    assert!(text.starts_with("Before\n\n<table>") && text.ends_with("After\n\n"));
+}
+
+#[test]
+fn hwpx_keeps_real_underlines_and_ignores_blank_paragraphs() {
+    let doc = convert(&package(&[
+        ("Contents/content.hpf", "<package/>"),
+        ("Contents/header.xml", r#"<head><charPr id="1"><underline type="NONE" shape="SOLID"/></charPr><charPr id="2"><underline type="BOTTOM" shape="SOLID"/></charPr></head>"#),
+        ("Contents/section0.xml", r#"<sec><p><run charPrIDRef="1"><t>Plain</t></run></p><p><run><t> </t></run></p><p><run charPrIDRef="2"><t>Underlined</t></run></p></sec>"#),
+    ]), false).unwrap();
+    assert_eq!(md(&doc).trim(), "Plain\n\n<u>Underlined</u>");
+}
+
+#[test]
+fn docx_empty_spacer_tables_and_paragraphs_are_omitted() {
+    let doc = convert(&package(&[
+        ("[Content_Types].xml", r#"<Types><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#),
+        ("_rels/.rels", r#"<Relationships><Relationship Id="a" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#),
+        ("word/document.xml", r#"<document><body><p><r><t>Before</t></r></p><tbl><tr><tc><p/></tc></tr></tbl><p><r><t>&#160;</t></r></p><tbl><tr><tc><p><r><t>Real table</t></r></p></tc></tr></tbl><p><r><t>After</t></r></p></body></document>"#),
+    ]), false).unwrap();
+    assert_eq!(
+        md(&doc).trim(),
+        "Before\n\n| Real table |\n| --- |\n\nAfter"
+    );
 }
 #[test]
 #[ignore = "run tests/fetch-samples.ps1 once and then cargo test -- --ignored"]
