@@ -77,7 +77,16 @@ fn runs(items: &[Run], html: bool, links: &Properties) -> String {
         if let Some(img) = &r.image
             && let Some(link) = links.get(img)
         {
-            t = if html {
+            t = if let Some(layout) = &r.image_layout {
+                format!(
+                    "<img alt=\"{}\" src=\"{}\" style=\"width:{}pt;height:{}pt;transform:rotate({}deg)\">",
+                    escape(&r.text),
+                    escape(&uri(link)),
+                    f64::from(layout.width) / 100.,
+                    f64::from(layout.height) / 100.,
+                    layout.rotation_deg
+                )
+            } else if html {
                 format!(
                     "<img alt=\"{}\" src=\"{}\">",
                     escape(&r.text),

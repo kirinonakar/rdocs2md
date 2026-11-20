@@ -499,6 +499,7 @@ impl PageReader<'_> {
                     let mut start = 0.;
                     let mut advance = 0.;
                     let mut pending_space = false;
+                    let mut decimal_gap = None;
                     // Some tables space individual glyphs an entire column apart
                     // with Tc, even when several cells share one PDF string.
                     let tracking = state.char_spacing * state.scale;
@@ -518,6 +519,20 @@ impl PageReader<'_> {
                                     .map(|code| mapping.get(code).copied().unwrap_or('\u{fffd}'))
                                     .collect()
                             };
+                            if let Some(end) = decimal_gap.take()
+                                && decoded.trim().split_once('.').is_some_and(
+                                    |(whole, fraction)| {
+                                        !whole.is_empty()
+                                            && !fraction.is_empty()
+                                            && whole
+                                                .bytes()
+                                                .chain(fraction.bytes())
+                                                .all(|b| b.is_ascii_digit())
+                                    },
+                                )
+                            {
+                                segments.push((std::mem::take(&mut text), start, end));
+                            }
                             if separate_glyphs
                                 && self.fragments.len() + segments.len() + b.len() / code_width
                                     <= TRACKED_GLYPH_LIMIT
@@ -552,6 +567,10 @@ impl PageReader<'_> {
                         } else if let Ok(offset) = part.as_float() {
                             if offset < -1100. && !text.is_empty() {
                                 segments.push((std::mem::take(&mut text), start, advance));
+                                decimal_gap = None;
+                            } else if offset < -800. && !text.is_empty() && decimal_gap.is_none() {
+                                // Decimal columns can be closer than the general text split.
+                                decimal_gap = Some(advance);
                             }
                             advance -= offset * state.size * state.scale / 1000.;
                             pending_space |= offset < -120.;

@@ -182,8 +182,7 @@ fn pdf_columns_coordinates_and_page_range() {
     assert!(serde_json::to_string(&d).unwrap().contains("x_pt"));
 }
 
-#[test]
-fn pdf_spaced_glyphs_and_ruled_headings_form_a_table() {
+fn positioned_pdf(content: String) -> Vec<u8> {
     use lopdf::{Document as Pdf, Stream, dictionary};
 
     let mut pdf = Pdf::with_version("1.4");
@@ -191,6 +190,31 @@ fn pdf_spaced_glyphs_and_ruled_headings_form_a_table() {
     let font =
         pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
     let resources = dictionary! {"Font"=>dictionary! {"F"=>font}};
+    let stream = pdf.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let page = pdf.add_object(dictionary! {
+        "Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources,
+        "MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]
+    });
+    pdf.objects.insert(
+        tree,
+        dictionary! {"Type"=>"Pages","Kids"=>vec![lopdf::Object::Reference(page)],"Count"=>1}
+            .into(),
+    );
+    let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree});
+    pdf.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    pdf.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn cell_text(row: &[Cell]) -> Vec<String> {
+    row.iter()
+        .map(|cell| cell.runs.iter().map(|run| run.text.as_str()).collect())
+        .collect()
+}
+
+#[test]
+fn pdf_spaced_glyphs_and_ruled_headings_form_a_table() {
     let mut content = String::from(
         "84 167 m 180 167 l 196 167 m 292 167 l S\n\
          84 156 m 124 156 l 140 156 m 180 156 l 196 156 m 236 156 l 252 156 m 292 156 l S\n\
@@ -212,22 +236,7 @@ fn pdf_spaced_glyphs_and_ruled_headings_form_a_table() {
          1 0 0 1 36 123 Tm [(1) 3000 (0) -2000 (76543210)] TJ\n\
          0 Tc 1 0 0 1 40 108 Tm (Table note) Tj ET\n",
     );
-    let stream = pdf.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-    let page = pdf.add_object(dictionary! {
-        "Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources,
-        "MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]
-    });
-    pdf.objects.insert(
-        tree,
-        dictionary! {"Type"=>"Pages","Kids"=>vec![lopdf::Object::Reference(page)],"Count"=>1}
-            .into(),
-    );
-    let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree});
-    pdf.trailer.set("Root", catalog);
-    let mut bytes = Vec::new();
-    pdf.save_to(&mut bytes).unwrap();
-
-    let doc = convert(&bytes, false).unwrap();
+    let doc = convert(&positioned_pdf(content), false).unwrap();
     let [
         Block::Paragraph { .. },
         Block::Table { rows },
@@ -241,25 +250,53 @@ fn pdf_spaced_glyphs_and_ruled_headings_form_a_table() {
     assert_eq!(rows[0][2].colspan, Some(4));
     assert!(rows[1][1..].iter().all(|cell| cell.colspan == Some(2)));
     assert!(rows[2..].iter().all(|row| row.len() == 9));
-    let values = |row: &[Cell]| {
-        row.iter()
-            .map(|cell| {
-                cell.runs
-                    .iter()
-                    .map(|run| run.text.as_str())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(values(&rows[0]), ["", "Reader A", "Reader B"]);
+    assert_eq!(cell_text(&rows[0]), ["", "Reader A", "Reader B"]);
     assert_eq!(
-        values(&rows[3]),
+        cell_text(&rows[3]),
         ["9", "0", "1", "2", "3", "4", "5", "6", "7"]
     );
     assert_eq!(
-        values(&rows[4]),
+        cell_text(&rows[4]),
         ["10", "7", "6", "5", "4", "3", "2", "1", "0"]
     );
+}
+
+#[test]
+fn pdf_ruled_table_keeps_section_rows_and_wrapped_headings_beside_prose() {
+    let content = "40 150 m 222 150 l S 40 80 m 222 80 l S\n\
+        BT /F 8 Tf\n\
+        1 0 0 1 94 167 Tm (First) Tj 1 0 0 1 166 167 Tm (Third) Tj\n\
+        1 0 0 1 250 163 Tm (Adjacent prose) Tj\n\
+        1 0 0 1 40 156 Tm (Measure) Tj 1 0 0 1 94 156 Tm (score) Tj\n\
+        1 0 0 1 145 156 Tm (B) Tj 1 0 0 1 166 156 Tm (score) Tj\n\
+        1 0 0 1 250 151 Tm (next line) Tj\n\
+        1 0 0 1 42 140 Tm (First group) Tj\n\
+        1 0 0 1 45 129 Tm (Mean) Tj 1 0 0 1 94 129 Tm (0.51) Tj\n\
+        1 0 0 1 145 129 Tm [(0.53) -821 (0.87)] TJ\n\
+        1 0 0 1 42 107 Tm (Second group) Tj\n\
+        1 0 0 1 45 96 Tm (Mean) Tj 1 0 0 1 94 96 Tm (0.61) Tj\n\
+        1 0 0 1 145 96 Tm [(0.68) -821 (0.93)] TJ\n\
+        /F 7 Tf 1 0 0 1 40 70 Tm (Table note) Tj ET";
+    let doc = convert(&positioned_pdf(content.into()), false).unwrap();
+    let table = doc.sections[0].blocks.iter().find_map(|block| match block {
+        Block::Table { rows } => Some(rows),
+        _ => None,
+    });
+    let rows = table.expect("expected one ruled table");
+    assert_eq!(rows.len(), 5);
+    assert_eq!(
+        cell_text(&rows[0]),
+        ["Measure", "First score", "B", "Third score"]
+    );
+    assert_eq!(cell_text(&rows[1]), ["First group"]);
+    assert_eq!(rows[1][0].colspan, Some(4));
+    assert_eq!(cell_text(&rows[2]), ["Mean", "0.51", "0.53", "0.87"]);
+    assert_eq!(cell_text(&rows[3]), ["Second group"]);
+    assert_eq!(rows[3][0].colspan, Some(4));
+    assert_eq!(cell_text(&rows[4]), ["Mean", "0.61", "0.68", "0.93"]);
+    let rendered = md(&doc);
+    assert_eq!(rendered.matches("<table>").count(), 1);
+    assert!(rendered.contains("Adjacent prose") && rendered.contains("</table>\n\nTable note"));
 }
 
 #[test]
@@ -298,9 +335,19 @@ fn hwp_tables_keep_merged_cells_and_nested_answers() {
     paragraph(&mut raw, 2, "Question");
     cell(&mut raw, 2, [2, 1, 1, 1]);
     paragraph(&mut raw, 2, "Answer");
-    table(&mut raw, 3, 1, 1);
+    table(&mut raw, 3, 1, 2);
     cell(&mut raw, 4, [0, 0, 1, 1]);
     paragraph(&mut raw, 4, "Nested answer");
+    cell(&mut raw, 4, [1, 0, 1, 1]);
+    let mut shape = [0; 50];
+    shape[..8].copy_from_slice(b"cip$cip$");
+    shape[28..32].copy_from_slice(&950_u32.to_le_bytes());
+    shape[32..36].copy_from_slice(&1000_u32.to_le_bytes());
+    shape[40..42].copy_from_slice(&270_u16.to_le_bytes());
+    record(&mut raw, 76, 6, &shape);
+    let mut picture = [0; 73];
+    picture[71..73].copy_from_slice(&1_u16.to_le_bytes());
+    record(&mut raw, 85, 7, &picture);
     paragraph(&mut raw, 2, "Answer continued");
     paragraph(&mut raw, 0, "After");
     let mut file = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
@@ -316,7 +363,32 @@ fn hwp_tables_keep_merged_cells_and_nested_answers() {
         .unwrap()
         .write_all(&raw)
         .unwrap();
-    let doc = convert(&file.into_inner().into_inner(), false).unwrap();
+    let mut bin_data = vec![0x11, 0, 7, 0, 3, 0];
+    bin_data.extend("bmp".encode_utf16().flat_map(u16::to_le_bytes));
+    let mut info = Vec::new();
+    record(&mut info, 18, 0, &bin_data);
+    file.create_stream("/DocInfo")
+        .unwrap()
+        .write_all(&info)
+        .unwrap();
+    let mut bitmap = [0; 58];
+    bitmap[..2].copy_from_slice(b"BM");
+    bitmap[2] = 58;
+    bitmap[10] = 54;
+    bitmap[14] = 40;
+    bitmap[18] = 1;
+    bitmap[22] = 1;
+    bitmap[26] = 1;
+    bitmap[28] = 24;
+    let mut packed = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    packed.write_all(&bitmap).unwrap();
+    file.create_storage("/BinData").unwrap();
+    file.create_stream("/BinData/BIN0007.bmp")
+        .unwrap()
+        .write_all(&packed.finish().unwrap())
+        .unwrap();
+    let file = file.into_inner().into_inner();
+    let doc = convert(&file, false).unwrap();
     let text = md(&doc);
     assert!(text.contains("<td rowspan=\"2\">1</td><td colspan=\"2\">Question and answer</td>"));
     assert!(text.contains("<td>Question</td><td><p>Answer</p>\n<table>"));
@@ -324,6 +396,13 @@ fn hwp_tables_keep_merged_cells_and_nested_answers() {
     assert!(text.contains("</table>\n<p>Answer continued</p>\n</td>"));
     assert_eq!(text.matches("\n\n").count(), 3);
     assert!(text.starts_with("Before\n\n<table>") && text.ends_with("After\n\n"));
+    assert!(doc.assets.is_empty());
+
+    let doc = convert(&file, true).unwrap();
+    assert_eq!(doc.assets["hwp/1"], bitmap);
+    let links = Properties::from([("hwp/1".into(), "image.bmp".into())]);
+    let result = render(&doc, "md", "hybrid", &links).unwrap();
+    assert!(result.contains("<td><img alt=\"\" src=\"image.bmp\" style=\"width:9.5pt;height:10pt;transform:rotate(270deg)\"></td>"));
 }
 
 #[test]

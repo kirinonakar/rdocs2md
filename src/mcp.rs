@@ -16,7 +16,7 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
     for (name, description) in [
         (
             "convert_document",
-            "Convert a local document to Markdown. Supply a new output_path for large results.",
+            "Convert a local document to Markdown, HTML, or JSON. Supply a new output_path for large results.",
         ),
         (
             "inspect_document",
@@ -39,13 +39,18 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
             required.push("path")
         }
         if matches!(name, "convert_document" | "extract_document_range") {
+            props["format"] = json!({
+                "type":"string",
+                "enum":["md","html","json"],
+                "default":"md",
+                "description":"Output format: Markdown, HTML, or JSON."
+            });
             props["mode"] = json!({"type":"string","enum":["semantic","hybrid","layout"]});
             props["extract_images"] = json!({"type":"boolean"});
             props["image_dir"] = json!({"type":"string","description":format!("Image directory. Its parent must exist. {scope}")});
             props["range"] =
                 json!({"type":"string","description":"1-based inclusive ranges, e.g. 1-3,5."});
-            props["output_path"] =
-                json!({"type":"string","description":format!("New Markdown filename. {scope}")});
+            props["output_path"] = json!({"type":"string","description":format!("New filename with an extension that matches format. {scope}")});
         }
         if name == "extract_document_range" {
             required.push("range")
@@ -132,13 +137,16 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<String> {
     if let Some(r) = text("range") {
         d.select(r)?
     }
+    let format = text("format").unwrap_or("md");
     let out = text("output_path")
         .map(|p| access.local(p, true))
         .transpose()?;
     if let Some(p) = &out
-        && (p.exists() || p.extension().is_none_or(|v| !v.eq_ignore_ascii_case("md")))
+        && (p.exists()
+            || p.extension()
+                .is_none_or(|v| !v.eq_ignore_ascii_case(format)))
     {
-        return Err("output_path must be a new .md file".into());
+        return Err(format!("output_path must be a new .{format} file").into());
     }
     let mut links = Properties::new();
     if images {
@@ -155,7 +163,7 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<String> {
                 .unwrap_or(&access.root),
         )?;
     }
-    let value = render(&d, "md", mode, &links)?;
+    let value = render(&d, format, mode, &links)?;
     if let Some(p) = out {
         output::save(&p, value.as_bytes(), true)?;
         Ok(serde_json::to_string(
@@ -234,7 +242,15 @@ fn dispatch(access: &Access, req: Value, phase: &mut u8, defs: &[Value]) -> Opti
             }
             let response =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(access, name, args)));
-            let (s,bad)=match response{Ok(Ok(s)) if s.len()<=INLINE=>(s,false),Ok(Ok(_))=>("Result exceeds 512 KiB. Use a smaller range or save converted Markdown with output_path.".into(),true),Ok(Err(e))=>(e.to_string(),true),Err(_)=>("Document parser failed".into(),true)};
+            let (s, bad) = match response {
+                Ok(Ok(s)) if s.len() <= INLINE => (s, false),
+                Ok(Ok(_)) => (
+                    "Result exceeds 512 KiB. Use a smaller range or save with output_path.".into(),
+                    true,
+                ),
+                Ok(Err(e)) => (e.to_string(), true),
+                Err(_) => ("Document parser failed".into(), true),
+            };
             json!({"content":[{"type":"text","text":s}],"isError":bad})
         }
         _ => return Some(rpc_error(id, -32601, "Method not found")),

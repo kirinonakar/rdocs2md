@@ -39,7 +39,7 @@ fn stream(ole: &mut Ole, name: &str) -> Result<Vec<u8>> {
     st.take(PART_LIMIT as u64 + 1).read_to_end(&mut v)?;
     Ok(v)
 }
-pub fn parse(data: &[u8]) -> Result<Document> {
+pub fn parse(data: &[u8], images: bool) -> Result<Document> {
     // The CFB reader validates allocation chains even in compatibility mode.
     // Some PowerPoint producers leave directory name terminators uninitialized.
     let mut ole = cfb::CompoundFile::open(Cursor::new(data))?;
@@ -47,7 +47,7 @@ pub fn parse(data: &[u8]) -> Result<Document> {
         return Err("encrypted Office package is unsupported".into());
     }
     if ole.is_stream("/FileHeader") {
-        hwp(&mut ole)
+        hwp(&mut ole, images)
     } else if ole.is_stream("/WordDocument") {
         word(&mut ole)
     } else if ole.is_stream("/PowerPoint Document") {
@@ -247,12 +247,119 @@ fn hwp_block<'a>(
             }
         }
         71 if record.data.starts_with(b" lbt") => hwp_table(records, record.level, depth, out)?,
+        76 if record.data.starts_with(b"cip$") => {
+            if let Some(picture) = records.next_if(|r| {
+                r.as_ref()
+                    .is_ok_and(|p| p.tag == 85 && p.level == record.level + 1)
+            }) && let Ok(id) = u16le(picture?.data, 71)
+                && id != 0
+            {
+                // The common shape record repeats the control ID for a top-level object.
+                let base = if record.data.starts_with(b"cip$cip$") {
+                    8
+                } else {
+                    4
+                };
+                let dimensions = || -> Result<ImageLayout> {
+                    let width = (u32le(record.data, base + 20)? as i32).unsigned_abs();
+                    let height = (u32le(record.data, base + 24)? as i32).unsigned_abs();
+                    let rotation_deg = u16le(record.data, base + 32)? % 360;
+                    Ok(ImageLayout {
+                        width,
+                        height,
+                        rotation_deg,
+                    })
+                };
+                out.push(Block::flow(vec![Run {
+                    image: Some(format!("hwp/{id}")),
+                    image_layout: dimensions().ok().filter(|layout| {
+                        (1..=200_000).contains(&layout.width)
+                            && (1..=200_000).contains(&layout.height)
+                    }),
+                    ..Run::default()
+                }]));
+            }
+        }
         _ => {}
     }
     Ok(())
 }
 
-fn hwp(ole: &mut Ole) -> Result<Document> {
+fn hwp_stream(ole: &mut Ole, path: &str, compressed: bool) -> Result<Vec<u8>> {
+    let bytes = stream(ole, path)?;
+    if !compressed {
+        return Ok(bytes);
+    }
+    let mut decoded = Vec::new();
+    flate2::read::DeflateDecoder::new(&bytes[..])
+        .take(PART_LIMIT as u64 + 1)
+        .read_to_end(&mut decoded)?;
+    if decoded.len() > PART_LIMIT {
+        return Err("HWP stream expansion limit exceeded".into());
+    }
+    Ok(decoded)
+}
+
+fn hwp_images(ole: &mut Ole, doc: &mut Document, compressed: bool, mut total: usize) -> Result<()> {
+    let sources = image_sources(doc);
+    if sources.is_empty() || !ole.is_stream("/DocInfo") {
+        return Ok(());
+    }
+    let info = hwp_stream(ole, "/DocInfo", compressed)?;
+    total += info.len();
+    if total > FILE_LIMIT {
+        return Err("HWP expansion limit exceeded".into());
+    }
+    let mut remaining = info.as_slice();
+    let mut id = 0;
+    while !remaining.is_empty() {
+        let record = hwp_record(&mut remaining)?;
+        if record.tag != 18 {
+            continue;
+        }
+        // Picture records use the one-based BinData record index, not the stream ID.
+        id += 1;
+        let key = format!("hwp/{id}");
+        if !sources.contains(&key) {
+            continue;
+        }
+        let attributes = u16le(record.data, 0)?;
+        if attributes & 0xf != 1 {
+            continue;
+        }
+        let stream_id = u16le(record.data, 2)?;
+        let length = usize::from(u16le(record.data, 4)?) * 2;
+        let ext = utf16(
+            record
+                .data
+                .get(6..6 + length)
+                .ok_or("truncated HWP image extension")?,
+        )?;
+        if ext.is_empty() || ext.len() > 8 || !ext.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let path = format!("/BinData/BIN{stream_id:04X}.{ext}");
+        if !ole.is_stream(&path) {
+            continue;
+        }
+        let packed = match attributes & 0x30 {
+            0x10 => true,
+            0x20 => false,
+            _ => compressed,
+        };
+        let bytes = hwp_stream(ole, &path, packed)?;
+        total += bytes.len();
+        if total > FILE_LIMIT {
+            return Err("HWP expansion limit exceeded".into());
+        }
+        if image_ext(&bytes).is_some() {
+            doc.assets.insert(key, bytes);
+        }
+    }
+    Ok(())
+}
+
+fn hwp(ole: &mut Ole, images: bool) -> Result<Document> {
     let head = stream(ole, "/FileHeader")?;
     if !head.starts_with(b"HWP Document File") || head.get(35) != Some(&5) {
         return Err("expected HWP version 5".into());
@@ -276,19 +383,11 @@ fn hwp(ole: &mut Ole) -> Result<Document> {
     files.sort();
     let mut doc = Document::new("hwp");
     let mut total = 0;
+    let compressed = flags & 1 != 0;
     for (_, path) in files {
-        let raw = stream(ole, &path)?;
-        let raw = if flags & 1 != 0 {
-            let mut b = Vec::new();
-            flate2::read::DeflateDecoder::new(&raw[..])
-                .take(PART_LIMIT as u64 + 1)
-                .read_to_end(&mut b)?;
-            b
-        } else {
-            raw
-        };
+        let raw = hwp_stream(ole, &path, compressed)?;
         total += raw.len();
-        if raw.len() > PART_LIMIT || total > FILE_LIMIT {
+        if total > FILE_LIMIT {
             return Err("HWP expansion limit exceeded".into());
         }
         let mut sec = Section::new("section", &path);
@@ -304,6 +403,9 @@ fn hwp(ole: &mut Ole) -> Result<Document> {
             hwp_block(&mut records, record?, 0, &mut sec.blocks)?;
         }
         doc.sections.push(sec)
+    }
+    if images {
+        hwp_images(ole, &mut doc, compressed, total)?;
     }
     Ok(doc)
 }

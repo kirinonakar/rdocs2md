@@ -228,6 +228,16 @@ pub struct Run {
     pub link: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_layout: Option<ImageLayout>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageLayout {
+    // Dimensions are in hundredths of a point.
+    pub width: u32,
+    pub height: u32,
+    pub rotation_deg: u16,
 }
 fn is_plain(s: &Style) -> bool {
     *s == Style::default()

@@ -38,7 +38,7 @@ pub fn convert(b: &[u8], images: bool) -> Result<Document> {
     } else if b.starts_with(b"PK\x03\x04") {
         office::package(b, images)?
     } else if b.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") {
-        legacy::parse(b)?
+        legacy::parse(b, images)?
     } else {
         return Err("unrecognized document signature".into());
     };
@@ -55,8 +55,8 @@ pub const FORMATS: &[(&str, &str, &str)] = &[
     ),
     (
         "hwp",
-        "HWP 5 BodyText, raw DEFLATE, Unicode paragraphs, simple cell records",
-        "No distribution-protected files, drawing objects or full character styles",
+        "HWP 5 BodyText, raw DEFLATE, Unicode paragraphs, tables and embedded raster pictures",
+        "No distribution-protected files, general vector drawings or full character styles",
     ),
     (
         "hwpx",

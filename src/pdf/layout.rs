@@ -1,5 +1,5 @@
 use crate::model::{Block, Cell, Properties, Run, Section, push_run};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, ops::Range};
 
 pub(super) struct Fragment {
     pub x: f32,
@@ -148,6 +148,7 @@ enum Content {
     Table {
         prefix: Vec<Item>,
         rows: Vec<Vec<Cell>>,
+        suffix: Vec<Item>,
     },
 }
 
@@ -433,6 +434,179 @@ fn ruled_headings(
     (baseline, headings)
 }
 
+fn cells_in_rule(band: &[Fragment], rule: &HorizontalRule) -> Range<usize> {
+    let start = band.partition_point(|f| f.x < rule.left - 1.);
+    start..band.partition_point(|f| f.x <= rule.right + 1.)
+}
+
+fn positioned_cell(mut f: Fragment) -> Cell {
+    clean_line(&mut f.runs);
+    Cell {
+        properties: coordinates(f.x, f.y),
+        runs: f.runs,
+        ..Cell::default()
+    }
+}
+
+fn ruled_table(
+    bands: &mut [Vec<Fragment>],
+    baselines: &[f32],
+    top: &HorizontalRule,
+    bottom: &HorizontalRule,
+) -> Option<Item> {
+    let first = baselines.partition_point(|&y| y > top.y);
+    let last = baselines.partition_point(|&y| y > bottom.y);
+    if first == 0 || first >= last {
+        return None;
+    }
+    let body: Vec<_> = (first..last)
+        .map(|i| (i, cells_in_rule(&bands[i], top)))
+        .filter(|(_, cells)| !cells.is_empty())
+        .collect();
+    let (i, cells) = body.iter().find(|(_, cells)| cells.len() >= 3)?;
+    let template = &bands[*i][cells.clone()];
+    let width = template.len();
+    let size = template[0].size;
+    let section_row =
+        |row: &[Fragment]| row.len() == 1 && row[0].horizontal && row[0].x <= template[0].x + size;
+    if width > 32
+        || body.len().saturating_mul(width) > crate::model::CELL_LIMIT
+        || !body.iter().any(|(i, r)| section_row(&bands[*i][r.clone()]))
+        || body.iter().filter(|(_, r)| r.len() == width).count() < 2
+        || body.iter().any(|(i, r)| {
+            let row = &bands[*i][r.clone()];
+            row.last().unwrap().end > top.right + 2.
+                || (!section_row(row) && !table_row(row, template))
+        })
+    {
+        return None;
+    }
+
+    // Use the full heading row just above the rule, then collect aligned wraps above it.
+    let mut headers = Vec::new();
+    for i in (0..first).rev() {
+        let below = headers.last().map_or(top.y, |&(i, _, _)| baselines[i]);
+        if baselines[i] - below > size * 1.65 || headers.len() == 4 {
+            break;
+        }
+        let range = cells_in_rule(&bands[i], top);
+        if range.is_empty() {
+            continue;
+        }
+        let line = &bands[i][range.clone()];
+        let mut columns = Vec::new();
+        for f in line {
+            let (column, anchor) = template
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| (f.x - a.x).abs().total_cmp(&(f.x - b.x).abs()))?;
+            if !f.horizontal
+                || (f.size - size).abs() > size * 0.12
+                || (f.x - anchor.x).abs() > size * 1.7
+                || columns.last().is_some_and(|&last| last >= column)
+            {
+                break;
+            }
+            columns.push(column);
+        }
+        if columns.is_empty()
+            || columns.len() != line.len()
+            || (headers.is_empty() && columns.len() != width)
+        {
+            break;
+        }
+        headers.push((i, range, columns));
+    }
+    let &(header_start, _, _) = headers.last()?;
+
+    let mut prefix = Vec::new();
+    let mut y = baselines[header_start];
+    for i in (0..header_start).rev() {
+        if baselines[i] - y > size * 2.5 || prefix.len() == 3 {
+            break;
+        }
+        let Some(j) = bands[i]
+            .iter()
+            .position(|f| f.x >= top.left - size * 1.25 && f.x <= top.right)
+        else {
+            continue;
+        };
+        let f = &bands[i][j];
+        if !f.horizontal || !f.styled() || f.x > top.left + size * 1.25 || f.end > top.right + 2. {
+            break;
+        }
+        prefix.push(as_item(bands[i].remove(j)));
+        y = baselines[i];
+    }
+    prefix.reverse();
+
+    let mut heading = vec![Cell::default(); width];
+    for (i, range, columns) in headers.into_iter().rev() {
+        for (column, f) in columns.into_iter().zip(bands[i].drain(range)) {
+            let cell = positioned_cell(f);
+            let head = &mut heading[column];
+            if head.runs.is_empty() {
+                head.properties = cell.properties;
+            }
+            join_runs(&mut head.runs, cell.runs, true);
+        }
+    }
+    let mut rows = vec![heading];
+    for (i, range) in body {
+        let mut row: Vec<_> = bands[i].drain(range).map(positioned_cell).collect();
+        if row.len() == 1 {
+            row[0].colspan = Some(width);
+        }
+        rows.push(row);
+    }
+
+    let mut suffix = Vec::new();
+    let mut previous_y = bottom.y;
+    for i in last..bands.len() {
+        if previous_y - baselines[i] > size * 1.6 || suffix.len() == 4 {
+            break;
+        }
+        let range = cells_in_rule(&bands[i], top);
+        if range.is_empty() {
+            continue;
+        }
+        let [f] = &bands[i][range.clone()] else { break };
+        if !f.horizontal || f.size >= size * 0.95 || (f.x - top.left).abs() > 1. {
+            break;
+        }
+        suffix.extend(bands[i].drain(range).map(as_item));
+        previous_y = baselines[i];
+    }
+
+    Some(Item {
+        x: top.left,
+        end: top.right,
+        y,
+        content: Content::Table {
+            prefix,
+            rows,
+            suffix,
+        },
+    })
+}
+
+fn ruled_tables(bands: &mut [Vec<Fragment>], rules: &[HorizontalRule]) -> Vec<Item> {
+    let baselines: Vec<_> = bands.iter().map(|b| b[0].y).collect();
+    let mut tables = Vec::new();
+    for (i, top) in rules.iter().enumerate() {
+        let bottom = rules[i + 1..]
+            .iter()
+            .take(64)
+            .find(|r| (r.left - top.left).abs() <= 1. && (r.right - top.right).abs() <= 1.);
+        if let Some(bottom) = bottom
+            && let Some(table) = ruled_table(bands, &baselines, top, bottom)
+        {
+            tables.push(table);
+        }
+    }
+    tables
+}
+
 fn page_items(bands: Vec<Vec<Fragment>>, rules: &[HorizontalRule]) -> Vec<Item> {
     let mut items = Vec::new();
     let mut bands = bands.into_iter().filter(|b| !b.is_empty()).peekable();
@@ -475,7 +649,11 @@ fn page_items(bands: Vec<Vec<Fragment>>, rules: &[HorizontalRule]) -> Vec<Item> 
                     x,
                     end,
                     y,
-                    content: Content::Table { prefix, rows },
+                    content: Content::Table {
+                        prefix,
+                        rows,
+                        suffix: Vec::new(),
+                    },
                 });
                 continue;
             }
@@ -771,9 +949,14 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                 });
                 previous = None;
             }
-            Content::Table { prefix, rows } => {
+            Content::Table {
+                prefix,
+                rows,
+                suffix,
+            } => {
                 reflow(prefix, out);
                 out.push(Block::Table { rows });
+                reflow(suffix, out);
                 previous = None;
             }
         }
@@ -788,8 +971,10 @@ pub(super) fn layout(mut pieces: Vec<Fragment>, mut rules: Vec<HorizontalRule>, 
     });
     let mut bands = baseline_bands(pieces);
     attach_labels(&mut bands);
+    bands.retain(|band| !band.is_empty());
     rules.sort_by(|a, b| b.y.total_cmp(&a.y));
-    let mut items = page_items(bands, &rules);
+    let mut items = ruled_tables(&mut bands, &rules);
+    items.extend(page_items(bands, &rules));
     items.sort_by(|a, b| b.y.total_cmp(&a.y).then_with(|| a.x.total_cmp(&b.x)));
     // Separate isolated running headers and page numbers from the column flow.
     let mut gaps: Vec<_> = items

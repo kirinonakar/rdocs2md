@@ -52,7 +52,7 @@ Set `command` to the actual EXE path and `--root` to the local folder where read
 }
 ```
 
-To process local documents outside the root as well, set `args` in the MCP configuration as shown below and restart the server. `--allow-outside-root` applies to input documents, new Markdown files (`output_path`), and image folders (`image_dir`). Relative paths are resolved against `--root`.
+To process local documents outside the root as well, set `args` in the MCP configuration as shown below and restart the server. `--allow-outside-root` applies to input documents, new output files (`output_path`), and image folders (`image_dir`). Relative paths are resolved against `--root`.
 
 ```json
 "args": ["mcp", "--root", "C:\\docu_path", "--allow-outside-root"]
@@ -62,10 +62,12 @@ To process local documents outside the root as well, set `args` in the MCP confi
 |---|---|
 | `list_supported_formats` | `{}` |
 | `inspect_document` | `{"path":"presentation.pptx"}` |
-| `convert_document` | `{"path":"data.epub","mode":"hybrid","extract_images":true,"output_path":"data.md"}` |
-| `extract_document_range` | `{"path":"report.pdf","range":"2-5,8"}` |
+| `convert_document` | `{"path":"data.epub","format":"html","mode":"hybrid","extract_images":true,"output_path":"data.html"}` |
+| `extract_document_range` | `{"path":"report.pdf","range":"2-5,8","format":"json"}` |
 
-The server handles line-delimited JSON-RPC 2.0, `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`. The negotiable versions are 2024-11-05, 2025-03-26, 2025-06-18, and 2025-11-25. The inline result text limit for MCP tools is 512 KiB. Large conversion results can be saved as new `.md` files with `output_path` or retrieved in pieces with `range`. [MCP lifecycle specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+Both conversion tools accept the optional `format` argument (`md`, `html`, or `json`). The default is `md`. When provided, `output_path` must name a new file with the corresponding `.md`, `.html`, or `.json` extension.
+
+The server handles line-delimited JSON-RPC 2.0, `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`. The negotiable versions are 2024-11-05, 2025-03-26, 2025-06-18, and 2025-11-25. The inline result text limit for MCP tools is 512 KiB. Large conversion results can be saved with `output_path` or retrieved in pieces with `range`. [MCP lifecycle specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 
 ## Per-format implementation status
 
@@ -74,7 +76,7 @@ All 14 formats implement body text extraction and conversion. The supported rang
 | Format | Implemented | Known limitations |
 |---|---|---|
 | PDF | Objects and streams, pages and Form XObjects, font character mapping, text origins, simple multi-column and regular cell-grid heuristics, link and underline annotations, JPEG and some RGB and grayscale images | No OCR for scanned pages. Irregular tables, formulas, rotated or vertical text, and multi-column layouts spanning full pages may restore with lower accuracy |
-| HWP | 5.x CFB, compressed BodyText, UTF-16 paragraphs and control characters, basic tables and cells | Distribution (DRM) and encrypted documents, shapes and pictures, complex nested tables, and styles are unsupported |
+| HWP | 5.x CFB, compressed BodyText, UTF-16 paragraphs and control characters, merged and nested table cells, embedded raster pictures with `--extract-images` | Distribution (DRM) and encrypted documents, general shapes, and styles are unsupported |
 | HWPX | HPF ordering, sections and paragraphs, character attributes, table and cell merges, BinData images, equation script text | Headers, page layout, and placement of composite objects are partially supported |
 | DOC | Word 97–2003 FIB and CLX piece table, main text, field results, explicit breaks | Binary table structures, per-character styles, other stories, and images are unsupported |
 | DOCX | Sections and explicit breaks, headings, numbering and styles, links, footnotes and endnotes, referenced headers and footers, nested and merged tables, images, and basic equations | Partial support for floating layout, multi-level numbering formats, per-page header inheritance, and advanced equations |

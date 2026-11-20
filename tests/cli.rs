@@ -1,7 +1,9 @@
+use serde_json::{Value, json};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
 };
 static N: AtomicUsize = AtomicUsize::new(0);
@@ -96,4 +98,104 @@ fn extract_raster_and_reuse_existing_result() {
             .starts_with(b"GIF89a")
     );
     assert_eq!(fs::read_dir(d.path("이미지")).unwrap().count(), 1);
+}
+
+#[test]
+fn mcp_advertises_and_renders_output_formats() {
+    let work = Scratch::new();
+    fs::write(
+        work.path("sample.rtf"),
+        br"{\rtf1\ansi First page\page Second page}",
+    )
+    .unwrap();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_rdocs2md"))
+        .current_dir(&work.0)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let request =
+        |id, method, params| json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+    let convert = |id, args| {
+        request(
+            id,
+            "tools/call",
+            json!({"name":"convert_document","arguments":args}),
+        )
+    };
+    let mut stdin = server.stdin.take().unwrap();
+    for message in [
+        request(1, "initialize", json!({"protocolVersion":"2025-11-25"})),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        request(2, "tools/list", json!({})),
+        convert(3, json!({"path":"sample.rtf"})),
+        convert(
+            4,
+            json!({"path":"sample.rtf","format":"html","output_path":"sample.html"}),
+        ),
+        request(
+            5,
+            "tools/call",
+            json!({"name":"extract_document_range","arguments":{
+                "path":"sample.rtf","range":"2","format":"json"
+            }}),
+        ),
+        convert(6, json!({"path":"sample.rtf","format":"txt"})),
+        convert(
+            7,
+            json!({"path":"sample.rtf","format":"json","output_path":"wrong.md"}),
+        ),
+        convert(
+            8,
+            json!({"path":"sample.rtf","format":"html","output_path":"sample.html"}),
+        ),
+    ] {
+        writeln!(stdin, "{message}").unwrap();
+    }
+    drop(stdin);
+
+    let output = server.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let replies: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 8);
+    let result = |id: usize| &replies[id - 1]["result"];
+    let content = |id| result(id)["content"][0]["text"].as_str().unwrap();
+    for tool in result(2)["tools"].as_array().unwrap() {
+        let schema = &tool["inputSchema"];
+        let format = &schema["properties"]["format"];
+        match tool["name"].as_str().unwrap() {
+            "convert_document" | "extract_document_range" => {
+                assert_eq!(format["enum"], json!(["md", "html", "json"]));
+                assert_eq!(format["default"], "md");
+                assert!(
+                    !schema["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("format"))
+                );
+            }
+            _ => assert!(format.is_null()),
+        }
+    }
+    assert_eq!(result(3)["isError"], false);
+    assert!(content(3).starts_with("First page"));
+    assert_eq!(result(4)["isError"], false);
+    let html = fs::read_to_string(work.path("sample.html")).unwrap();
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(html.contains("First page"));
+    assert_eq!(result(5)["isError"], false);
+    let document: Value = serde_json::from_str(content(5)).unwrap();
+    assert_eq!(document["sections"].as_array().unwrap().len(), 1);
+    assert!(content(5).contains("Second page"));
+    assert!(!content(5).contains("First page"));
+    assert_eq!(replies[5]["error"]["code"], -32602);
+    assert_eq!(result(7)["isError"], true);
+    assert!(content(7).contains("new .json file"));
+    assert!(!work.path("wrong.md").exists());
+    assert_eq!(result(8)["isError"], true);
 }
