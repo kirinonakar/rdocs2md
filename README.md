@@ -6,7 +6,7 @@
 
 <h3 align="center">rdocs2md</h3>
 
-An offline document converter for Windows x64; its single executable contains both the CLI and the MCP stdio server, extracting reading order and document structure from PDF, Hangul (HWP/HWPX), Office, OpenDocument, RTF, and EPUB files and saving the result as UTF-8 Markdown, HTML, or JSON.
+rdocs2md is a simple portable executable written in Rust, with AI-agent-friendly MCP and CLI interfaces. This single offline executable for Windows x64 converts a wide range of document formats such as PDF, Hangul (HWP/HWPX), Office, OpenDocument, RTF, and EPUB into UTF-8 Markdown, HTML, or JSON, keeping reading order and document structure as readable as possible.
 
 ## Quick start
 
