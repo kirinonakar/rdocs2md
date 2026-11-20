@@ -1,4 +1,5 @@
 use crate::model::{Block, Cell, Properties, Run, Section, push_run};
+use super::math::{Glyph, Script, Segment, to_latex};
 use std::{collections::BTreeMap, ops::Range};
 
 pub(super) struct Fragment {
@@ -98,6 +99,13 @@ fn coordinates(x: f32, y: f32) -> Properties {
         ("x_pt".into(), x.to_string()),
         ("y_pt".into(), y.to_string()),
     ])
+}
+
+/// Rows are ordered by a quantised baseline. One visual row is often emitted as
+/// several text objects whose baselines differ by hundredths of a point, so a
+/// plain comparison scrambles option rows and inline math.
+fn row_key(y: f32) -> i32 {
+    (y * 2.).round() as i32
 }
 
 fn join_runs(target: &mut Vec<Run>, incoming: Vec<Run>, space: bool) {
@@ -1086,6 +1094,18 @@ fn grid_tables(
         }
         let columns = x_edges.len() - 1;
         let row_count = y_edges.len() - 1;
+        // The outermost horizontal edges must close the whole grid. A callout
+        // border is often drawn as two strokes interrupted by its label, and
+        // gluing such a stroke to unrelated rules on the same baseline would
+        // turn the surrounding prose on both sides into table cells.
+        let closed = |y: f32| {
+            component_horizontal.iter().any(|level| {
+                (level.y - y).abs() <= 1.5 && interval_covers(&level.segments, left, right, 1.5)
+            })
+        };
+        if !closed(top) || !closed(bottom) {
+            continue;
+        }
         if columns == 0
             || row_count == 0
             || columns.saturating_mul(row_count) > crate::model::CELL_LIMIT
@@ -1975,7 +1995,7 @@ fn clean_line(runs: &mut Vec<Run>) {
 }
 
 fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
-    let mut previous = None;
+    let mut previous: Option<LineInfo> = None;
     // Compare line endings among similarly sized neighbors. Titles, footers and
     // side notes can have different margins from the surrounding body.
     let right_edges: Vec<_> = items.iter().map(|i| (i.end, i.line_size())).collect();
@@ -2004,6 +2024,47 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
         match item.content {
             Content::Line { runs, size, .. } => {
                 let info = info.unwrap();
+                // One visual row is frequently emitted as several text objects.
+                // Keep them on one line instead of starting a paragraph per object.
+                let same_row = previous.as_ref().is_some_and(|prev| {
+                    (prev.y - info.y).abs() <= 1.2 && info.x >= prev.x - size * 2.6
+                }) && matches!(out.last(), Some(Block::Paragraph { .. }));
+                if same_row {
+                    let (x, end, row_y, row_size, bold, first, gap) = {
+                        let prev = previous.as_ref().unwrap();
+                        (
+                            prev.x,
+                            prev.end.max(info.end),
+                            prev.y,
+                            prev.size.max(info.size),
+                            prev.bold,
+                            prev.first.clone(),
+                            info.x - prev.end,
+                        )
+                    };
+                    let last = info.last.clone();
+                    if let Some(Block::Paragraph {
+                        runs: para,
+                        properties,
+                        ..
+                    }) = out.last_mut()
+                    {
+                        join_runs(para, runs, gap > size * 0.12);
+                        properties.insert("last_y_pt".into(), y.to_string());
+                    }
+                    previous = Some(LineInfo {
+                        x,
+                        end,
+                        y: row_y,
+                        size: row_size,
+                        bold,
+                        drop_cap: false,
+                        discretionary_hyphen: false,
+                        first,
+                        last,
+                    });
+                    continue;
+                }
                 let right = right_edges[idx.saturating_sub(4)..(idx + 5).min(right_edges.len())]
                     .iter()
                     .filter(|(_, s)| s.is_some_and(|s| (s - size).abs() < size * 0.15))
@@ -2054,6 +2115,149 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
     }
 }
 
+fn math_glyph(f: &Fragment) -> Glyph {
+    Glyph {
+        x: f.x,
+        end: f.end,
+        y: f.y,
+        size: f.size,
+        segments: f
+            .runs
+            .iter()
+            .map(|r| Segment {
+                text: r.text.clone(),
+                script: match r.style.script.as_deref() {
+                    Some("sup") => Some(Script::Sup),
+                    Some("sub") => Some(Script::Sub),
+                    _ => None,
+                },
+                latex: false,
+            })
+            .collect(),
+    }
+}
+
+fn zone_root(parent: &mut [usize], mut node: usize) -> usize {
+    while parent[node] != node {
+        parent[node] = parent[parent[node]];
+        node = parent[node];
+    }
+    node
+}
+
+/// Rebuilds HWP equation objects as single LaTeX runs. Only the equation font
+/// is grouped, so surrounding prose keeps its own fragments and reading order.
+fn math_zones(pieces: &mut Vec<Fragment>) {
+    let candidates: Vec<usize> = (0..pieces.len())
+        .filter(|&i| pieces[i].horizontal && pieces[i].size > 0. && hyhwp_eq_font(&pieces[i]))
+        .collect();
+    // Some PDF writers draw the same glyph twice (bold simulation or a shadow),
+    // which would otherwise duplicate every token inside one formula.
+    let text_of = |i: usize| -> String {
+        pieces[i]
+            .runs
+            .iter()
+            .map(|r| r.text.trim())
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let mut math: Vec<usize> = Vec::with_capacity(candidates.len());
+    let mut duplicates: Vec<usize> = Vec::new();
+    for i in candidates {
+        let text = text_of(i);
+        let duplicate = math.iter().any(|&k| {
+            text_of(k) == text
+                && (pieces[k].y - pieces[i].y).abs() < 0.6
+                && (pieces[k].x - pieces[i].x).abs() < 1.5
+        });
+        if duplicate {
+            duplicates.push(i);
+        } else {
+            math.push(i);
+        }
+    }
+    if math.len() < 2 && duplicates.is_empty() {
+        return;
+    }
+    let glyphs: Vec<Glyph> = math.iter().map(|&i| math_glyph(&pieces[i])).collect();
+    let mut parent: Vec<usize> = (0..math.len()).collect();
+    for a in 0..math.len() {
+        for b in (a + 1)..math.len() {
+            let (left, right) = (&glyphs[a], &glyphs[b]);
+            let size = left.size.max(right.size);
+            let gap = (right.x - left.end).max(left.x - right.end);
+            if (left.y - right.y).abs() <= size * 2.5 && gap <= size * 2. {
+                let (ra, rb) = (zone_root(&mut parent, a), zone_root(&mut parent, b));
+                parent[ra] = rb;
+            }
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for a in 0..math.len() {
+        let root = zone_root(&mut parent, a);
+        groups.entry(root).or_default().push(a);
+    }
+    let mut consumed = Vec::new();
+    let mut rebuilt = Vec::new();
+    for members in groups.into_values() {
+        if members.len() < 2 || members.len() > 40 {
+            continue;
+        }
+        let items: Vec<Glyph> = members.iter().map(|&m| glyphs[m].clone()).collect();
+        let Some(latex) = to_latex(&items) else {
+            continue;
+        };
+        // A rebuilt formula that dropped glyphs is worse than the plain text
+        // that was extracted from the same page, so it is discarded.
+        let alnum = |text: &str| text.chars().filter(|c| c.is_alphanumeric()).count();
+        let plain: String = items
+            .iter()
+            .flat_map(|g| g.segments.iter().map(|s| s.text.as_str()))
+            .collect();
+        if alnum(&latex) + 2 < alnum(&plain) || latex.len() > 320 {
+            continue;
+        }
+        let x = items.iter().map(|g| g.x).fold(f32::INFINITY, f32::min);
+        let end = items
+            .iter()
+            .map(|g| g.end)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let size = items.iter().map(|g| g.size).fold(0., f32::max);
+        let y = items
+            .iter()
+            .find(|g| g.size >= size - 0.01)
+            .map_or(0., |g| g.y);
+        let text: Vec<&str> = members
+            .iter()
+            .flat_map(|&m| pieces[math[m]].runs.iter().map(|r| r.text.as_str()))
+            .collect();
+        rebuilt.push(Fragment {
+            x,
+            end,
+            y,
+            size,
+            horizontal: true,
+            discretionary_hyphen: false,
+            runs: vec![Run {
+                latex: Some(latex),
+                text: text.join(" "),
+                ..Run::default()
+            }],
+        });
+        consumed.extend(members.into_iter().map(|m| math[m]));
+    }
+    if rebuilt.is_empty() && duplicates.is_empty() {
+        return;
+    }
+    consumed.extend(duplicates);
+    consumed.sort_unstable();
+    consumed.dedup();
+    for i in consumed.into_iter().rev() {
+        pieces.remove(i);
+    }
+    pieces.extend(rebuilt);
+}
+
 pub(super) fn layout(
     mut pieces: Vec<Fragment>,
     mut rules: Vec<HorizontalRule>,
@@ -2061,10 +2265,22 @@ pub(super) fn layout(
     sec: &mut Section,
 ) {
     pieces.retain(|f| {
+        let total: usize = f
+            .runs
+            .iter()
+            .map(|r| r.text.chars().filter(|c| !c.is_whitespace()).count())
+            .sum();
+        let unknown: usize = f
+            .runs
+            .iter()
+            .map(|r| r.text.chars().filter(|c| *c == '\u{fffd}').count())
+            .sum();
         f.runs
             .iter()
             .any(|r| r.image.is_some() || !r.text.trim().is_empty())
+            && (total == 0 || unknown * 2 < total)
     });
+    math_zones(&mut pieces);
     let mut bands = baseline_bands(pieces);
     attach_labels(&mut bands);
     bands.retain(|band| !band.is_empty());
@@ -2075,7 +2291,11 @@ pub(super) fn layout(
     bands.retain(|band| !band.is_empty());
     items.extend(ruled_tables(&mut bands, &rules));
     items.extend(page_items(bands, &rules));
-    items.sort_by(|a, b| b.y.total_cmp(&a.y).then_with(|| a.x.total_cmp(&b.x)));
+    items.sort_by(|a, b| {
+        row_key(b.y)
+            .cmp(&row_key(a.y))
+            .then_with(|| a.x.total_cmp(&b.x))
+    });
     // Separate isolated running headers and page numbers from the column flow.
     let mut gaps: Vec<_> = items
         .windows(2)

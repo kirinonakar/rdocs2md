@@ -230,6 +230,10 @@ pub struct Run {
     pub page_break: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mathml: Option<String>,
+    /// LaTeX for a formula, either supplied by the parser or reconstructed
+    /// from page geometry. Rendered as `$...$` in Markdown and `\(...\)` in HTML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latex: Option<String>,
     pub text: String,
     #[serde(skip_serializing_if = "is_plain")]
     pub style: Style,

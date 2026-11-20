@@ -2,6 +2,7 @@ mod epub;
 mod flow;
 mod formatting;
 mod hwp3;
+mod latex;
 mod legacy;
 mod math;
 pub mod mcp;

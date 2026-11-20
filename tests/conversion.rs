@@ -658,7 +658,10 @@ fn odf_math_preserves_fraction_without_active_markup() {
         ("content.xml","<doc><body><text><p><object href='./Object 1'/></p></text></body></doc>"),
         ("Object 1/content.xml","<math><semantics><mfrac><mi>a</mi><mi>b</mi></mfrac><annotation-xml><script>ignored</script></annotation-xml></semantics></math>")]),false).unwrap();
     let s = md(&d);
-    assert!(s.contains("<mfrac><mi>a</mi><mi>b</mi></mfrac>"));
+    // Formulas are rendered as LaTeX, never as active MathML markup.
+    assert!(s.contains("\\frac{a}{b}"), "{s}");
+    assert!(s.contains('$'));
+    assert!(!s.contains("<mfrac>"));
     assert!(!s.contains("script"));
 }
 #[test]

@@ -7,27 +7,70 @@ pub fn escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn literal_angle_open(tail: &str) -> bool {
+/// A `<` needs escaping only when it can start an HTML tag or an autolink, which
+/// always continues with an ASCII letter, digit or tag punctuation. Labels such
+/// as `<보기>`, `<보 기>` and `<A>` are plain text in Korean exam papers, and font
+/// changes split one label into several runs, so a trailing `<` is also plain.
+fn potential_markup(tail: &str) -> bool {
     let mut chars = tail.chars();
-    match chars.next() {
-        Some(first) if first.is_whitespace() => true,
-        // These labels cannot start a Markdown HTML tag or autolink.
-        Some(first) if !first.is_ascii() && first.is_alphabetic() => {
-            chars.find(|c| !(c.is_alphanumeric() || matches!(c, ' ' | '-' | '·'))) == Some('>')
-        }
-        _ => false,
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || matches!(first, '/' | '!' | '?')) {
+        return false;
     }
+    // A short all-uppercase label cannot be a tag name.
+    let mut inside = String::from(first);
+    for c in chars {
+        if c == '>' {
+            let label = inside.trim();
+            return !(label.chars().count() <= 4 && label.chars().all(|c| c.is_uppercase()));
+        }
+        if inside.chars().count() > 8 {
+            break;
+        }
+        inside.push(c);
+    }
+    true
+}
+
+/// Byte offsets of the brackets that must stay escaped because they start a
+/// Markdown link (`[text](target)` or `[text][label]`).
+///
+/// Annotations such as `[2점]`, `[A]` or `[1～3]` are plain text and are written
+/// without backslashes. Font changes split one annotation into several runs, so
+/// the rule only escapes a pair that is complete inside the same text fragment.
+fn link_brackets(text: &str) -> Vec<usize> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut escaped = Vec::new();
+    for (i, (start, c)) in chars.iter().enumerate() {
+        if *c != '[' {
+            continue;
+        }
+        let Some(j) = (i + 1..chars.len()).find(|&j| chars[j].1 == ']') else {
+            continue;
+        };
+        if matches!(chars.get(j + 1).map(|(_, c)| *c), Some('(') | Some('[')) {
+            escaped.push(*start);
+            escaped.push(chars[j].0);
+        }
+    }
+    escaped
 }
 
 fn markdown(s: &str) -> String {
     let mut out = String::new();
     for line in s.split_inclusive('\n') {
         let mut margin = true;
+        let link = link_brackets(line);
         for (i, c) in line.char_indices() {
             match c {
                 '&' => out.push_str("&amp;"),
-                '<' if !literal_angle_open(&line[i + 1..]) => out.push_str("\\<"),
-                '>' if margin => out.push_str("\\>"),
+                '<' if potential_markup(&line[i + 1..]) => out.push_str("\\<"),
+                // `>` is never escaped: font changes often start a run with the
+                // closing bracket of `<보기>` or with the arrow of `고개 > 고개`,
+                // and both are plain text.
+                '[' | ']' if !link.contains(&i) => out.push(c),
                 '\\' | '*' | '_' | '[' | ']' | '|' | '~' | '\u{60}' => {
                     out.push('\\');
                     out.push(c)
@@ -52,6 +95,40 @@ fn pdf_font_size(runs: &[Run]) -> f32 {
         .find_map(|size| size.strip_suffix("pt")?.parse::<f32>().ok())
         .filter(|size| size.is_finite() && *size > 0.)
         .unwrap_or(12.)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::markdown;
+
+    #[test]
+    fn annotations_keep_literal_brackets() {
+        assert_eq!(markdown("값은? [2점]"), "값은? [2점]");
+        assert_eq!(markdown("보기는 [1～3] 이다"), "보기는 [1～3] 이다");
+        assert_eq!(markdown("[A] 대응된다"), "[A] 대응된다");
+        assert_eq!(markdown("[보 기]"), "[보 기]");
+    }
+
+    #[test]
+    fn link_syntax_stays_escaped() {
+        assert_eq!(markdown("[text](target)"), "\\[text\\](target)");
+        assert_eq!(markdown("[ref][label]"), "\\[ref\\][label]");
+    }
+
+    #[test]
+    fn labels_keep_literal_angle_brackets() {
+        assert_eq!(markdown("<보기>는"), "<보기>는");
+        assert_eq!(markdown("<"), "<");
+        assert_eq!(markdown(">"), ">");
+        assert_eq!(markdown("고개 > 고개"), "고개 > 고개");
+        assert_eq!(markdown("<A> 참조"), "<A> 참조");
+    }
+
+    #[test]
+    fn markup_is_still_escaped() {
+        assert_eq!(markdown("<div>"), "\\<div>");
+        assert_eq!(markdown("<https://example.com>"), "\\<https://example.com>");
+    }
 }
 
 fn pdf_baseline(properties: &Properties) -> Option<f32> {
@@ -96,8 +173,16 @@ fn runs(items: &[Run], html: bool, links: &Properties) -> String {
         } else {
             markdown(&r.text).replace('\n', "  \n")
         };
-        if let Some(math) = &r.mathml {
-            t = math.clone()
+        if let Some(latex) = r
+            .latex
+            .clone()
+            .or_else(|| r.mathml.as_deref().and_then(crate::latex::from_mathml))
+        {
+            t = if html {
+                format!("<span class=\"math\">\\({latex}\\)</span>")
+            } else {
+                format!("${latex}$")
+            };
         }
         if let Some(img) = &r.image
             && let Some(link) = links.get(img)
@@ -487,7 +572,9 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                             let size = pdf_font_size(items);
                             let adjacent = y.is_some_and(|y| {
                                 previous_pdf_line.is_some_and(|(previous_y, previous_size)| {
-                                    previous_y - y <= previous_size.max(size) * 1.8
+                                    // Only a gap within normal leading continues the
+                                    // same text block; paragraph spacing is larger.
+                                    previous_y - y <= previous_size.max(size) * 1.5
                                 })
                             });
                             if adjacent {

@@ -27,6 +27,7 @@ impl Matrix {
     }
 }
 mod layout;
+mod math;
 use layout::{Fragment, HorizontalRule, VerticalRule, approximate_width, layout};
 
 const PDF_RULE_LIMIT: usize = 4096;
