@@ -1,4 +1,4 @@
-use crate::{model::*, package::*};
+use crate::{flow::style_props, formatting, model::*, package::*};
 use std::collections::{HashMap, HashSet};
 pub fn address(s: &str) -> Result<(usize, usize)> {
     let cut = s
@@ -85,6 +85,114 @@ impl Grid {
         self.last = None;
     }
 }
+
+#[derive(Default)]
+struct XlsxStyle {
+    number_format: String,
+    cell: Properties,
+    font: Style,
+}
+
+fn xlsx_color(node: N) -> Option<String> {
+    let value = attr(node, "rgb")?;
+    formatting::color(if value.len() == 8 {
+        value.get(2..)?
+    } else {
+        value
+    })
+}
+
+fn xlsx_styles(root: N) -> Vec<XlsxStyle> {
+    let entries = |group, name| {
+        child(root, group)
+            .into_iter()
+            .flat_map(move |n| n.children().filter(move |c| tag(*c) == name))
+    };
+    let borders: Vec<_> = entries("borders", "border")
+        .map(|node| {
+            let mut props = Properties::new();
+            for (side, key) in formatting::SIDES.into_iter().zip(formatting::BORDERS) {
+                let Some(edge) = child(node, side) else {
+                    continue;
+                };
+                let (width, style) = match attr(edge, "style") {
+                    Some("double") => ("3px", "double"),
+                    Some("medium") => ("2px", "solid"),
+                    Some("thick") => ("3px", "solid"),
+                    Some(
+                        "mediumDashed" | "mediumDashDot" | "mediumDashDotDot" | "slantDashDot",
+                    ) => ("2px", "dashed"),
+                    Some("dashed" | "dashDot" | "dashDotDot") => ("1px", "dashed"),
+                    Some("dotted" | "hair") => ("1px", "dotted"),
+                    Some("thin") => ("1px", "solid"),
+                    _ => continue,
+                };
+                let shade = child(edge, "color").and_then(xlsx_color);
+                props.insert(
+                    key.into(),
+                    formatting::border(style, width, shade.as_deref()),
+                );
+            }
+            props
+        })
+        .collect();
+    let fills: Vec<_> = entries("fills", "fill")
+        .map(|n| {
+            child(n, "patternFill")
+                .filter(|p| attr(*p, "patternType") == Some("solid"))
+                .and_then(|p| child(p, "fgColor"))
+                .and_then(xlsx_color)
+        })
+        .collect();
+    let fonts: Vec<_> = entries("fonts", "font")
+        .map(|n| {
+            let mut font = Style::default();
+            style_props(n, &mut font);
+            font.font = child(n, "name")
+                .and_then(|n| attr(n, "val"))
+                .map(str::to_owned);
+            font.size = formatting::units(child(n, "sz").and_then(|n| attr(n, "val")), 1.)
+                .map(|n| format!("{n}pt"));
+            font.color = child(n, "color").and_then(xlsx_color);
+            font
+        })
+        .collect();
+    entries("cellXfs", "xf")
+        .map(|node| {
+            let index = |key| attr(node, key).and_then(|v| v.parse::<usize>().ok());
+            let mut style = XlsxStyle {
+                number_format: attr(node, "numFmtId").unwrap_or("0").into(),
+                cell: index("borderId")
+                    .and_then(|i| borders.get(i))
+                    .cloned()
+                    .unwrap_or_default(),
+                font: index("fontId")
+                    .and_then(|i| fonts.get(i))
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            if let Some(shade) = index("fillId")
+                .and_then(|i| fills.get(i))
+                .and_then(Option::as_ref)
+            {
+                style.cell.insert("background-color".into(), shade.clone());
+            }
+            if let Some(align) = child(node, "alignment") {
+                for (source, key) in [("horizontal", "text-align"), ("vertical", "vertical-align")]
+                {
+                    if let Some(v) = attr(align, source) {
+                        formatting::box_property(&mut style.cell, key, v);
+                    }
+                }
+                if matches!(attr(align, "wrapText"), Some("1" | "true")) {
+                    style.cell.insert("white-space".into(), "pre-wrap".into());
+                }
+            }
+            style
+        })
+        .collect()
+}
+
 pub fn xlsx(
     pkg: &mut Package,
     mut doc: Document,
@@ -118,10 +226,8 @@ pub fn xlsx(
                 fmts.insert(k.to_string(), v.to_string());
             }
         }
-        if let Some(n) = desc(x.root(), "cellXfs").next() {
-            for style in n.children().filter(|n| tag(*n) == "xf") {
-                xf.push(attr(style, "numFmtId").unwrap_or("0").to_string())
-            }
+        if let Some(root) = x.root().first_element_child() {
+            xf = xlsx_styles(root);
         }
     }
     let mut text_budget = 0usize;
@@ -227,19 +333,25 @@ pub fn xlsx(
                 if attr(row, "hidden") == Some("1") {
                     c.properties.insert("hidden".into(), "true".into());
                 }
-                if let Some(id) = attr(n, "s")
+                if let Some(style) = attr(n, "s")
                     .and_then(|v| v.parse::<usize>().ok())
                     .and_then(|i| xf.get(i))
                 {
+                    let id = &style.number_format;
                     if let Ok(num) = raw.parse::<f64>()
                         && let Some(value) = display_number(num, id, epoch1904)
                         && typ == "n"
                     {
-                        c.runs = vec![Run::text(value)];
+                        c.runs[0].text = value;
                         c.properties.insert("raw_value".into(), raw.into());
                     }
+                    c.properties.extend(style.cell.clone());
+                    c.runs[0].style = style.font.clone();
                     c.properties
                         .insert("number_format".into(), fmts.get(id).unwrap_or(id).clone());
+                } else if let Some(style) = xf.first() {
+                    c.properties.extend(style.cell.clone());
+                    c.runs[0].style = style.font.clone();
                 }
                 if let Some((h, w)) = merges.get(&pos) {
                     if *h > 1 {

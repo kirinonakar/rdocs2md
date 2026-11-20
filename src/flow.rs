@@ -1,8 +1,12 @@
-use crate::{model::*, package::*};
+use crate::{formatting, model::*, package::*};
 use std::collections::HashMap;
 #[derive(Default, Clone)]
 pub struct Rules {
     pub paragraph_styles: HashMap<String, Properties>,
+    pub cell_styles: HashMap<String, Properties>,
+    pub table_borders: HashMap<String, Properties>,
+    pub table_cells: HashMap<String, Properties>,
+    pub hwpx_borders: HashMap<String, Properties>,
     pub table_bytes: std::rc::Rc<std::cell::Cell<usize>>,
     pub objects: HashMap<String, Run>,
     pub styles: HashMap<String, Style>,
@@ -19,6 +23,9 @@ fn apply_style(to: &mut Style, s: &Style) {
     to.strike |= s.strike;
     if s.size.is_some() {
         to.size = s.size.clone()
+    }
+    if s.color.is_some() {
+        to.color = s.color.clone()
     }
     if s.font.is_some() {
         to.font = s.font.clone()
@@ -41,6 +48,7 @@ pub fn css_style(s: &str, st: &mut Style) {
                 ("vertical-align", "sub") => st.script = Some("sub".into()),
                 ("font-size", v) => st.size = Some(v.into()),
                 ("font-family", v) => st.font = Some(v.into()),
+                ("color", v) => st.color = formatting::color(v),
                 _ => {}
             }
         }
@@ -59,7 +67,7 @@ pub fn style_props(n: N, st: &mut Style) {
             "font-name" | "font-family" | "typeface" | "ascii" => st.font = Some(v.into()),
             "font-size" => st.size = Some(v.into()),
             "sz" => st.size = v.parse::<f32>().ok().map(|n| format!("{}pt", n / 100.)),
-            "color" => st.color = Some(v.into()),
+            "color" | "textColor" => st.color = formatting::color(v),
             "text-position" if v.starts_with("super") => st.script = Some("sup".into()),
             "text-position" if v.starts_with("sub") => st.script = Some("sub".into()),
             _ => {}
@@ -84,7 +92,7 @@ pub fn style_props(n: N, st: &mut Style) {
                 }
             }
             "sz" => st.size = v.parse::<f32>().ok().map(|n| format!("{}pt", n / 2.)),
-            "color" => st.color = Some(format!("#{v}")),
+            "color" => st.color = formatting::color(v),
             "rFonts" | "latin" => style_props(c, st),
             _ => {}
         }
@@ -289,18 +297,18 @@ impl Flow<'_> {
         Ok(out)
     }
     pub fn paragraph(&self, n: N) -> Result<Block> {
-        let mut runs = self.runs(n)?;
         let ppr = child(n, "pPr");
         let style_id = ppr
             .and_then(|p| child(p, "pStyle"))
             .and_then(|s| attr(s, "val"))
             .or_else(|| attr(n, "style-name"))
             .unwrap_or("");
-        if let Some(s) = self.rules.styles.get(style_id) {
-            for r in &mut runs {
-                apply_style(&mut r.style, s)
-            }
-        }
+        let mut runs = Vec::new();
+        let state = Run {
+            style: self.rules.styles.get(style_id).cloned().unwrap_or_default(),
+            ..Run::default()
+        };
+        self.inline(n, &state, &mut runs)?;
         let name = tag(n);
         let heading = if name == "h" {
             attr(n, "outline-level").unwrap_or("1").parse().unwrap_or(1)
@@ -363,9 +371,14 @@ impl Flow<'_> {
         let mut props = self
             .rules
             .paragraph_styles
-            .get(style_id)
+            .get(attr(n, "paraPrIDRef").unwrap_or(style_id))
             .cloned()
             .unwrap_or_default();
+        if self.kind == "docx"
+            && let Some(p) = ppr
+        {
+            formatting::word_paragraph(&mut props, p);
+        }
         if attr(n, "pageBreak") == Some("1")
             || ppr
                 .and_then(|p| child(p, "pageBreakBefore"))
@@ -459,11 +472,28 @@ impl Flow<'_> {
         } else if ps.is_empty() {
             c.runs = self.runs(n)?
         } else {
+            let mut common_align = None;
+            let mut aligned = true;
+            let mut first = true;
             for (i, p) in ps.into_iter().enumerate() {
-                let runs = self.runs(p)?;
+                let Block::Paragraph {
+                    runs, properties, ..
+                } = self.paragraph(p)?
+                else {
+                    unreachable!()
+                };
                 let discard_spacers = matches!(self.kind, "hwpx" | "docx");
                 if discard_spacers && !has_content(&runs) {
                     continue;
+                }
+                let align = properties
+                    .get("align")
+                    .and_then(|v| formatting::alignment(v));
+                if first {
+                    common_align = align;
+                    first = false;
+                } else {
+                    aligned &= align == common_align;
                 }
                 if if discard_spacers {
                     !c.runs.is_empty()
@@ -476,8 +506,55 @@ impl Flow<'_> {
                     push_run(&mut c.runs, r)
                 }
             }
+            if aligned && let Some(align) = common_align {
+                c.properties.insert("text-align".into(), align.into());
+            }
         }
         let props = child(n, "tcPr");
+        match self.kind {
+            "hwpx" => {
+                if let Some(fill) =
+                    attr(n, "borderFillIDRef").and_then(|id| self.rules.hwpx_borders.get(id))
+                {
+                    c.properties.extend(fill.clone());
+                }
+                if let Some(size) = child(n, "cellSz") {
+                    for key in ["width", "height"] {
+                        formatting::points(
+                            &mut c.properties,
+                            key,
+                            formatting::units(attr(size, key), 100.).filter(|n| *n > 0.),
+                        );
+                    }
+                }
+                if let Some(v) = child(n, "subList").and_then(|list| attr(list, "vertAlign")) {
+                    formatting::box_property(&mut c.properties, "vertical-align", v);
+                }
+            }
+            "docx" => {
+                if let Some(p) = props {
+                    formatting::word_cell(&mut c.properties, p);
+                }
+            }
+            "pptx" => {
+                if let Some(p) = props {
+                    formatting::drawing_cell(&mut c.properties, p);
+                }
+            }
+            "odt" | "ods" | "odp" => {
+                if let Some(style) =
+                    attr(n, "style-name").and_then(|id| self.rules.cell_styles.get(id))
+                {
+                    c.properties.extend(style.clone());
+                }
+            }
+            "epub" => {
+                for (key, value) in self.css(n).split(';').filter_map(|d| d.split_once(':')) {
+                    formatting::box_property(&mut c.properties, key.trim(), value.trim());
+                }
+            }
+            _ => {}
+        }
         let span = child(n, "cellSpan");
         c.colspan = attr(n, "number-columns-spanned")
             .or_else(|| attr(n, "colspan"))
@@ -531,6 +608,9 @@ impl Flow<'_> {
         let mut merges: HashMap<usize, (usize, usize)> = HashMap::new();
         let mut cells = 0usize;
         let mut weight = 0usize;
+        let word = (self.kind == "docx").then(|| word_table_format(n, self.rules));
+        let mut positions = Vec::new();
+        let mut columns = 0;
         for row in n.descendants().skip(1).filter(|v| {
             matches!(tag(*v), "tr" | "table-row")
                 && v.ancestors()
@@ -547,6 +627,7 @@ impl Flow<'_> {
             let mut line = Vec::new();
             let mut bytes = 0usize;
             let mut column = 0;
+            let mut starts = Vec::new();
             for node in row.children().filter(|v| {
                 matches!(
                     tag(*v),
@@ -560,10 +641,28 @@ impl Flow<'_> {
                     .unwrap_or("1")
                     .parse::<usize>()?;
                 let mut c = self.cell(node)?;
+                if self.kind == "hwpx"
+                    && let Some(margins) = child(node, "cellMargin")
+                        .filter(|_| attr(node, "hasMargin") != Some("0"))
+                        .or_else(|| child(n, "inMargin"))
+                {
+                    for (side, key) in formatting::SIDES.into_iter().zip([
+                        "padding-left",
+                        "padding-right",
+                        "padding-top",
+                        "padding-bottom",
+                    ]) {
+                        formatting::points(
+                            &mut c.properties,
+                            key,
+                            formatting::units(attr(margins, side), 100.).filter(|n| *n >= 0.),
+                        );
+                    }
+                }
                 if let Some(v) = attr(row, "visibility") {
                     c.properties.insert("row_visibility".into(), v.into());
                 }
-                if self.kind == "docx" {
+                if word.is_some() {
                     let col = column;
                     column += c.colspan.unwrap_or(1).min(16384);
                     match child(node, "tcPr").and_then(|p| child(p, "vMerge")) {
@@ -574,6 +673,9 @@ impl Flow<'_> {
                             let (r, j) = merges[&col];
                             if let Some(origin) = rows.get_mut(r).and_then(|row| row.get_mut(j)) {
                                 origin.rowspan = Some(origin.rowspan.unwrap_or(1) + 1);
+                                if let Some(bottom) = c.properties.remove("border-bottom") {
+                                    origin.properties.insert("border-bottom".into(), bottom);
+                                }
                                 continue;
                             }
                         }
@@ -600,6 +702,12 @@ impl Flow<'_> {
                 {
                     return Err("table column expansion limit exceeded".into());
                 }
+                if word.is_some() {
+                    starts.extend(std::iter::repeat_n(
+                        column - c.colspan.unwrap_or(1).min(16384),
+                        repeat,
+                    ));
+                }
                 line.extend(std::iter::repeat_n(c, repeat));
             }
             cells = cells.saturating_add(line.len().max(1).saturating_mul(count));
@@ -610,7 +718,40 @@ impl Flow<'_> {
             {
                 return Err("table row expansion limit exceeded".into());
             }
+            columns = columns.max(column);
+            if word.is_some() {
+                positions.extend(std::iter::repeat_n(starts, count));
+            }
             rows.extend(std::iter::repeat_n(line, count));
+        }
+        if let Some((edges, defaults)) = word {
+            let height = rows.len();
+            for (y, (row, starts)) in rows.iter_mut().zip(positions).enumerate() {
+                for (cell, x) in row.iter_mut().zip(starts) {
+                    for (key, value) in &defaults {
+                        cell.properties
+                            .entry(key.clone())
+                            .or_insert_with(|| value.clone());
+                    }
+                    let outer = [
+                        x == 0,
+                        x + cell.colspan.unwrap_or(1).min(16384) >= columns,
+                        y == 0,
+                        y + cell.rowspan.unwrap_or(1) >= height,
+                    ];
+                    for ((key, is_outer), inner) in formatting::BORDERS
+                        .into_iter()
+                        .zip(outer)
+                        .zip(["insideV", "insideV", "insideH", "insideH"])
+                    {
+                        if let Some(value) = edges.get(if is_outer { key } else { inner }) {
+                            cell.properties
+                                .entry(key.into())
+                                .or_insert_with(|| value.clone());
+                        }
+                    }
+                }
+            }
         }
         self.rules
             .table_bytes
@@ -749,6 +890,28 @@ impl Flow<'_> {
         }
         Ok(())
     }
+}
+
+fn word_table_format(n: N, rules: &Rules) -> (Properties, Properties) {
+    let props = child(n, "tblPr");
+    let style = props
+        .and_then(|p| child(p, "tblStyle"))
+        .and_then(|s| attr(s, "val"));
+    let mut edges = style
+        .and_then(|id| rules.table_borders.get(id))
+        .cloned()
+        .unwrap_or_default();
+    let mut defaults = style
+        .and_then(|id| rules.table_cells.get(id))
+        .cloned()
+        .unwrap_or_default();
+    if let Some(props) = props {
+        if let Some(node) = child(props, "tblBorders") {
+            edges.extend(formatting::word_borders(node));
+        }
+        formatting::word_cell(&mut defaults, props);
+    }
+    (edges, defaults)
 }
 
 fn has_content(runs: &[Run]) -> bool {

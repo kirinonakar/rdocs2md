@@ -7,6 +7,7 @@ pub(super) struct Fragment {
     pub y: f32,
     pub size: f32,
     pub horizontal: bool,
+    pub discretionary_hyphen: bool,
     pub runs: Vec<Run>,
 }
 
@@ -14,6 +15,16 @@ pub(super) struct HorizontalRule {
     pub left: f32,
     pub right: f32,
     pub y: f32,
+    pub width: f32,
+    pub color: [u8; 3],
+    pub style: &'static str,
+}
+
+impl HorizontalRule {
+    fn border(&self) -> String {
+        let [r, g, b] = self.color;
+        format!("{}pt {} #{r:02X}{g:02X}{b:02X}", self.width, self.style)
+    }
 }
 
 impl Fragment {
@@ -143,6 +154,7 @@ enum Content {
     Line {
         runs: Vec<Run>,
         size: f32,
+        discretionary_hyphen: bool,
     },
     Standalone(Vec<Run>),
     Table {
@@ -177,6 +189,7 @@ fn as_item(f: Fragment) -> Item {
             Content::Line {
                 runs: f.runs,
                 size: f.size,
+                discretionary_hyphen: f.discretionary_hyphen,
             }
         } else {
             Content::Standalone(f.runs)
@@ -212,6 +225,7 @@ fn baseline_bands(mut fragments: Vec<Fragment>) -> Vec<Vec<Fragment>> {
                     && !f.first_text().starts_with([',', '.', ':', ';', ')', ']'])
                     && !f.runs.first().is_some_and(|r| r.style.script.is_some());
                 prev.end = prev.end.max(f.end);
+                prev.discretionary_hyphen = f.discretionary_hyphen;
                 join_runs(&mut prev.runs, f.runs, space);
             } else {
                 lines.push(f);
@@ -397,13 +411,19 @@ fn ruled_headings(
                 }
                 let start = row.partition_point(|f| f.x < rule.left - 1.);
                 let end = row.partition_point(|f| f.x <= rule.right + 1.);
-                (end >= start + 2 && boundaries[start] && boundaries[end]).then_some((start, end))
+                (end >= start + 2 && boundaries[start] && boundaries[end])
+                    .then_some((start, end, rule))
             });
-            let Some((start, end)) = span else { break };
-            if spans.last().is_some_and(|&(_, previous)| previous > start) {
+            let Some((start, end, rule)) = span else {
+                break;
+            };
+            if spans
+                .last()
+                .is_some_and(|&(_, previous, _)| previous > start)
+            {
                 break;
             }
-            spans.push((start, end));
+            spans.push((start, end, rule));
         }
         if spans.len() != items.len() - band {
             break;
@@ -412,16 +432,18 @@ fn ruled_headings(
         baseline = last.y;
         let mut cells = Vec::new();
         let mut column = 0;
-        for ((start, end), item) in spans.into_iter().zip(items.drain(band..)) {
+        for ((start, end, rule), item) in spans.into_iter().zip(items.drain(band..)) {
             cells.extend((column..start).map(|_| Cell::default()));
             let Content::Line { mut runs, .. } = item.content else {
                 unreachable!();
             };
             clean_line(&mut runs);
+            let mut properties = coordinates(item.x, item.y);
+            properties.insert("border-bottom".into(), rule.border());
             cells.push(Cell {
                 runs,
                 colspan: Some(end - start),
-                properties: coordinates(item.x, item.y),
+                properties,
                 ..Cell::default()
             });
             boundaries[start + 1..end].fill(false);
@@ -559,6 +581,16 @@ fn ruled_table(
         }
         rows.push(row);
     }
+    let header_border = top.border();
+    for cell in &mut rows[0] {
+        cell.properties
+            .insert("border-bottom".into(), header_border.clone());
+    }
+    let footer_border = bottom.border();
+    for cell in rows.last_mut().unwrap() {
+        cell.properties
+            .insert("border-bottom".into(), footer_border.clone());
+    }
 
     let mut suffix = Vec::new();
     let mut previous_y = bottom.y;
@@ -592,7 +624,7 @@ fn ruled_table(
 
 fn ruled_tables(bands: &mut [Vec<Fragment>], rules: &[HorizontalRule]) -> Vec<Item> {
     let baselines: Vec<_> = bands.iter().map(|b| b[0].y).collect();
-    let mut tables = Vec::new();
+    let mut tables = segmented_tables(bands, &baselines, rules);
     for (i, top) in rules.iter().enumerate() {
         let bottom = rules[i + 1..]
             .iter()
@@ -605,6 +637,145 @@ fn ruled_tables(bands: &mut [Vec<Fragment>], rules: &[HorizontalRule]) -> Vec<It
         }
     }
     tables
+}
+
+// Some PDFs draw each column's horizontal border separately. Repeated sets
+// of touching segments give us both the table bounds and the column edges.
+fn segmented_tables(
+    bands: &mut [Vec<Fragment>],
+    baselines: &[f32],
+    rules: &[HorizontalRule],
+) -> Vec<Item> {
+    let mut borders = Vec::new();
+    for line in rules.chunk_by(|a, b| (a.y - b.y).abs() <= 0.25) {
+        let mut segments: Vec<_> = line.iter().collect();
+        segments.sort_by(|a, b| a.left.total_cmp(&b.left));
+        for columns in segments.chunk_by(|a, b| (a.right - b.left).abs() <= 1.) {
+            if (2..=32).contains(&columns.len()) {
+                borders.push(columns.to_vec());
+            }
+        }
+    }
+    let mut tables = Vec::new();
+    for (i, top) in borders.iter().enumerate() {
+        let mut matching = borders.iter().skip(i + 1).take(64).filter(|line| {
+            line.len() == top.len()
+                && line
+                    .iter()
+                    .zip(top)
+                    .all(|(a, b)| (a.left - b.left).abs() <= 1. && (a.right - b.right).abs() <= 1.)
+        });
+        if let (Some(header), Some(bottom)) = (matching.next(), matching.next())
+            && let Some(table) = segmented_table(bands, baselines, top, header, bottom)
+        {
+            tables.push(table);
+        }
+    }
+    tables
+}
+
+fn segmented_table(
+    bands: &mut [Vec<Fragment>],
+    baselines: &[f32],
+    top: &[&HorizontalRule],
+    header: &[&HorizontalRule],
+    bottom: &[&HorizontalRule],
+) -> Option<Item> {
+    let left = top[0].left;
+    let right = top.last()?.right;
+    let first = baselines.partition_point(|&y| y > top[0].y);
+    let body = baselines.partition_point(|&y| y > header[0].y);
+    let last = baselines.partition_point(|&y| y > bottom[0].y);
+    if first >= body
+        || body >= last
+        || (last - first).saturating_mul(top.len()) > crate::model::CELL_LIMIT
+    {
+        return None;
+    }
+
+    let mut plan = Vec::new();
+    let mut row = 0;
+    let mut previous = None;
+    for i in first..last {
+        let band = &bands[i];
+        let start = band.partition_point(|f| f.x < left - 1.);
+        let end = band.partition_point(|f| f.x <= right + 1.);
+        let line = &band[start..end];
+        if line.is_empty() {
+            continue;
+        }
+        let mut columns = Vec::new();
+        for f in line {
+            let col = top.partition_point(|rule| rule.right <= f.x + 0.5);
+            let border = top.get(col)?;
+            if !f.horizontal
+                || f.end > border.right + 2.
+                || columns.last().is_some_and(|&c| c >= col)
+            {
+                return None;
+            }
+            columns.push(col);
+        }
+        let full = line.len() == top.len();
+        if previous.is_none() && (i >= body || !full) {
+            return None;
+        }
+        if i >= body && full {
+            row += 1;
+        } else if let Some((last_y, last_size)) = previous
+            && ((i >= body && row == 0)
+                || (i >= body && columns[0] == 0)
+                || last_y - line[0].y > last_size * 1.8)
+        {
+            return None;
+        }
+        previous = Some((line[0].y, line[0].size));
+        plan.push((i, start..end, row, columns));
+    }
+    if row < 2 {
+        return None;
+    }
+
+    let y = baselines[plan[0].0];
+    let mut rows = vec![vec![Cell::default(); top.len()]; row + 1];
+    let mut discretionary = vec![false; top.len()];
+    let mut current_row = 0;
+    for (i, range, row, columns) in plan {
+        if row != current_row {
+            discretionary.fill(false);
+            current_row = row;
+        }
+        for (f, col) in bands[i].drain(range).zip(columns) {
+            let hyphen = f.discretionary_hyphen;
+            let cell = positioned_cell(f);
+            let target = &mut rows[row][col];
+            if target.runs.is_empty() {
+                *target = cell;
+            } else {
+                join_wrapped_line(&mut target.runs, cell.runs, discretionary[col]);
+            }
+            discretionary[col] = hyphen;
+        }
+    }
+    for (i, cell) in rows[0].iter_mut().enumerate() {
+        cell.properties.insert("border-top".into(), top[i].border());
+        cell.properties
+            .insert("border-bottom".into(), header[i].border());
+    }
+    for (i, cell) in rows[row].iter_mut().enumerate() {
+        cell.properties
+            .insert("border-bottom".into(), bottom[i].border());
+    }
+    Some(Item {
+        x: left,
+        end: right,
+        y,
+        content: Content::Table {
+            prefix: Vec::new(),
+            rows,
+            suffix: Vec::new(),
+        },
+    })
 }
 
 fn page_items(bands: Vec<Vec<Fragment>>, rules: &[HorizontalRule]) -> Vec<Item> {
@@ -752,13 +923,15 @@ fn read_region(items: Vec<Item>, out: &mut Vec<Block>, depth: usize) {
 fn continues(prev: &LineInfo, next: &LineInfo, right: f32) -> bool {
     let size = prev.size.max(next.size);
     let gap = prev.y - next.y;
+    let indent = next.x - prev.x;
+    let hanging_indent = prev.list_marker() && indent <= size * 2.;
     if gap < size * 0.55
-        || gap > size * 1.65
+        || gap > size * 1.8
         || prev.size.min(next.size) < size * 0.85
         || prev.bold != next.bold
-        || (next.x - prev.x > size * 0.8 && !prev.drop_cap)
-        || prev.x - next.x > size * 4.
-        || next.first.starts_with(['•', '▪', '■', '◦'])
+        || (indent > size * 0.55 && !prev.drop_cap && !hanging_indent)
+        || indent < -size * 4.
+        || next.list_marker()
     {
         return false;
     }
@@ -780,12 +953,20 @@ struct LineInfo {
     size: f32,
     bold: bool,
     drop_cap: bool,
+    discretionary_hyphen: bool,
     first: String,
     last: String,
 }
 
 impl LineInfo {
-    fn new(item: &Item, runs: &[Run], size: f32) -> Self {
+    fn list_marker(&self) -> bool {
+        self.first.starts_with(['•', '▪', '■', '◦'])
+            || self.first.strip_suffix(['.', ')']).is_some_and(|n| {
+                !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit())
+            })
+    }
+
+    fn new(item: &Item, runs: &[Run], size: f32, discretionary_hyphen: bool) -> Self {
         let first = runs
             .iter()
             .find_map(|r| r.text.split_whitespace().next())
@@ -800,6 +981,7 @@ impl LineInfo {
             end: item.end,
             y: item.y,
             size,
+            discretionary_hyphen,
             bold: runs
                 .iter()
                 .rev()
@@ -820,26 +1002,32 @@ impl LineInfo {
     }
 }
 
-fn join_wrapped_line(
-    previous: &LineInfo,
-    next: &LineInfo,
-    runs: &mut Vec<Run>,
-    incoming: Vec<Run>,
-) {
+fn join_wrapped_line(runs: &mut Vec<Run>, incoming: Vec<Run>, discretionary_hyphen: bool) {
     let mut space = true;
+    let next = incoming
+        .iter()
+        .find_map(|r| r.text.split_whitespace().next());
     if let Some(last) = runs.last_mut()
-        && let Some(after) = next.first.chars().next()
+        && let Some(next) = next
+        && let Some(after) = next.chars().next()
     {
-        if last.text.ends_with('\u{ad}') {
+        if last.text.ends_with('\u{ad}')
+            || (discretionary_hyphen && last.text.ends_with('-') && after.is_alphabetic())
+        {
             last.text.pop();
             space = false;
-        } else if let Some(stem) = previous.last.strip_suffix('-')
+        } else if let Some(stem) = last
+            .text
+            .split_whitespace()
+            .next_back()
+            .and_then(|t| t.strip_suffix('-'))
             && stem.ends_with(char::is_alphanumeric)
             && after.is_alphanumeric()
         {
             // Compound fragments often already contain a hyphen, digit or
             // spelled-out number. Keep their visible hyphen when joining.
             let compound = stem.contains('-')
+                || next.trim_end_matches(['-', '\u{ad}']).contains('-')
                 || stem.contains(char::is_numeric)
                 || matches!(
                     stem.to_ascii_lowercase().as_str(),
@@ -908,17 +1096,22 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     continue;
                 }
                 let item_size = item.line_size().unwrap();
-                let Content::Line { runs, .. } = &item.content else {
+                let Content::Line {
+                    runs,
+                    discretionary_hyphen,
+                    ..
+                } = &item.content
+                else {
                     unreachable!()
                 };
-                Some(LineInfo::new(&item, runs, item_size))
+                Some(LineInfo::new(&item, runs, item_size, *discretionary_hyphen))
             }
             _ => None,
         };
         let x = item.x;
         let y = item.y;
         match item.content {
-            Content::Line { runs, size } => {
+            Content::Line { runs, size, .. } => {
                 let info = info.unwrap();
                 let right = right_edges[idx.saturating_sub(4)..(idx + 5).min(right_edges.len())]
                     .iter()
@@ -929,7 +1122,7 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     && continues(prev, &info, right)
                     && let Some(Block::Paragraph { runs: para, .. }) = out.last_mut()
                 {
-                    join_wrapped_line(prev, &info, para, runs);
+                    join_wrapped_line(para, runs, prev.discretionary_hyphen);
                 } else {
                     out.push(Block::Paragraph {
                         heading: 0,

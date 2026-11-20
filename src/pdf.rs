@@ -55,6 +55,23 @@ impl Default for TextState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Stroke {
+    width: f32,
+    color: [u8; 3],
+    style: &'static str,
+}
+
+impl Default for Stroke {
+    fn default() -> Self {
+        Self {
+            width: 1.,
+            color: [0; 3],
+            style: "solid",
+        }
+    }
+}
+
 fn resolve_object<'a>(pdf: &'a Pdf, obj: &'a Object) -> Option<&'a Object> {
     match obj {
         Object::Reference(id) => pdf.get_object(*id).ok(),
@@ -343,6 +360,7 @@ impl PageReader<'_> {
         bytes: &[u8],
         resources: Option<&lopdf::Dictionary>,
         mut ctm: Matrix,
+        mut stroke: Stroke,
     ) -> Result<()> {
         *self.total += bytes.len() + 64;
         if *self.total > 512 * MIB {
@@ -379,6 +397,7 @@ impl PageReader<'_> {
         let mut state = TextState::default();
         let mut path_point: Option<(f32, f32)> = None;
         let mut path_rules = Vec::new();
+        let mut marked_spans = Vec::new();
 
         let mut moved = true;
         for op in Content::decode_iter(bytes) {
@@ -390,17 +409,29 @@ impl PageReader<'_> {
                     .and_then(|v| v.as_float().map_err(|_| "invalid PDF numeric operand"))
             };
             match op.operator.as_str() {
+                "BMC" => marked_spans.push(false),
+                "BDC" => marked_spans.push(
+                    args.first().and_then(|o| o.as_name().ok()) == Some(b"Span")
+                        && args
+                            .get(1)
+                            .and_then(|o| o.as_dict().ok())
+                            .is_some_and(|properties| properties.has(b"MCID")),
+                ),
+                "EMC" => {
+                    marked_spans.pop();
+                }
                 "q" => {
                     if stack.len() > 128 {
                         return Err("PDF graphics state depth exceeded".into());
                     }
-                    stack.push((ctm, font.clone(), state))
+                    stack.push((ctm, font.clone(), state, stroke))
                 }
                 "Q" => {
-                    if let Some((m, f, s)) = stack.pop() {
+                    if let Some((m, f, s, line_style)) = stack.pop() {
                         ctm = m;
                         font = f;
                         state = s;
+                        stroke = line_style;
                         moved = true;
                     }
                 }
@@ -414,6 +445,35 @@ impl PageReader<'_> {
                     }
                     moved = true
                 }
+                "w" => {
+                    if let Ok(w) = num(0)
+                        && w.is_finite()
+                        && w >= 0.
+                    {
+                        stroke.width = w;
+                    }
+                }
+                "G" | "RG" => {
+                    let component = |i| num(i).ok().map(|v| (255. * v.clamp(0., 1.)).round() as u8);
+                    if let Some(r) = component(0) {
+                        stroke.color = if op.operator == "G" {
+                            [r; 3]
+                        } else if let (Some(g), Some(b)) = (component(1), component(2)) {
+                            [r, g, b]
+                        } else {
+                            stroke.color
+                        };
+                    }
+                }
+                "d" => {
+                    if let Some(pattern) = args.first().and_then(|a| a.as_array().ok()) {
+                        stroke.style = match pattern.first().and_then(|p| p.as_float().ok()) {
+                            Some(n) if n <= stroke.width => "dotted",
+                            Some(_) => "dashed",
+                            None => "solid",
+                        };
+                    }
+                }
                 "m" | "l" => {
                     let next = num(0).ok().zip(num(1).ok()).map(|(x, y)| ctm.point(x, y));
                     if op.operator == "l"
@@ -424,18 +484,25 @@ impl PageReader<'_> {
                         && (y - end_y).abs() <= 0.5
                         && (x - end).abs() >= 10.
                     {
-                        path_rules.push(HorizontalRule {
-                            left: x.min(end),
-                            right: x.max(end),
-                            y,
-                        });
+                        path_rules.push((x.min(end), x.max(end), y));
                     }
                     path_point = next;
                 }
                 "c" | "v" | "y" | "h" | "re" => path_point = None,
                 "S" | "s" | "B" | "B*" | "b" | "b*" => {
                     let remaining = PDF_RULE_LIMIT - self.rules.len();
-                    self.rules.extend(path_rules.drain(..).take(remaining));
+                    let scale = ctm.0[2].hypot(ctm.0[3]);
+                    let width = (stroke.width * scale).clamp(0.25, 100.);
+                    self.rules.extend(path_rules.drain(..).take(remaining).map(
+                        |(left, right, y)| HorizontalRule {
+                            left,
+                            right,
+                            y,
+                            width,
+                            color: stroke.color,
+                            style: stroke.style,
+                        },
+                    ));
                     path_point = None;
                 }
                 "f" | "F" | "f*" | "n" => {
@@ -605,6 +672,10 @@ impl PageReader<'_> {
                         {
                             return Err("non-finite PDF coordinates".into());
                         }
+                        // A positioned hyphen in its own marked span can be
+                        // dropped at a wrap without stripping compound hyphens.
+                        let discretionary_hyphen =
+                            moved && text == "-" && marked_spans.last() == Some(&true);
                         let run = Run {
                             text,
                             style: style.clone(),
@@ -616,6 +687,7 @@ impl PageReader<'_> {
                             && let Some(f) = self.fragments.last_mut()
                         {
                             f.end = f.end.max(end);
+                            f.discretionary_hyphen = false;
                             push_run(&mut f.runs, run);
                         } else {
                             self.fragments.push(Fragment {
@@ -624,6 +696,7 @@ impl PageReader<'_> {
                                 y,
                                 size: effective_size,
                                 horizontal: basis.0[0] > 0. && basis.0[1].abs() < basis.0[0] * 0.15,
+                                discretionary_hyphen,
                                 runs: vec![run],
                             });
                         }
@@ -659,7 +732,7 @@ impl PageReader<'_> {
                                     .or(resources);
                                 let content = stream.get_plain_content_with_limit(PART_LIMIT)?;
                                 self.active.push(id);
-                                self.content(&content, r, ctm.concat(transform))?;
+                                self.content(&content, r, ctm.concat(transform), stroke)?;
                                 self.active.pop();
                                 moved = true;
                             }
@@ -683,6 +756,7 @@ impl PageReader<'_> {
                                     y,
                                     size: 0.,
                                     horizontal: false,
+                                    discretionary_hyphen: false,
                                     runs: vec![Run {
                                         image: Some(name),
                                         ..Run::default()
@@ -739,7 +813,7 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
             rules: Vec::new(),
             active: Vec::new(),
         };
-        reader.content(&bytes, resources, Matrix::ID)?;
+        reader.content(&bytes, resources, Matrix::ID, Stroke::default())?;
         annotations(&pdf, id, &mut reader.fragments)?;
         if !reader
             .fragments

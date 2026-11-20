@@ -1,4 +1,4 @@
-use crate::model::*;
+use crate::{formatting, model::*};
 use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Read},
@@ -58,11 +58,37 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
         Err("unsupported OLE document streams".into())
     }
 }
-fn hwp_text(data: &[u8]) -> Result<String> {
+fn hwp_runs(data: &[u8], shapes: &[u8], styles: &[Style]) -> Result<Vec<Run>> {
+    let mut runs = Vec::new();
     let mut units = Vec::new();
+    let mut changes = shapes.as_chunks::<8>().0.iter().take(CELL_LIMIT).peekable();
+    let mut style = None;
+    let flush = |runs: &mut Vec<Run>, units: &mut Vec<u16>, style: Option<&Style>| {
+        if !units.is_empty() {
+            push_run(
+                runs,
+                Run {
+                    text: String::from_utf16_lossy(units),
+                    style: style.cloned().unwrap_or_default(),
+                    ..Run::default()
+                },
+            );
+            units.clear();
+        }
+    };
     let mut i = 0;
     while i < data.len() {
         let n = u16le(data, i)?;
+        // Shape offsets count UTF-16 units, including the extended control bytes.
+        if !(0xdc00..=0xdfff).contains(&n) {
+            while let Some(shape) = changes.next_if(|v| u32le(*v, 0).unwrap() as usize <= i / 2) {
+                let next = styles.get(u32le(shape, 4)? as usize);
+                if next != style {
+                    flush(&mut runs, &mut units, style);
+                    style = next;
+                }
+            }
+        }
         i += 2;
         match n {
             9 => {
@@ -81,7 +107,21 @@ fn hwp_text(data: &[u8]) -> Result<String> {
             return Err("truncated HWP control".into());
         }
     }
-    Ok(String::from_utf16_lossy(&units))
+    flush(&mut runs, &mut units, style);
+    let Some(first) = runs.iter().position(|r| !r.text.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let last = runs
+        .iter()
+        .rposition(|r| !r.text.trim().is_empty())
+        .unwrap();
+    runs.truncate(last + 1);
+    runs.drain(..first);
+    let leading = runs[0].text.len() - runs[0].text.trim_start().len();
+    runs[0].text.drain(..leading);
+    let tail = &mut runs.last_mut().unwrap().text;
+    tail.truncate(tail.trim_end().len());
+    Ok(runs)
 }
 
 #[derive(Clone, Copy)]
@@ -110,11 +150,179 @@ fn hwp_record<'a>(raw: &mut &'a [u8]) -> Result<HwpRecord<'a>> {
     })
 }
 
+#[derive(Default)]
+struct HwpFormatting {
+    borders: Vec<Properties>,
+    alignments: Vec<Option<&'static str>>,
+    characters: Vec<Style>,
+}
+
+fn hwp_color(bytes: &[u8]) -> String {
+    format!("#{:02X}{:02X}{:02X}", bytes[0], bytes[1], bytes[2])
+}
+
+impl HwpFormatting {
+    fn read(mut info: &[u8]) -> Self {
+        let mut styles = Self::default();
+        let mut fonts = Vec::new();
+        let mut hangul_fonts = 0;
+        while !info.is_empty() {
+            let Ok(record) = hwp_record(&mut info) else {
+                break;
+            };
+            match record.tag {
+                17 => {
+                    hangul_fonts = u32le(record.data, 4)
+                        .unwrap_or_default()
+                        .min(u16::MAX as u32 + 1) as usize
+                }
+                19 if fonts.len() < hangul_fonts => {
+                    let size = usize::from(u16le(record.data, 1).unwrap_or_default());
+                    fonts.push(
+                        (1..128)
+                            .contains(&size)
+                            .then(|| {
+                                record
+                                    .data
+                                    .get(3..3 + size * 2)
+                                    .and_then(|name| utf16(name).ok())
+                            })
+                            .flatten(),
+                    );
+                }
+                20 if styles.borders.len() < u16::MAX as usize => {
+                    let mut props = Properties::new();
+                    if let Some(edges) = record.data.get(2..26) {
+                        for (key, edge) in formatting::BORDERS
+                            .into_iter()
+                            .zip(edges.as_chunks::<6>().0)
+                        {
+                            let style = match edge[0] {
+                                0 => "none",
+                                2 | 4..=6 | 12 => "dashed",
+                                3 | 7 => "dotted",
+                                8..=11 | 13 => "double",
+                                _ => "solid",
+                            };
+                            let widths = [
+                                "0.1mm", "0.12mm", "0.15mm", "0.2mm", "0.25mm", "0.3mm", "0.4mm",
+                                "0.5mm", "0.6mm", "0.7mm", "1mm", "1.5mm", "2mm", "3mm", "4mm",
+                                "5mm",
+                            ];
+                            let width = widths.get(usize::from(edge[1])).unwrap_or(&"0.12mm");
+                            props.insert(
+                                key.into(),
+                                formatting::border(style, width, Some(&hwp_color(&edge[2..]))),
+                            );
+                        }
+                    }
+                    if u32le(record.data, 32).is_ok_and(|flags| flags & 1 != 0)
+                        && let Some(shade) = record.data.get(36..40)
+                        && shade != [255; 4]
+                    {
+                        props.insert("background-color".into(), hwp_color(shade));
+                    }
+                    styles.borders.push(props);
+                }
+                21 if styles.characters.len() < CELL_LIMIT => {
+                    let flags = u32le(record.data, 46).unwrap_or_default();
+                    let size = u32le(record.data, 42)
+                        .ok()
+                        .filter(|n| (1..100_000).contains(n));
+                    let font = u16le(record.data, 0)
+                        .ok()
+                        .and_then(|id| fonts.get(usize::from(id)))
+                        .cloned()
+                        .flatten();
+                    styles.characters.push(Style {
+                        font,
+                        size: size.map(|n| format!("{}pt", f64::from(n) / 100.)),
+                        color: record.data.get(52..56).map(hwp_color),
+                        bold: flags & 2 != 0,
+                        italic: flags & 1 != 0,
+                        underline: (flags >> 2) & 3 == 1,
+                        script: if flags & (1 << 15) != 0 {
+                            Some("sup".into())
+                        } else if flags & (1 << 16) != 0 {
+                            Some("sub".into())
+                        } else {
+                            None
+                        },
+                        ..Style::default()
+                    });
+                }
+                25 if styles.alignments.len() <= u16::MAX as usize => {
+                    styles
+                        .alignments
+                        .push(
+                            record
+                                .data
+                                .first()
+                                .and_then(|flags| match (flags >> 2) & 7 {
+                                    0 | 4 | 5 => Some("justify"),
+                                    1 => Some("left"),
+                                    2 => Some("right"),
+                                    3 => Some("center"),
+                                    _ => None,
+                                }),
+                        );
+                }
+                _ => {}
+            }
+        }
+        styles
+    }
+
+    fn cell(&self, data: &[u8]) -> Result<Properties> {
+        let id = usize::from(u16le(data, 32)?);
+        let mut props = if id == 0 && !self.borders.is_empty() {
+            formatting::BORDERS
+                .into_iter()
+                .map(|key| (key.into(), "none".into()))
+                .collect()
+        } else {
+            id.checked_sub(1)
+                .and_then(|i| self.borders.get(i))
+                .cloned()
+                .unwrap_or_default()
+        };
+        for (key, offset) in [("width", 16), ("height", 20)] {
+            let value = u32le(data, offset)?;
+            formatting::points(
+                &mut props,
+                key,
+                (value > 0).then_some(f64::from(value) / 100.),
+            );
+        }
+        let align = match (u32le(data, 4)? >> 5) & 3 {
+            0 => "top",
+            1 => "middle",
+            2 => "bottom",
+            _ => "",
+        };
+        formatting::box_property(&mut props, "vertical-align", align);
+        for (key, offset) in [
+            ("padding-left", 24),
+            ("padding-right", 26),
+            ("padding-top", 28),
+            ("padding-bottom", 30),
+        ] {
+            formatting::points(
+                &mut props,
+                key,
+                Some(f64::from(u16le(data, offset)?) / 100.),
+            );
+        }
+        Ok(props)
+    }
+}
+
 fn hwp_table<'a>(
     records: &mut std::iter::Peekable<impl Iterator<Item = Result<HwpRecord<'a>>>>,
     level: u32,
     depth: usize,
     out: &mut Vec<Block>,
+    styles: &HwpFormatting,
 ) -> Result<()> {
     if depth >= 32 {
         return Err("HWP table nesting limit exceeded".into());
@@ -166,22 +374,34 @@ fn hwp_table<'a>(
                     grid[index] = Some(Cell {
                         colspan: (colspan > 1).then_some(colspan),
                         rowspan: (rowspan > 1).then_some(rowspan),
+                        properties: styles.cell(record.data)?,
                         ..Cell::default()
                     });
                     current = Some(index);
+                }
+                66 => {
+                    if let Some(index) = current {
+                        hwp_block(
+                            records,
+                            record,
+                            depth + 1,
+                            &mut grid[index].as_mut().unwrap().blocks,
+                            styles,
+                        )?;
+                    }
                 }
                 _ => {}
             }
         } else if let Some(index) = current {
             let cell = grid[index].as_mut().unwrap();
-            hwp_block(records, record, depth + 1, &mut cell.blocks)?;
+            hwp_block(records, record, depth + 1, &mut cell.blocks, styles)?;
         } else {
             let blocks = if columns == 0 {
                 &mut *out
             } else {
                 &mut trailing
             };
-            hwp_block(records, record, depth + 1, blocks)?;
+            hwp_block(records, record, depth + 1, blocks, styles)?;
         }
     }
     if columns > 0 && !grid.is_empty() {
@@ -211,6 +431,15 @@ fn hwp_table<'a>(
                     .iter()
                     .all(|b| matches!(b, Block::Paragraph { .. }))
                 {
+                    let mut alignments = cell.blocks.iter().map(|block| match block {
+                        Block::Paragraph { properties, .. } => properties.get("align"),
+                        _ => None,
+                    });
+                    if let Some(Some(align)) = alignments.next()
+                        && alignments.all(|a| a == Some(align))
+                    {
+                        cell.properties.insert("text-align".into(), align.clone());
+                    }
                     for block in std::mem::take(&mut cell.blocks) {
                         if let Block::Paragraph { runs, .. } = block {
                             if !cell.runs.is_empty() {
@@ -237,16 +466,43 @@ fn hwp_block<'a>(
     record: HwpRecord<'a>,
     depth: usize,
     out: &mut Vec<Block>,
+    styles: &HwpFormatting,
 ) -> Result<()> {
     match record.tag {
-        67 => {
-            let text = hwp_text(record.data)?;
-            let text = text.trim();
-            if !text.is_empty() {
-                out.push(Block::text(text));
+        66 => {
+            if let Some(text) = records.next_if(|r| {
+                r.as_ref()
+                    .is_ok_and(|p| p.tag == 67 && p.level == record.level + 1)
+            }) {
+                let shapes = records
+                    .next_if(|r| {
+                        r.as_ref()
+                            .is_ok_and(|p| p.tag == 68 && p.level == record.level + 1)
+                    })
+                    .transpose()?
+                    .map_or(&[][..], |p| p.data);
+                let runs = hwp_runs(text?.data, shapes, &styles.characters)?;
+                if !runs.is_empty() {
+                    let mut block = Block::flow(runs);
+                    if let Block::Paragraph { properties, .. } = &mut block
+                        && let Ok(index) = u16le(record.data, 8)
+                        && let Some(Some(align)) = styles.alignments.get(usize::from(index))
+                    {
+                        properties.insert("align".into(), (*align).into());
+                    }
+                    out.push(block);
+                }
             }
         }
-        71 if record.data.starts_with(b" lbt") => hwp_table(records, record.level, depth, out)?,
+        67 => {
+            let runs = hwp_runs(record.data, &[], &[])?;
+            if !runs.is_empty() {
+                out.push(Block::flow(runs));
+            }
+        }
+        71 if record.data.starts_with(b" lbt") => {
+            hwp_table(records, record.level, depth, out, styles)?
+        }
         76 if record.data.starts_with(b"cip$") => {
             if let Some(picture) = records.next_if(|r| {
                 r.as_ref()
@@ -300,17 +556,17 @@ fn hwp_stream(ole: &mut Ole, path: &str, compressed: bool) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn hwp_images(ole: &mut Ole, doc: &mut Document, compressed: bool, mut total: usize) -> Result<()> {
+fn hwp_images(
+    ole: &mut Ole,
+    doc: &mut Document,
+    compressed: bool,
+    mut total: usize,
+    mut remaining: &[u8],
+) -> Result<()> {
     let sources = image_sources(doc);
-    if sources.is_empty() || !ole.is_stream("/DocInfo") {
+    if sources.is_empty() {
         return Ok(());
     }
-    let info = hwp_stream(ole, "/DocInfo", compressed)?;
-    total += info.len();
-    if total > FILE_LIMIT {
-        return Err("HWP expansion limit exceeded".into());
-    }
-    let mut remaining = info.as_slice();
     let mut id = 0;
     while !remaining.is_empty() {
         let record = hwp_record(&mut remaining)?;
@@ -382,8 +638,14 @@ fn hwp(ole: &mut Ole, images: bool) -> Result<Document> {
         .collect();
     files.sort();
     let mut doc = Document::new("hwp");
-    let mut total = 0;
     let compressed = flags & 1 != 0;
+    let info = if ole.is_stream("/DocInfo") {
+        hwp_stream(ole, "/DocInfo", compressed)?
+    } else {
+        Vec::new()
+    };
+    let mut total = info.len();
+    let styles = HwpFormatting::read(&info);
     for (_, path) in files {
         let raw = hwp_stream(ole, &path, compressed)?;
         total += raw.len();
@@ -400,12 +662,12 @@ fn hwp(ole: &mut Ole, images: bool) -> Result<Document> {
         })
         .peekable();
         while let Some(record) = records.next() {
-            hwp_block(&mut records, record?, 0, &mut sec.blocks)?;
+            hwp_block(&mut records, record?, 0, &mut sec.blocks, &styles)?;
         }
         doc.sections.push(sec)
     }
     if images {
-        hwp_images(ole, &mut doc, compressed, total)?;
+        hwp_images(ole, &mut doc, compressed, total, &info)?;
     }
     Ok(doc)
 }

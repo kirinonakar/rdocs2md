@@ -28,6 +28,8 @@ fn rtf_groups_codepages_unicode_fields_and_table() {
     }
     assert!(!s.contains("private"));
     assert_eq!(d.sections.len(), 2);
+    let html = render(&d, "html", "hybrid", &Properties::new()).unwrap();
+    assert!(html.contains("border: 1px solid") && html.contains("<table>"));
 }
 #[test]
 fn ods_repeats_formulas_spans_and_modes() {
@@ -214,6 +216,65 @@ fn cell_text(row: &[Cell]) -> Vec<String> {
 }
 
 #[test]
+fn pdf_reflows_loose_leading_and_keeps_paragraph_and_reference_boundaries() {
+    let content = "BT /F 9 Tf\n\
+        1 0 0 1 49 200 Tm (The document includes page-naviga) Tj\n\
+        /Span << /MCID 1 >> BDC 1 0 0 1 189 200 Tm (-) Tj EMC\n\
+        1 0 0 1 40 185 Tm (tion and other reading controls for one-) Tj\n\
+        1 0 0 1 40 170 Tm (step access. This line is filled to the margin.) Tj\n\
+        1 0 0 1 49 155 Tm (Another paragraph starts here and then) Tj\n\
+        1 0 0 1 40 140 Tm (continues on the next line.) Tj\n\
+        1 0 0 1 40 104 Tm (1. A reference with a long title that wraps.) Tj\n\
+        1 0 0 1 52 89 Tm (Publisher and year.) Tj\n\
+        1 0 0 1 40 74 Tm (2. The next reference.) Tj ET";
+    let rendered = md(&convert(&positioned_pdf(content.into()), false).unwrap());
+    assert_eq!(
+        rendered.trim(),
+        "The document includes page-navigation and other reading controls for one-step access. This line is filled to the margin.\n\
+         \nAnother paragraph starts here and then continues on the next line.\n\
+         \n1. A reference with a long title that wraps. Publisher and year.\n\
+         \n2. The next reference."
+    );
+}
+
+#[test]
+fn pdf_segmented_rules_keep_centered_headers_and_wrapped_cells() {
+    let content = "1 w 40 175 m 90 175 l 90 175 m 255 175 l S\n\
+        0.5 w 40 160 m 90 160 l 90 160 m 255 160 l S\n\
+        40 92 m 90 92 l 90 92 m 255 92 l S\n\
+        BT /F 8 Tf\n\
+        1 0 0 1 40 189 Tm (Table caption) Tj\n\
+        1 0 0 1 53 164 Tm (Group) Tj 1 0 0 1 150 164 Tm (Description) Tj\n\
+        1 0 0 1 60 148 Tm (A1) Tj 1 0 0 1 90 148 Tm (A description that has a) Tj\n\
+        1 0 0 1 96 135 Tm (second line.) Tj 1 0 0 1 263 135 Tm (Side note) Tj\n\
+        1 0 0 1 60 121 Tm (A2) Tj 1 0 0 1 90 121 Tm (Another description with) Tj\n\
+        1 0 0 1 96 108 Tm (its own continuation.) Tj\n\
+        1 0 0 1 40 81 Tm (Table note) Tj ET";
+    let doc = convert(&positioned_pdf(content.into()), false).unwrap();
+    let tables: Vec<_> = doc.sections[0]
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Table { rows } => {
+                Some(rows.iter().map(|row| cell_text(row)).collect::<Vec<_>>())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tables,
+        [vec![
+            vec!["Group", "Description"],
+            vec!["A1", "A description that has a second line."],
+            vec!["A2", "Another description with its own continuation."],
+        ]]
+    );
+    let rendered = md(&doc);
+    assert!(rendered.contains("Table caption\n\n| Group | Description |\n| --- | --- |"));
+    assert!(rendered.contains("Side note") && rendered.contains("Table note"));
+}
+
+#[test]
 fn pdf_spaced_glyphs_and_ruled_headings_form_a_table() {
     let mut content = String::from(
         "84 167 m 180 167 l 196 167 m 292 167 l S\n\
@@ -263,7 +324,7 @@ fn pdf_spaced_glyphs_and_ruled_headings_form_a_table() {
 
 #[test]
 fn pdf_ruled_table_keeps_section_rows_and_wrapped_headings_beside_prose() {
-    let content = "40 150 m 222 150 l S 40 80 m 222 80 l S\n\
+    let content = "0.75 w 1 0 0 RG [3 2] 0 d 40 150 m 222 150 l S 40 80 m 222 80 l S\n\
         BT /F 8 Tf\n\
         1 0 0 1 94 167 Tm (First) Tj 1 0 0 1 166 167 Tm (Third) Tj\n\
         1 0 0 1 250 163 Tm (Adjacent prose) Tj\n\
@@ -297,6 +358,11 @@ fn pdf_ruled_table_keeps_section_rows_and_wrapped_headings_beside_prose() {
     let rendered = md(&doc);
     assert_eq!(rendered.matches("<table>").count(), 1);
     assert!(rendered.contains("Adjacent prose") && rendered.contains("</table>\n\nTable note"));
+    let html = render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+    assert_eq!(
+        html.matches("border-bottom:0.75pt dashed #FF0000;").count(),
+        8
+    );
 }
 
 #[test]
@@ -317,12 +383,22 @@ fn hwp_tables_keep_merged_cells_and_nested_answers() {
         let mut data = vec![1, 0, 0, 0, 0, 0, 5, 0];
         data.extend(address.into_iter().flat_map(u16::to_le_bytes));
         data.resize(47, 0);
+        data[16..20].copy_from_slice(&6000_u32.to_le_bytes());
+        data[32..34].copy_from_slice(&1_u16.to_le_bytes());
         record(out, 72, level, &data);
     }
     fn paragraph(out: &mut Vec<u8>, level: u32, text: &str) {
-        record(out, 66, level, &[]);
+        record(out, 66, level, &[0; 10]);
+        let styled = text == "After";
         let text: Vec<_> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
         record(out, 67, level + 1, &text);
+        if styled {
+            let shapes: Vec<_> = [0_u32, 0, 2, 1]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            record(out, 68, level + 1, &shapes);
+        }
     }
     let mut raw = Vec::new();
     paragraph(&mut raw, 0, "Before");
@@ -367,6 +443,18 @@ fn hwp_tables_keep_merged_cells_and_nested_answers() {
     bin_data.extend("bmp".encode_utf16().flat_map(u16::to_le_bytes));
     let mut info = Vec::new();
     record(&mut info, 18, 0, &bin_data);
+    let mut borders = [0; 48];
+    borders[2..8].copy_from_slice(&[2, 6, 0xAB, 0x12, 0x34, 0]);
+    borders[32] = 1;
+    borders[36..39].copy_from_slice(&[0xF2, 0xE5, 0xC4]);
+    record(&mut info, 20, 0, &borders);
+    let mut characters = [0; 56];
+    characters[42..46].copy_from_slice(&1200_u32.to_le_bytes());
+    characters[52..55].copy_from_slice(&[0x11, 0x22, 0x33]);
+    record(&mut info, 21, 0, &characters);
+    characters[42..46].copy_from_slice(&900_u32.to_le_bytes());
+    record(&mut info, 21, 0, &characters);
+    record(&mut info, 25, 0, &[12]);
     file.create_stream("/DocInfo")
         .unwrap()
         .write_all(&info)
@@ -403,6 +491,52 @@ fn hwp_tables_keep_merged_cells_and_nested_answers() {
     let links = Properties::from([("hwp/1".into(), "image.bmp".into())]);
     let result = render(&doc, "md", "hybrid", &links).unwrap();
     assert!(result.contains("<td><img alt=\"\" src=\"image.bmp\" style=\"width:9.5pt;height:10pt;transform:rotate(270deg)\"></td>"));
+    let html = render(&doc, "html", "hybrid", &links).unwrap();
+    for expected in [
+        "border-left:0.4mm dashed #AB1234;",
+        "border-right:none;",
+        "background-color:#F2E5C4;",
+        "width:60pt;",
+        "rowspan=\"2\"",
+        "<p style=\"text-align:center;\">Answer continued</p>",
+        "font-size:12pt;color:#112233;\">Af</span><span style=\"font-size:9pt;color:#112233;\">ter</span>",
+    ] {
+        assert!(html.contains(expected), "missing {expected} in {html}");
+    }
+}
+
+#[test]
+fn html_hwpx_keeps_referenced_cell_border_fill_and_alignment() {
+    let input = package(&[
+        ("Contents/content.hpf", "<package/>"),
+        (
+            "Contents/header.xml",
+            r##"<head><borderFill id="7"><leftBorder type="SOLID" width="0.4 mm" color="#A43221"/><rightBorder type="NONE"/><topBorder type="DOT" width="0.2mm"/><fillBrush><winBrush faceColor="#F1E2D3"/></fillBrush></borderFill><paraPr id="3"><align horizontal="CENTER"/></paraPr></head>"##,
+        ),
+        (
+            "Contents/section0.xml",
+            r#"<sec><tbl><tr><tc borderFillIDRef="7"><subList vertAlign="CENTER"><p paraPrIDRef="3"><run><t>원본 표</t></run></p></subList><cellSpan colSpan="2"/><cellSz width="9000" height="2400"/><cellMargin left="400"/></tc></tr></tbl></sec>"#,
+        ),
+    ]);
+    let doc = convert(&input, false).unwrap();
+    for mode in ["semantic", "layout", "hybrid"] {
+        let html = render(&doc, "html", mode, &Properties::new()).unwrap();
+        for expected in [
+            "colspan=\"2\"",
+            "border-left:0.4mm solid #A43221;",
+            "border-right:none;",
+            "border-top:0.2mm dotted #000000;",
+            "background-color:#F1E2D3;",
+            "height:24pt;",
+            "width:90pt;",
+            "padding-left:4pt;",
+            "text-align:center;",
+            "vertical-align:middle;",
+        ] {
+            assert!(html.contains(expected), "missing {expected} in {html}");
+        }
+    }
+    assert!(md(&doc).contains("<td colspan=\"2\">원본 표</td>"));
 }
 
 #[test]
@@ -497,12 +631,16 @@ fn docx_nested_table_vertical_merge_notes_and_header() {
         ),
         (
             "word/_rels/document.xml.rels",
-            "<Relationships><Relationship Id='H' Target='header1.xml' Type='rel/header'/></Relationships>",
+            "<Relationships><Relationship Id='H' Target='header1.xml' Type='rel/header'/><Relationship Id='S' Target='styles.xml' Type='rel/styles'/></Relationships>",
+        ),
+        (
+            "word/styles.xml",
+            "<styles><style styleId='Base'><tblPr><tblBorders><insideV val='double' sz='24' color='FF0011'/><insideH val='single' sz='4'/></tblBorders></tblPr></style><style styleId='Grid'><basedOn val='Base'/></style></styles>",
         ),
         ("word/header1.xml", "<hdr><p><r><t>머리글</t></r></p></hdr>"),
         (
             "word/document.xml",
-            "<document><body><tbl><tr><tc><tcPr><vMerge val='restart'/></tcPr><p><r><t>위</t></r></p></tc><tc><tbl><tr><tc><p><r><t>안쪽</t></r></p></tc></tr></tbl></tc></tr><tr><tc><tcPr><vMerge/></tcPr></tc><tc><p><r><t>아래</t></r></p></tc></tr></tbl><sectPr><headerReference id='H'/></sectPr></body></document>",
+            "<document><body><tbl><tblPr><tblStyle val='Grid'/><tblBorders><top val='dashed' sz='12' color='112233'/><bottom val='single' sz='8'/></tblBorders></tblPr><tr><tc><tcPr><vMerge val='restart'/><shd fill='FFEECC'/><tcW w='1200' type='dxa'/></tcPr><p><pPr><jc val='center'/></pPr><r><t>위</t></r></p></tc><tc><tbl><tr><tc><p><r><t>안쪽</t></r></p></tc></tr></tbl></tc></tr><tr><tc><tcPr><vMerge/><tcBorders><bottom val='nil'/></tcBorders></tcPr></tc><tc><p><r><t>아래</t></r></p></tc></tr></tbl><sectPr><headerReference id='H'/></sectPr></body></document>",
         ),
     ]);
     let d = convert(&data, false).unwrap();
@@ -510,6 +648,9 @@ fn docx_nested_table_vertical_merge_notes_and_header() {
     assert_eq!(m.matches("<table>").count(), 2);
     assert!(m.contains("rowspan=\"2\""));
     assert!(m.find("머리글").unwrap() < m.find("안쪽").unwrap());
+    let html = render(&d, "html", "hybrid", &Properties::new()).unwrap();
+    assert_eq!(html.matches("class=\"source-borders\"").count(), 1);
+    assert!(html.contains("rowspan=\"2\" style=\"background-color:#FFEECC;border-bottom:none;border-right:3pt double #FF0011;border-top:1.5pt dashed #112233;text-align:center;width:60pt;\""));
 }
 #[test]
 fn odf_math_preserves_fraction_without_active_markup() {
@@ -571,7 +712,7 @@ fn xlsx_cached_formula_dates_sparse_cells_and_merge() {
         ),
         (
             "xl/styles.xml",
-            "<styles><cellXfs><xf numFmtId='14'/></cellXfs></styles>",
+            "<styles><borders><border><right style='mediumDashed'><color rgb='FF123456'/></right></border></borders><fills><fill><patternFill patternType='solid'><fgColor rgb='FFF0E0D0'/></patternFill></fill></fills><fonts><font><b/><sz val='14'/><color rgb='FF001122'/></font></fonts><cellXfs><xf numFmtId='14' borderId='0' fillId='0' fontId='0'><alignment horizontal='right' vertical='center'/></xf></cellXfs></styles>",
         ),
         (
             "xl/sheet.xml",
@@ -591,4 +732,7 @@ fn xlsx_cached_formula_dates_sparse_cells_and_merge() {
     };
     assert_eq!(rows[0][0].properties["formula"], "SUM(1,2)");
     assert_eq!(rows[0][0].properties["cached_value"], "3");
+    let html = render(&d, "html", "hybrid", &Properties::new()).unwrap();
+    assert!(html.contains("background-color:#F0E0D0;border-right:2px dashed #123456;text-align:right;vertical-align:middle;"));
+    assert!(html.contains("font-size:14pt;color:#001122;\"><strong>1900-03-01</strong>"));
 }

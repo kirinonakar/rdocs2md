@@ -1,4 +1,4 @@
-use crate::model::*;
+use crate::{formatting, model::*};
 use std::fmt::Write;
 pub fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -145,11 +145,7 @@ fn runs(items: &[Run], html: bool, links: &Properties) -> String {
             {
                 let _ = write!(css, "font-size:{size};");
             }
-            if let Some(color) = &r.style.color
-                && color.len() == 7
-                && color.starts_with('#')
-                && color[1..].bytes().all(|c| c.is_ascii_hexdigit())
-            {
+            if let Some(color) = r.style.color.as_deref().and_then(formatting::color) {
                 let _ = write!(css, "color:{color};");
             }
             if !css.is_empty() {
@@ -160,8 +156,89 @@ fn runs(items: &[Run], html: bool, links: &Properties) -> String {
     }
     out
 }
-fn html_table(out: &mut String, rows: &[Vec<Cell>], links: &Properties) -> Result<()> {
-    out.push_str("<table>\n");
+fn cell_attributes(out: &mut String, props: &Properties) -> Result<()> {
+    let mut css = Properties::new();
+    for (key, value) in props {
+        if key != "border" {
+            formatting::box_property(&mut css, key, value);
+        }
+    }
+    if !css.is_empty() {
+        out.push_str(" style=\"");
+        for (key, value) in css {
+            write!(out, "{key}:{value};")?;
+        }
+        out.push('"');
+    }
+    Ok(())
+}
+
+fn paragraph_css(props: &Properties, preserve_space: bool, left: Option<f32>) -> Result<String> {
+    let mut css = String::new();
+    if preserve_space {
+        css.push_str("white-space:pre-wrap;");
+    }
+    if let Some(left) = left {
+        let indent = props
+            .get("left_indent_twips")
+            .and_then(|v| v.parse::<f32>().ok())
+            .map(|v| v / 20.)
+            .or_else(|| props.get("x_pt")?.parse::<f32>().ok().map(|v| v - left));
+        if let Some(x) = indent.filter(|x| x.is_finite() && x.abs() < 10000.) {
+            write!(css, "margin-left:{x}pt;")?;
+        }
+    }
+    for key in [
+        "margin-left",
+        "margin-right",
+        "margin-top",
+        "margin-bottom",
+        "text-indent",
+        "line-height",
+    ] {
+        if let Some(value) = props
+            .get(key)
+            .and_then(|v| formatting::length(v, key != "line-height"))
+        {
+            write!(css, "{key}:{value};")?;
+        }
+    }
+    if let Some(align) = props.get("align").and_then(|v| formatting::alignment(v)) {
+        write!(css, "text-align:{align};")?;
+    }
+    if let Some(writing_mode) = props.get("writing-mode")
+        && matches!(writing_mode.as_str(), "vertical-rl" | "vertical-lr")
+    {
+        write!(css, "writing-mode:{writing_mode};")?;
+    }
+    Ok(css)
+}
+
+fn direction(props: &Properties) -> &'static str {
+    if props.get("dir").is_some_and(|v| v == "rtl") {
+        " dir=\"rtl\""
+    } else {
+        ""
+    }
+}
+
+fn html_table(
+    out: &mut String,
+    rows: &[Vec<Cell>],
+    links: &Properties,
+    styled: bool,
+) -> Result<()> {
+    let source_borders = styled
+        && rows.iter().flatten().any(|c| {
+            formatting::BORDERS
+                .iter()
+                .any(|key| c.properties.contains_key(*key))
+        });
+    out.push_str(if source_borders {
+        "<table class=\"source-borders\">\n"
+    } else {
+        "<table>\n"
+    });
     for row in rows {
         out.push_str("<tr>");
         for c in row {
@@ -172,14 +249,36 @@ fn html_table(out: &mut String, rows: &[Vec<Cell>], links: &Properties) -> Resul
             if let Some(n) = c.rowspan {
                 write!(out, " rowspan=\"{n}\"")?
             }
+            if styled {
+                cell_attributes(out, &c.properties)?;
+            }
             out.push('>');
             out.push_str(&runs(&c.runs, true, links));
             for b in &c.blocks {
                 match b {
+                    Block::Paragraph {
+                        heading,
+                        runs: items,
+                        properties,
+                        ..
+                    } if styled => {
+                        let elem = if *heading == 0 {
+                            "p".into()
+                        } else {
+                            format!("h{}", (*heading).min(6))
+                        };
+                        let css = paragraph_css(properties, false, None)?;
+                        writeln!(
+                            out,
+                            "<{elem}{} style=\"{css}\">{}</{elem}>",
+                            direction(properties),
+                            runs(items, true, links)
+                        )?;
+                    }
                     Block::Paragraph { runs: items, .. } => {
                         writeln!(out, "<p>{}</p>", runs(items, true, links))?
                     }
-                    Block::Table { rows } => html_table(out, rows, links)?,
+                    Block::Table { rows } => html_table(out, rows, links, styled)?,
                 }
             }
             out.push_str("</td>");
@@ -202,7 +301,16 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
     }
     let mut out = String::new();
     if html {
-        out.push_str("<!doctype html>\n<meta charset=\"utf-8\">\n<article>\n")
+        out.push_str(concat!(
+            "<!doctype html>\n<meta charset=\"utf-8\">\n<style>\n",
+            "article { overflow-wrap: break-word; print-color-adjust: exact; -webkit-print-color-adjust: exact; }\n",
+            "article table { border-collapse: collapse; max-width: 100%; margin-block: 0.5em; }\n",
+            "article td, article th { border: 1px solid #a0a0a0; padding: 0.25em 0.45em; vertical-align: top; white-space: pre-wrap; }\n",
+            "article .source-borders > tbody > tr > :is(td, th) { border: none; }\n",
+            "article td > :first-child { margin-top: 0; }\n",
+            "article td > :last-child { margin-bottom: 0; }\n",
+            "article img { max-width: 100%; }\n</style>\n<article>\n",
+        ));
     }
     for (i, s) in doc.sections.iter().enumerate() {
         if i > 0 && !out.is_empty() {
@@ -298,43 +406,16 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                         } else {
                             "p".into()
                         };
-                        let mut attrs = String::new();
-                        if mode == "layout" {
-                            attrs.push_str("white-space:pre-wrap;");
-                            let indent = properties
-                                .get("left_indent_twips")
-                                .and_then(|v| v.parse::<f32>().ok())
-                                .map(|v| v / 20.)
-                                .or_else(|| {
-                                    properties
-                                        .get("x_pt")?
-                                        .parse::<f32>()
-                                        .ok()
-                                        .map(|v| v - left)
-                                });
-                            if let Some(x) = indent.filter(|x| x.is_finite() && x.abs() < 10000.) {
-                                write!(attrs, "margin-left:{x}pt;")?
-                            }
-                        }
-                        if let Some(a) = properties.get("align")
-                            && matches!(a.as_str(), "left" | "right" | "center" | "justify")
-                        {
-                            write!(attrs, "text-align:{a};")?
-                        }
-                        if let Some(w) = properties.get("writing-mode")
-                            && matches!(w.as_str(), "vertical-rl" | "vertical-lr")
-                        {
-                            write!(attrs, "writing-mode:{w};")?
-                        }
-                        let dir = if properties.get("dir").is_some_and(|v| v == "rtl") {
-                            " dir=\"rtl\""
-                        } else {
-                            ""
-                        };
+                        let attrs = paragraph_css(
+                            properties,
+                            mode == "layout" || html,
+                            (mode == "layout").then_some(left),
+                        )?;
+                        let dir = direction(properties);
                         if let Some(l) = list {
                             let t = if l.ordered { "ol" } else { "ul" };
                             if html {
-                                writeln!(out, "<li>{val}</li>")?
+                                writeln!(out, "<li{dir} style=\"{attrs}\">{val}</li>")?
                             } else {
                                 writeln!(out, "<{t}><li>{val}</li></{t}>")?
                             }
@@ -373,7 +454,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                         || merged
                         || rows.len().saturating_mul(width) > CELL_LIMIT
                     {
-                        html_table(&mut out, rows, links)?;
+                        html_table(&mut out, rows, links, html)?;
                         // A blank line ends the Markdown HTML block, so only
                         // add one after the outermost table.
                         out.push('\n');

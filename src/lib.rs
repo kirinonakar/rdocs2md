@@ -1,5 +1,6 @@
 mod epub;
 mod flow;
+mod formatting;
 mod legacy;
 mod math;
 pub mod mcp;

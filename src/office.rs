@@ -1,5 +1,6 @@
 use crate::{
     flow::{Flow, Rules, style_props},
+    formatting,
     model::*,
     package::*,
 };
@@ -52,20 +53,7 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
         if let Some(id) = attr(n, if odf { "name" } else { "styleId" }) {
             let parent = attr(n, "parent-style-name")
                 .or_else(|| child(n, "basedOn").and_then(|c| attr(c, "val")));
-            let props = child(n, if odf { "text-properties" } else { "rPr" });
-            raw.insert(id, (parent, props));
-            if let Some(p) = child(n, "paragraph-properties") {
-                let mut props = Properties::new();
-                for a in p.attributes() {
-                    let k = match a.name() {
-                        "break-before" | "margin-left" | "text-indent" => a.name(),
-                        "text-align" => "align",
-                        _ => continue,
-                    };
-                    props.insert(k.into(), a.value().into());
-                }
-                rules.paragraph_styles.insert(id.into(), props);
-            }
+            raw.insert(id, (parent, n));
             if let Some(h) = desc(n, "outlineLvl")
                 .next()
                 .and_then(|c| attr(c, "val"))
@@ -80,6 +68,10 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
         let mut chain = Vec::new();
         let mut key = Some(*id);
         let mut st = Style::default();
+        let mut paragraph = Properties::new();
+        let mut cell = Properties::new();
+        let mut table_borders = Properties::new();
+        let mut table_cells = Properties::new();
         while let Some(k) = key {
             if chain.len() >= 64 {
                 return Err("cyclic or excessive style inheritance".into());
@@ -91,13 +83,71 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
                 if let Some(parent) = rules.styles.get(k) {
                     st = parent.clone()
                 }
+                paragraph = rules.paragraph_styles.get(k).cloned().unwrap_or_default();
+                cell = rules.cell_styles.get(k).cloned().unwrap_or_default();
+                table_borders = rules.table_borders.get(k).cloned().unwrap_or_default();
+                table_cells = rules.table_cells.get(k).cloned().unwrap_or_default();
                 break;
             }
         }
-        for props in chain.into_iter().rev().flatten() {
-            style_props(props, &mut st)
+        for node in chain.into_iter().rev() {
+            if let Some(props) = child(node, if odf { "text-properties" } else { "rPr" }) {
+                style_props(props, &mut st);
+            }
+            if odf {
+                if let Some(p) = child(node, "paragraph-properties") {
+                    for a in p.attributes() {
+                        let k = match a.name() {
+                            "break-before" | "margin-left" | "margin-right" | "margin-top"
+                            | "margin-bottom" | "text-indent" | "line-height" => a.name(),
+                            "text-align" => "align",
+                            _ => continue,
+                        };
+                        paragraph.insert(k.into(), a.value().into());
+                    }
+                }
+                if let Some(p) = child(node, "table-cell-properties") {
+                    for a in p.attributes() {
+                        if a.name() == "padding" {
+                            for key in [
+                                "padding-left",
+                                "padding-right",
+                                "padding-top",
+                                "padding-bottom",
+                            ] {
+                                formatting::box_property(&mut cell, key, a.value());
+                            }
+                        } else {
+                            formatting::box_property(&mut cell, a.name(), a.value());
+                        }
+                    }
+                }
+            } else {
+                if let Some(p) = child(node, "pPr") {
+                    formatting::word_paragraph(&mut paragraph, p);
+                }
+                if let Some(p) = child(node, "tblPr") {
+                    if let Some(edges) = child(p, "tblBorders") {
+                        table_borders.extend(formatting::word_borders(edges));
+                    }
+                    formatting::word_cell(&mut table_cells, p);
+                }
+                if let Some(p) = child(node, "tcPr") {
+                    formatting::word_cell(&mut table_cells, p);
+                }
+            }
         }
         rules.styles.insert(id.to_string(), st);
+        for (map, props) in [
+            (&mut rules.paragraph_styles, paragraph),
+            (&mut rules.cell_styles, cell),
+            (&mut rules.table_borders, table_borders),
+            (&mut rules.table_cells, table_cells),
+        ] {
+            if !props.is_empty() {
+                map.insert(id.to_string(), props);
+            }
+        }
     }
     for n in desc(x.root(), "list-style") {
         if let Some(id) = attr(n, "name") {
@@ -505,10 +555,37 @@ pub fn hwpx(pkg: &mut Package) -> Result<Document> {
     if pkg.has("Contents/header.xml") {
         let s = pkg.text("Contents/header.xml")?;
         let x = xml(&s)?;
+        let fonts: HashMap<_, _> = desc(x.root(), "fontface")
+            .filter(|n| attr(*n, "lang") == Some("HANGUL"))
+            .flat_map(|n| n.children().filter(|c| tag(*c) == "font"))
+            .filter_map(|n| Some((attr(n, "id")?, attr(n, "face")?)))
+            .collect();
+        for n in desc(x.root(), "borderFill") {
+            if let Some(id) = attr(n, "id") {
+                rules
+                    .hwpx_borders
+                    .insert(id.into(), formatting::hwpx_border_fill(n));
+            }
+        }
+        for n in desc(x.root(), "paraPr") {
+            if let Some(id) = attr(n, "id") {
+                let mut props = Properties::new();
+                if let Some(align) = child(n, "align").and_then(|n| attr(n, "horizontal")) {
+                    props.insert("align".into(), align.into());
+                }
+                rules.paragraph_styles.insert(id.into(), props);
+            }
+        }
         for n in desc(x.root(), "charPr") {
             if let Some(id) = attr(n, "id") {
                 let mut style = Style::default();
                 style_props(n, &mut style);
+                if let Some(font) = child(n, "fontRef")
+                    .and_then(|font| attr(font, "hangul"))
+                    .and_then(|id| fonts.get(id))
+                {
+                    style.font = Some((*font).into());
+                }
                 style.size = attr(n, "height")
                     .and_then(|v| v.parse::<f32>().ok())
                     .map(|n| format!("{}pt", n / 100.));
