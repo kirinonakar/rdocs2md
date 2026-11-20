@@ -69,6 +69,12 @@ Both conversion tools accept the optional `format` argument (`md`, `html`, or `j
 
 The server handles line-delimited JSON-RPC 2.0, `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`. The negotiable versions are 2024-11-05, 2025-03-26, 2025-06-18, and 2025-11-25. The inline result text limit for MCP tools is 512 KiB. Large conversion results can be saved with `output_path` or retrieved in pieces with `range`. [MCP lifecycle specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 
+## Agent skill
+
+[`skills/rdocs2md/SKILL.md`](skills/rdocs2md/SKILL.md) is an agent skill that teaches a coding agent how to drive the CLI: supported formats, options, mode selection, range units, image extraction, and exit codes. It assumes `rdocs2md` is on `PATH`.
+
+Copy the `skills/rdocs2md` folder into your agent's skill directory and restart the agent. The skill stays CLI-only and does not duplicate the MCP tool schemas; connect the MCP server as described above when structured tool calls are preferred.
+
 ## Per-format implementation status
 
 All 14 formats implement body text extraction and conversion. The supported range of formatting and layout is as follows.
