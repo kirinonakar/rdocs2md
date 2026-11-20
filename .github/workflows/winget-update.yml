@@ -1,0 +1,107 @@
+name: Update WinGet
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      submit_initial:
+        description: Submit the initial 1.0.0 manifest
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  winget:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install .NET 6 runtime
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 6.0.x
+
+      - name: Download WingetCreate
+        shell: pwsh
+        run: |
+          $wingetCreatePath = Join-Path $env:RUNNER_TEMP 'wingetcreate.exe'
+          Invoke-WebRequest 'https://aka.ms/wingetcreate/latest' -OutFile $wingetCreatePath
+
+      - name: Submit initial package manifest
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.submit_initial == 'true'
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
+            throw 'Add the WINGET_CREATE_GITHUB_TOKEN repository secret before submitting the initial WinGet manifest.'
+          }
+
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'winget/manifests/k/kirinonakar/rdocs2md/1.0.0'
+          & (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe') submit `
+            --no-open `
+            --prtitle 'New package: kirinonakar.rdocs2md version 1.0.0' `
+            $manifestPath
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Read release version and asset URL
+        if: github.event_name == 'release'
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REPOSITORY: ${{ github.repository }}
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$') {
+            throw "Expected a version tag in vX.Y.Z form, received '$env:RELEASE_TAG'."
+          }
+
+          $version = $Matches.version
+          $assetName = "rdocs2md-$($env:RELEASE_TAG).zip"
+          $releaseJson = gh release view $env:RELEASE_TAG --repo $env:REPOSITORY --json assets
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read assets for release '$env:RELEASE_TAG'."
+          }
+
+          $release = $releaseJson | ConvertFrom-Json
+          $asset = @($release.assets | Where-Object { $_.name -ceq $assetName })
+          if ($asset.Count -ne 1) {
+            throw "Expected exactly one release asset named '$assetName'."
+          }
+
+          $escapedTag = [uri]::EscapeDataString($env:RELEASE_TAG)
+          $escapedAsset = [uri]::EscapeDataString($assetName)
+          $installerUrl = "https://github.com/$($env:REPOSITORY)/releases/download/$escapedTag/$escapedAsset"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "installer_url=$installerUrl" >> $env:GITHUB_OUTPUT
+
+      - name: Submit WinGet update
+        if: github.event_name == 'release'
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+          PACKAGE_VERSION: ${{ steps.release.outputs.version }}
+          INSTALLER_URL: ${{ steps.release.outputs.installer_url }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
+            throw 'Add the WINGET_CREATE_GITHUB_TOKEN repository secret before publishing a release.'
+          }
+
+          $installerUrlWithArchitecture = "$($env:INSTALLER_URL)|x64"
+          & (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe') update 'kirinonakar.rdocs2md' `
+            --version $env:PACKAGE_VERSION `
+            --urls $installerUrlWithArchitecture `
+            --submit `
+            --no-open
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
