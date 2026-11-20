@@ -1,4 +1,5 @@
-use rdocs2md::{convert, model::*, render::render};
+use rdocs2md::{convert, convert_range, model::*, render::render, search::Query};
+use serde_json::{json, to_value};
 use std::io::{Cursor, Write};
 fn package(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -185,6 +186,10 @@ fn pdf_columns_coordinates_and_page_range() {
 }
 
 fn positioned_pdf(content: String) -> Vec<u8> {
+    pdf_with_pages(&[&content])
+}
+
+fn pdf_with_pages(contents: &[&str]) -> Vec<u8> {
     use lopdf::{Document as Pdf, Stream, dictionary};
 
     let mut pdf = Pdf::with_version("1.4");
@@ -192,21 +197,137 @@ fn positioned_pdf(content: String) -> Vec<u8> {
     let font =
         pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
     let resources = dictionary! {"Font"=>dictionary! {"F"=>font}};
-    let stream = pdf.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-    let page = pdf.add_object(dictionary! {
-        "Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources,
-        "MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]
-    });
+    let pages: Vec<_> = contents
+        .iter()
+        .map(|content| {
+            let stream = pdf.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+            pdf.add_object(dictionary! {
+                "Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources.clone()
+            })
+            .into()
+        })
+        .collect();
     pdf.objects.insert(
         tree,
-        dictionary! {"Type"=>"Pages","Kids"=>vec![lopdf::Object::Reference(page)],"Count"=>1}
-            .into(),
+        dictionary! {"Type"=>"Pages","Kids"=>pages,"Count"=>contents.len() as i64,
+        "MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]}
+        .into(),
     );
     let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree});
     pdf.trailer.set("Root", catalog);
     let mut bytes = Vec::new();
     pdf.save_to(&mut bytes).unwrap();
     bytes
+}
+
+#[test]
+fn pdf_range_skips_bad_page_and_marks_visibility() {
+    let bytes = pdf_with_pages(&[
+        "1 0 cm",
+        "BT /F 10 Tf 1 0 0 1 30 180 Tm (Normal) Tj ET\n\
+         q 1 g BT /F 2 Tf 1 0 0 1 30 130 Tm (White tiny) Tj ET Q\n\
+         BT /F 10 Tf 3 Tr 1 0 0 1 30 80 Tm (Invisible) Tj ET\n\
+         BT /F 10 Tf 0 Tr 1 0 0 1 400 40 Tm (Outside) Tj ET",
+        "q BI /W 1 /H 1 /BPC 8 /CS /G ID X EI Q",
+    ]);
+    assert!(convert(&bytes, false).is_err());
+    let d = convert_range(&bytes, false, Some("3,2,2")).unwrap();
+    assert_eq!(d.sections.len(), 2);
+    assert_eq!(
+        d.sections[1].properties["text_extraction"],
+        "ocr_needed_for_image_text"
+    );
+    assert!(
+        d.warnings
+            .iter()
+            .any(|w| w.contains("Text visible in the images requires OCR"))
+    );
+    let runs = d.sections[0]
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Paragraph { runs, .. } => Some(runs.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    for (text, flags) in [
+        ("Normal", &[][..]),
+        (
+            "White tiny",
+            &[VisibilityFlag::WhiteText, VisibilityFlag::TinyText],
+        ),
+        ("Invisible", &[VisibilityFlag::HiddenText]),
+        ("Outside", &[VisibilityFlag::OffPage]),
+    ] {
+        assert_eq!(
+            runs.iter()
+                .find(|r| r.text == text)
+                .unwrap()
+                .visibility_flags,
+            flags,
+            "{text}"
+        );
+    }
+    let result = to_value(Query::new("outside", false, 1).unwrap().find(&d)).unwrap();
+    assert_eq!(result["matches"][0]["section_index"], 2);
+    assert_eq!(result["matches"][0]["x_pt"], 400.);
+    assert!(convert_range(&bytes, false, Some("4")).is_err());
+}
+
+#[test]
+fn ods_visibility_and_range_skip_expansion_in_other_sheet() {
+    let bytes = package(&[
+        ("mimetype", "application/vnd.oasis.opendocument.spreadsheet"),
+        (
+            "content.xml",
+            "<r><automatic-styles><style name='hidden'><table-properties display='false'/></style></automatic-styles><body><spreadsheet>\
+            <table><table-row number-rows-repeated='900000'><table-cell/></table-row></table>\
+            <table name='Hidden' style-name='hidden'><table-column/><table-column-group display='false'><table-column number-columns-repeated='2'/></table-column-group>\
+            <table-row visibility='filter'><table-cell number-columns-repeated='3'><p>Token</p></table-cell></table-row></table>\
+            </spreadsheet></body></r>",
+        ),
+    ]);
+    assert!(convert(&bytes, false).is_err());
+    let d = convert_range(&bytes, false, Some("2")).unwrap();
+    let s = &d.sections[0];
+    assert_eq!(s.properties["hidden"], "true");
+    assert_eq!(s.properties["hidden_columns"], "2-3");
+    assert_eq!(s.properties["hidden_rows"], "1");
+    let Block::Table { rows } = &s.blocks[0] else {
+        panic!()
+    };
+    assert!(!rows[0][0].properties.contains_key("hidden_column"));
+    assert_eq!(rows[0][1].properties["hidden_column"], "true");
+    assert_eq!(rows[0][2].properties["hidden_row"], "true");
+    assert_eq!(d.warnings.len(), 3);
+    let result = to_value(Query::new("TOKEN", false, 4).unwrap().find(&d)).unwrap();
+    assert_eq!(result["matches"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        result["matches"][2]["path"],
+        json!([{"block":1},{"row":1,"column":3}])
+    );
+}
+
+#[test]
+fn rtf_range_skips_later_pages_and_keeps_inherited_state() {
+    let bytes = br"{\rtf1\fs4\v before\page middle\page broken {";
+    assert!(convert(bytes, false).is_err());
+    let d = convert_range(bytes, false, Some("2")).unwrap();
+    assert_eq!(md(&d).trim(), "middle");
+    let ir = to_value(d).unwrap();
+    assert_eq!(
+        ir["sections"][0]["blocks"][0]["runs"][0]["visibility_flags"],
+        json!(["tiny_text", "hidden_text"])
+    );
+}
+
+#[test]
+fn a_panicking_document_does_not_stop_subsequent_work() {
+    let first = rdocs2md::recover_document::<()>(|| panic!("simulated parser panic"));
+    assert!(first.unwrap_err().to_string().contains("panicked"));
+    let next = rdocs2md::recover_document(|| convert(br"{\rtf1 next}", false)).unwrap();
+    assert_eq!(md(&next).trim(), "next");
 }
 
 fn cell_text(row: &[Cell]) -> Vec<String> {
@@ -707,7 +828,7 @@ fn xlsx_cached_formula_dates_sparse_cells_and_merge() {
         ),
         (
             "xl/book.xml",
-            "<workbook><sheets><sheet id='s' name='월별'/></sheets></workbook>",
+            "<workbook><sheets><sheet id='s' name='월별' state='veryHidden'/></sheets></workbook>",
         ),
         (
             "xl/_rels/book.xml.rels",
@@ -719,10 +840,13 @@ fn xlsx_cached_formula_dates_sparse_cells_and_merge() {
         ),
         (
             "xl/sheet.xml",
-            "<worksheet><sheetData><row r='1'><c r='A1' t='inlineStr'><is><t>날짜</t></is></c><c r='C1' s='0'><v>61</v></c></row><row r='3'><c r='A3'><f>SUM(1,2)</f><v>3</v></c></row></sheetData><mergeCells><mergeCell ref='A1:B1'/></mergeCells></worksheet>",
+            "<worksheet><cols><col min='3' max='3' hidden='true'/></cols><sheetData><row r='1'><c r='A1' t='inlineStr'><is><t>날짜</t></is></c><c r='C1' s='0'><v>61</v></c></row><row r='3' hidden='1'><c r='A3'><f>SUM(1,2)</f><v>3</v></c></row></sheetData><mergeCells><mergeCell ref='A1:B1'/></mergeCells></worksheet>",
         ),
     ]);
     let d = convert(&data, false).unwrap();
+    assert_eq!(d.sections[0].properties["hidden"], "true");
+    assert_eq!(d.sections[0].properties["hidden_columns"], "3");
+    assert_eq!(d.sections[0].properties["hidden_rows"], "3");
     assert_eq!(d.sections[0].blocks.len(), 2);
     let Block::Table { rows } = &d.sections[0].blocks[0] else {
         panic!()
@@ -730,11 +854,15 @@ fn xlsx_cached_formula_dates_sparse_cells_and_merge() {
     assert_eq!(rows[0].len(), 2);
     assert_eq!(rows[0][0].colspan, Some(2));
     assert_eq!(rows[0][1].runs[0].text, "1900-03-01");
+    assert_eq!(rows[0][1].properties["hidden_column"], "true");
+    let hits = to_value(Query::new("1900-03-01", false, 1).unwrap().find(&d)).unwrap();
+    assert_eq!(hits["matches"][0]["address"], "C1");
     let Block::Table { rows } = &d.sections[0].blocks[1] else {
         panic!()
     };
     assert_eq!(rows[0][0].properties["formula"], "SUM(1,2)");
     assert_eq!(rows[0][0].properties["cached_value"], "3");
+    assert_eq!(rows[0][0].properties["hidden_row"], "true");
     let html = render(&d, "html", "hybrid", &Properties::new()).unwrap();
     assert!(html.contains("background-color:#F0E0D0;border-right:2px dashed #123456;text-align:right;vertical-align:middle;"));
     assert!(html.contains("font-size:14pt;color:#001122;\"><strong>1900-03-01</strong>"));

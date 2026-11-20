@@ -101,6 +101,91 @@ fn extract_raster_and_reuse_existing_result() {
 }
 
 #[test]
+fn recursive_batch_with_destinations_and_stdout() {
+    let work = Scratch::new();
+    fs::create_dir_all(work.path("docs/sub")).unwrap();
+    let picture = br"{\rtf1 report {\pict 47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b}}";
+    fs::write(work.path("docs/same.rtf"), picture).unwrap();
+    fs::write(work.path("docs/sub/same.rtf"), picture).unwrap();
+    fs::write(work.path("docs/sub/notes.txt"), "not a document").unwrap();
+    let result = work.run(&[
+        "docs",
+        "--recursive",
+        "-o",
+        "converted",
+        "--json",
+        "ir",
+        "--image-dir",
+        "images",
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for name in ["same", "same-2"] {
+        let markdown = fs::read_to_string(work.path(&format!("converted/{name}.md"))).unwrap();
+        assert!(markdown.contains(&format!("../images/{name}/image-1.gif")));
+        assert!(work.path(&format!("ir/{name}.json")).is_file());
+    }
+    fs::write(work.path("docs/sub/bad.rtf"), "corrupt").unwrap();
+    let result = work.run(&["docs/**/*.rtf", "--stdout", "--json", "stdout-ir"]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("bad.rtf"));
+    let lines: Vec<Value> = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines
+            .iter()
+            .all(|line| line["content"].as_str().unwrap().contains("report"))
+    );
+    assert_eq!(fs::read_dir(work.path("stdout-ir")).unwrap().count(), 2);
+
+    let one = work.run(&["docs/s?me.[r]tf", "-o", "one-match"]);
+    assert!(
+        one.status.success(),
+        "{}",
+        String::from_utf8_lossy(&one.stderr)
+    );
+    assert!(work.path("one-match/same.md").is_file());
+}
+
+#[test]
+fn cli_search_reports_original_page_and_context() {
+    let work = Scratch::new();
+    fs::write(
+        work.path("sample.rtf"),
+        br"{\rtf1 skipped\page Before {\b Tar}get after\page Target again}",
+    )
+    .unwrap();
+    let result = work.run(&[
+        "sample.rtf",
+        "--search",
+        "target",
+        "--pages",
+        "2-3",
+        "--limit",
+        "1",
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(response["truncated"], true);
+    assert_eq!(response["matches"][0]["text"], "Target");
+    assert_eq!(response["matches"][0]["before"], "Before ");
+    assert_eq!(response["matches"][0]["after"], " after");
+    assert_eq!(response["matches"][0]["section_index"], 2);
+    assert_eq!(response["matches"][0]["path"], json!([{"block":1}]));
+}
+
+#[test]
 fn mcp_advertises_and_renders_output_formats() {
     let work = Scratch::new();
     fs::write(
@@ -108,6 +193,9 @@ fn mcp_advertises_and_renders_output_formats() {
         br"{\rtf1\ansi First page\page Second page}",
     )
     .unwrap();
+    fs::create_dir_all(work.path("docs/sub")).unwrap();
+    fs::copy(work.path("sample.rtf"), work.path("docs/sub/copy.rtf")).unwrap();
+    fs::write(work.path("docs/broken.rtf"), "corrupt").unwrap();
     let mut server = Command::new(env!("CARGO_BIN_EXE_rdocs2md"))
         .current_dir(&work.0)
         .arg("mcp")
@@ -150,6 +238,27 @@ fn mcp_advertises_and_renders_output_formats() {
             8,
             json!({"path":"sample.rtf","format":"html","output_path":"sample.html"}),
         ),
+        request(
+            9,
+            "tools/call",
+            json!({"name":"search_document","arguments":{
+                "path":"sample.rtf","query":"SECOND","range":"2","limit":1
+            }}),
+        ),
+        request(
+            10,
+            "tools/call",
+            json!({"name":"search_document","arguments":{
+                "path":"sample.rtf","query":"text","limit":0
+            }}),
+        ),
+        request(
+            11,
+            "tools/call",
+            json!({"name":"convert_documents","arguments":{
+                "paths":["docs/*.rtf","sample.rtf","../*.rtf"],"recursive":true,"output_dir":"batch","format":"json"
+            }}),
+        ),
     ] {
         writeln!(stdin, "{message}").unwrap();
     }
@@ -162,14 +271,14 @@ fn mcp_advertises_and_renders_output_formats() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 8);
+    assert_eq!(replies.len(), 11);
     let result = |id: usize| &replies[id - 1]["result"];
     let content = |id| result(id)["content"][0]["text"].as_str().unwrap();
     for tool in result(2)["tools"].as_array().unwrap() {
         let schema = &tool["inputSchema"];
         let format = &schema["properties"]["format"];
         match tool["name"].as_str().unwrap() {
-            "convert_document" | "extract_document_range" => {
+            "convert_document" | "extract_document_range" | "convert_documents" => {
                 assert_eq!(format["enum"], json!(["md", "html", "json"]));
                 assert_eq!(format["default"], "md");
                 assert!(
@@ -198,4 +307,17 @@ fn mcp_advertises_and_renders_output_formats() {
     assert!(content(7).contains("new .json file"));
     assert!(!work.path("wrong.md").exists());
     assert_eq!(result(8)["isError"], true);
+    assert_eq!(result(9)["isError"], false);
+    let search: Value = serde_json::from_str(content(9)).unwrap();
+    assert_eq!(search["matches"][0]["section_index"], 2);
+    assert_eq!(search["matches"][0]["text"], "Second");
+    assert_eq!(replies[9]["error"]["code"], -32602);
+    assert_eq!(result(11)["isError"], false);
+    let batch: Value = serde_json::from_str(content(11)).unwrap();
+    assert_eq!(batch["succeeded"], 2, "{batch}");
+    assert_eq!(batch["failed"], 2, "{batch}");
+    assert!(content(11).contains("outside the MCP root"));
+    assert!(work.path("batch/copy.json").is_file());
+    assert!(work.path("batch/sample.json").is_file());
+    assert!(!work.path("batch/broken.json").exists());
 }

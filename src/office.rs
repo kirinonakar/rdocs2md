@@ -3,6 +3,8 @@ use crate::{
     formatting,
     model::*,
     package::*,
+    sheets::record_hidden_axis,
+    visibility::flag_text,
 };
 use std::collections::{HashMap, HashSet};
 pub fn relationships(
@@ -48,8 +50,12 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
     }
     let s = pkg.text(path)?;
     let x = xml(&s)?;
+    read_styles(x.root(), rules, odf)
+}
+
+fn read_styles(root: N, rules: &mut Rules, odf: bool) -> Result<()> {
     let mut raw = HashMap::new();
-    for n in desc(x.root(), "style") {
+    for n in desc(root, "style") {
         if let Some(id) = attr(n, if odf { "name" } else { "styleId" }) {
             let parent = attr(n, "parent-style-name")
                 .or_else(|| child(n, "basedOn").and_then(|c| attr(c, "val")));
@@ -72,6 +78,7 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
         let mut cell = Properties::new();
         let mut table_borders = Properties::new();
         let mut table_cells = Properties::new();
+        let mut table_display = None;
         while let Some(k) = key {
             if chain.len() >= 64 {
                 return Err("cyclic or excessive style inheritance".into());
@@ -87,6 +94,7 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
                 cell = rules.cell_styles.get(k).cloned().unwrap_or_default();
                 table_borders = rules.table_borders.get(k).cloned().unwrap_or_default();
                 table_cells = rules.table_cells.get(k).cloned().unwrap_or_default();
+                table_display = rules.table_display.get(k).cloned();
                 break;
             }
         }
@@ -95,6 +103,11 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
                 style_props(props, &mut st);
             }
             if odf {
+                if let Some(value) =
+                    child(node, "table-properties").and_then(|n| attr(n, "display"))
+                {
+                    table_display = Some(value.into());
+                }
                 if let Some(p) = child(node, "paragraph-properties") {
                     for a in p.attributes() {
                         let k = match a.name() {
@@ -138,6 +151,9 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
             }
         }
         rules.styles.insert(id.to_string(), st);
+        if let Some(display) = table_display {
+            rules.table_display.insert(id.to_string(), display);
+        }
         for (map, props) in [
             (&mut rules.paragraph_styles, paragraph),
             (&mut rules.cell_styles, cell),
@@ -149,7 +165,7 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
             }
         }
     }
-    for n in desc(x.root(), "list-style") {
+    for n in desc(root, "list-style") {
         if let Some(id) = attr(n, "name") {
             rules
                 .numbers
@@ -158,7 +174,12 @@ fn styles(pkg: &mut Package, path: &str, rules: &mut Rules, odf: bool) -> Result
     }
     Ok(())
 }
-pub fn ooxml(pkg: &mut Package, main: &str, kind: &str) -> Result<Document> {
+fn ooxml(
+    pkg: &mut Package,
+    main: &str,
+    kind: &str,
+    range: Option<&SectionRange>,
+) -> Result<Document> {
     let mut doc = Document::new(kind);
     metadata(pkg, &mut doc, "docProps/core.xml")?;
     let (rels, types) = relationships(pkg, main)?;
@@ -310,7 +331,12 @@ pub fn ooxml(pkg: &mut Package, main: &str, kind: &str) -> Result<Document> {
             if tag(root) != "presentation" {
                 return Err("invalid presentation main part".into());
             }
-            for slide in desc(root, "sldId") {
+            let slides: Vec<_> = desc(root, "sldId").collect();
+            let slide_size = child(root, "sldSz")
+                .and_then(|n| dimensions(n, "cx", "cy"))
+                .filter(|&(w, h)| w > 0. && h > 0.);
+            for i in section_indices(range, slides.len())? {
+                let slide = slides[i];
                 let id = slide
                     .attributes()
                     .find(|a| a.name() == "id" && a.namespace().is_some())
@@ -319,7 +345,7 @@ pub fn ooxml(pkg: &mut Package, main: &str, kind: &str) -> Result<Document> {
                 let p = rules.rels.get(id).ok_or("unknown slide relationship")?;
                 let s = pkg.text(p)?;
                 let x = xml(&s)?;
-                let mut sec = Section::new("slide", p);
+                let mut sec = Section::new("slide", p).indexed(i);
                 let (r, types) = relationships(pkg, p)?;
                 let slide_rules = Rules {
                     rels: r,
@@ -336,6 +362,11 @@ pub fn ooxml(pkg: &mut Package, main: &str, kind: &str) -> Result<Document> {
                 for shape in tree.children().filter(|c| c.is_element()) {
                     let from = sec.blocks.len();
                     flow.blocks(shape, &mut sec.blocks)?;
+                    if let Some(bounds) = slide_size
+                        && off_slide(shape, bounds)
+                    {
+                        flag_text(&mut sec.blocks[from..], VisibilityFlag::OffPage);
+                    }
                     if desc(shape, "ph")
                         .any(|p| matches!(attr(p, "type"), Some("title" | "ctrTitle")))
                         && let Some(Block::Paragraph { heading, .. }) = sec.blocks.get_mut(from)
@@ -361,12 +392,12 @@ pub fn ooxml(pkg: &mut Package, main: &str, kind: &str) -> Result<Document> {
                 doc.sections.push(sec);
             }
         }
-        "xlsx" => return crate::sheets::xlsx(pkg, doc, root, &rules.rels, &types),
+        "xlsx" => return crate::sheets::xlsx(pkg, doc, root, &rules.rels, &types, range),
         _ => return Err("unknown office format".into()),
     }
     Ok(doc)
 }
-pub fn odf(pkg: &mut Package, kind: &str) -> Result<Document> {
+fn odf(pkg: &mut Package, kind: &str, range: Option<&SectionRange>) -> Result<Document> {
     let mut doc = Document::new(kind);
     metadata(pkg, &mut doc, "meta.xml")?;
     if pkg.has("META-INF/manifest.xml") {
@@ -391,11 +422,25 @@ pub fn odf(pkg: &mut Package, kind: &str) -> Result<Document> {
     }
     let mut rules = Rules::default();
     styles(pkg, "styles.xml", &mut rules, true)?;
-    styles(pkg, "content.xml", &mut rules, true)?;
     let s = pkg.text("content.xml")?;
     let x = xml(&s)?;
+    read_styles(x.root(), &mut rules, true)?;
     let body = desc(x.root(), "body").next().ok_or("ODF body missing")?;
-    for object in desc(body, "object") {
+    let (typ, section_tag) = match kind {
+        "odt" => ("text", ""),
+        "ods" => ("spreadsheet", "table"),
+        _ => ("presentation", "page"),
+    };
+    let root = child(body, typ).ok_or("ODF body and MIME type disagree")?;
+    let sources: Vec<_> = root.children().filter(|n| tag(*n) == section_tag).collect();
+    let selected: Vec<_> = if kind == "odt" {
+        vec![(0, root)]
+    } else {
+        section_indices(range, sources.len())?
+            .map(|i| (i, sources[i]))
+            .collect()
+    };
+    for object in selected.iter().flat_map(|&(_, n)| desc(n, "object")) {
         if let Some(href) = attr(object, "href")
             && !rules.objects.contains_key(href)
             && let Ok(p) = resolve("content.xml", &format!("{href}/content.xml"))
@@ -413,21 +458,26 @@ pub fn odf(pkg: &mut Package, kind: &str) -> Result<Document> {
         base: "content.xml",
         rules: &rules,
     };
-    let typ = match kind {
-        "odt" => "text",
-        "ods" => "spreadsheet",
-        _ => "presentation",
-    };
-    let root = child(body, typ).ok_or("ODF body and MIME type disagree")?;
     match kind {
         "ods" => {
-            for n in root.children().filter(|n| tag(*n) == "table") {
-                let mut sec = Section::new("sheet", "content.xml");
+            for (i, n) in selected {
+                let mut sec = Section::new("sheet", "content.xml").indexed(i);
                 sec.title = attr(n, "name").unwrap_or("").into();
-                if let Some(v) = attr(n, "display") {
+                if let Some(v) = attr(n, "display").or_else(|| {
+                    attr(n, "style-name")
+                        .and_then(|id| rules.table_display.get(id))
+                        .map(String::as_str)
+                }) {
                     sec.properties.insert("display".into(), v.into());
+                    if matches!(v, "false" | "0") {
+                        sec.properties.insert("hidden".into(), "true".into());
+                    }
                 }
-                let Block::Table { rows } = f.table(n)? else {
+                let columns = ods_hidden_axis(n, "table-column", "number-columns-repeated")?;
+                let hidden_rows = ods_hidden_axis(n, "table-row", "number-rows-repeated")?;
+                record_hidden_axis(&mut sec, "hidden_columns", &columns);
+                record_hidden_axis(&mut sec, "hidden_rows", &hidden_rows);
+                let Block::Table { rows } = f.table_with_hidden_columns(n, &columns)? else {
                     unreachable!()
                 };
                 let mut area = Vec::new();
@@ -457,8 +507,8 @@ pub fn odf(pkg: &mut Package, kind: &str) -> Result<Document> {
             }
         }
         "odp" => {
-            for n in root.children().filter(|n| tag(*n) == "page") {
-                let mut sec = Section::new("slide", "content.xml");
+            for (i, n) in selected {
+                let mut sec = Section::new("slide", "content.xml").indexed(i);
                 sec.title = attr(n, "name").unwrap_or("").into();
                 let mut shapes: Vec<_> = n.children().filter(|n| n.is_element()).collect();
                 shapes.sort_by_key(|n| {
@@ -498,6 +548,53 @@ pub fn odf(pkg: &mut Package, kind: &str) -> Result<Document> {
     }
     Ok(doc)
 }
+
+fn dimensions(node: N, x: &str, y: &str) -> Option<(f64, f64)> {
+    let x = attr(node, x)?.parse::<i64>().ok()? as f64;
+    let y = attr(node, y)?.parse::<i64>().ok()? as f64;
+    Some((x, y))
+}
+
+fn off_slide(shape: N, (width, height): (f64, f64)) -> bool {
+    let transform = child(shape, "spPr")
+        .and_then(|p| child(p, "xfrm"))
+        .or_else(|| child(shape, "xfrm"));
+    let Some((x, y, w, h, angle)) = transform.and_then(|n| {
+        let (x, y) = dimensions(child(n, "off")?, "x", "y")?;
+        let (w, h) = dimensions(child(n, "ext")?, "cx", "cy")?;
+        let angle = attr(n, "rot")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        (w >= 0. && h >= 0.).then_some((x, y, w, h, angle))
+    }) else {
+        return false;
+    };
+    let (sin, cos) = (f64::from(angle) / 60000.).to_radians().sin_cos();
+    let (x, y) = (x + w / 2., y + h / 2.);
+    let (rx, ry) = (
+        (w * cos.abs() + h * sin.abs()) / 2.,
+        (w * sin.abs() + h * cos.abs()) / 2.,
+    );
+    x + rx < 0. || y + ry < 0. || x - rx > width || y - ry > height
+}
+
+fn ods_hidden_axis(sheet: N, tag_name: &str, repeat_attr: &str) -> Result<SectionRange> {
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for node in desc(sheet, tag_name)
+        .filter(|n| n.ancestors().skip(1).find(|a| tag(*a) == "table") == Some(sheet))
+    {
+        let count = attr(node, repeat_attr).unwrap_or("1").parse::<usize>()?;
+        let end = offset
+            .checked_add(count)
+            .ok_or("invalid sheet repeat count")?;
+        if count != 0 && crate::sheets::ods_axis_hidden(node, sheet) {
+            spans.push((offset + 1, end));
+        }
+        offset = end;
+    }
+    Ok(SectionRange::from_spans(spans))
+}
 fn length(v: Option<&str>) -> i64 {
     let s = v.unwrap_or("");
     let cut = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
@@ -510,7 +607,7 @@ fn length(v: Option<&str>) -> i64 {
     };
     (s[..cut].parse::<f64>().unwrap_or(0.) * scale) as i64
 }
-pub fn hwpx(pkg: &mut Package) -> Result<Document> {
+fn hwpx(pkg: &mut Package, range: Option<&SectionRange>) -> Result<Document> {
     let mut doc = Document::new("hwpx");
     let mut rules = Rules::default();
     let mut sections = Vec::new();
@@ -594,6 +691,8 @@ pub fn hwpx(pkg: &mut Package) -> Result<Document> {
         }
     }
     metadata(pkg, &mut doc, "Contents/content.hpf")?;
+    let mut pages = Vec::new();
+    let mut index = 0;
     for p in sections {
         let s = pkg.text(&p)?;
         let x = xml(&s)?;
@@ -604,11 +703,23 @@ pub fn hwpx(pkg: &mut Package) -> Result<Document> {
             rules: &rules,
         }
         .blocks(x.root(), &mut sec.blocks)?;
-        doc.sections.push(sec)
+        sec.append_explicit_pages(&mut pages);
+        for page in pages.drain(..) {
+            index += 1;
+            if range.is_none_or(|r| r.contains(index)) {
+                doc.sections.push(page.indexed(index - 1));
+            }
+            if range.is_some_and(|r| r.ends_at(index)) {
+                return Ok(doc);
+            }
+        }
+    }
+    if let Some(range) = range {
+        range.validate(index)?;
     }
     Ok(doc)
 }
-pub fn package(data: &[u8], images: bool) -> Result<Document> {
+pub fn package(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<Document> {
     let mut pkg = Package::new(data)?;
     let mime = if pkg.has("mimetype") {
         pkg.text("mimetype")?
@@ -616,11 +727,11 @@ pub fn package(data: &[u8], images: bool) -> Result<Document> {
         String::new()
     };
     let mut d = match mime.trim() {
-        "application/epub+zip" => crate::epub::parse(&mut pkg)?,
-        "application/vnd.oasis.opendocument.text" => odf(&mut pkg, "odt")?,
-        "application/vnd.oasis.opendocument.spreadsheet" => odf(&mut pkg, "ods")?,
-        "application/vnd.oasis.opendocument.presentation" => odf(&mut pkg, "odp")?,
-        _ if pkg.has("Contents/content.hpf") => hwpx(&mut pkg)?,
+        "application/epub+zip" => crate::epub::parse(&mut pkg, range)?,
+        "application/vnd.oasis.opendocument.text" => odf(&mut pkg, "odt", range)?,
+        "application/vnd.oasis.opendocument.spreadsheet" => odf(&mut pkg, "ods", range)?,
+        "application/vnd.oasis.opendocument.presentation" => odf(&mut pkg, "odp", range)?,
+        _ if pkg.has("Contents/content.hpf") => hwpx(&mut pkg, range)?,
         _ if pkg.has("[Content_Types].xml") => {
             let (_, ts) = relationships(&mut pkg, "")?;
             let main = ts
@@ -642,12 +753,13 @@ pub fn package(data: &[u8], images: bool) -> Result<Document> {
             } else {
                 return Err("unsupported Office content type".into());
             };
-            ooxml(&mut pkg, main, kind)?
+            ooxml(&mut pkg, main, kind, range)?
         }
         _ => return Err("unrecognized ZIP document structure".into()),
     };
-    if matches!(d.format.as_str(), "docx" | "odt" | "hwpx") {
-        d.explicit_pages()
+    if matches!(d.format.as_str(), "docx" | "odt") {
+        d.explicit_pages();
+        d.retain_sections(range)?;
     }
     if images {
         let mut missing = HashSet::new();

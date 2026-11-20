@@ -1,7 +1,7 @@
 use crate::{
     legacy::{u16le, u32le, utf16},
     model::*,
-    sheets::Grid,
+    sheets::{Grid, record_hidden_axis},
 };
 fn record(b: &[u8], i: usize) -> Result<(u16, &[u8])> {
     let n = u16le(b, i + 2)? as usize;
@@ -102,7 +102,7 @@ fn short_string(b: &[u8], n: usize, wide: bool) -> Result<String> {
         Ok(bytes.iter().map(|c| char::from(*c)).collect())
     }
 }
-pub fn parse(b: &[u8]) -> Result<Document> {
+pub fn parse(b: &[u8], range: Option<&SectionRange>) -> Result<Document> {
     let (typ, bof) = record(b, 0)?;
     if typ != 0x809 || u16le(bof, 0)? != 0x600 {
         return Err("only BIFF8 Excel 97–2003 workbooks are supported".into());
@@ -152,13 +152,49 @@ pub fn parse(b: &[u8]) -> Result<Document> {
     }
     let mut doc = Document::new("xls");
     let mut bytes = 0usize;
-    for (mut i, name, state) in sheets {
-        let mut s = Section::new("sheet", format!("Workbook:{i}"));
-        s.title = name;
-        if state != 0 {
+    for index in section_indices(range, sheets.len())? {
+        let (mut i, ref name, state) = sheets[index];
+        let mut s = Section::new("sheet", format!("Workbook:{i}")).indexed(index);
+        s.title = name.clone();
+        if matches!(state & 3, 1 | 2) {
             s.properties.insert("hidden".into(), "true".into());
+            s.properties.insert(
+                "state".into(),
+                if state & 3 == 2 {
+                    "veryHidden"
+                } else {
+                    "hidden"
+                }
+                .into(),
+            );
         }
         let mut grid = Grid::new();
+        let mut scan = i;
+        let mut hidden_columns = Vec::new();
+        let mut hidden_rows = Vec::new();
+        while scan < b.len() {
+            let (kind, v) = record(b, scan)?;
+            scan += v.len() + 4;
+            match kind {
+                0xa => break,
+                0x7d if u16le(v, 8)? & 1 != 0 => {
+                    let first = usize::from(u16le(v, 0)?);
+                    let last = usize::from(u16le(v, 2)?).min(255);
+                    if first <= last {
+                        hidden_columns.push((first + 1, last + 1));
+                    }
+                }
+                0x208 if u16le(v, 12)? & 0x20 != 0 => {
+                    let row = usize::from(u16le(v, 0)?) + 1;
+                    hidden_rows.push((row, row));
+                }
+                _ => {}
+            }
+        }
+        grid.hidden_columns = SectionRange::from_spans(hidden_columns);
+        grid.hidden_rows = SectionRange::from_spans(hidden_rows);
+        record_hidden_axis(&mut s, "hidden_columns", &grid.hidden_columns);
+        record_hidden_axis(&mut s, "hidden_rows", &grid.hidden_rows);
         let mut pending = None;
         while i < b.len() {
             let (k, v) = record(b, i)?;

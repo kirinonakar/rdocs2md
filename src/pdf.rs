@@ -1,4 +1,4 @@
-use crate::model::*;
+use crate::{model::*, visibility::TINY_POINTS};
 use lopdf::{Document as Pdf, LoadOptions, Object, content::Content};
 use std::collections::HashMap;
 #[derive(Clone, Copy)]
@@ -622,6 +622,66 @@ fn resource_dict<'a>(
 ) -> Option<&'a lopdf::Dictionary> {
     dictionary(pdf, resources?.get(key).ok()?)
 }
+
+fn page_box(pdf: &Pdf, mut id: lopdf::ObjectId) -> Option<[f32; 4]> {
+    let mut media = None;
+    let mut crop = None;
+    for _ in 0..128 {
+        let Ok(dict) = pdf.get_dictionary(id) else {
+            break;
+        };
+        let bounds = |key: &[u8]| {
+            let values = resolve_object(pdf, dict.get(key).ok()?)?.as_array().ok()?;
+            let [a, b, c, d] = values.as_slice() else {
+                return None;
+            };
+            let coords = [
+                a.as_float().ok()?,
+                b.as_float().ok()?,
+                c.as_float().ok()?,
+                d.as_float().ok()?,
+            ];
+            coords.iter().all(|v| v.is_finite()).then(|| {
+                let [a, b, c, d] = coords;
+                [a.min(c), b.min(d), a.max(c), b.max(d)]
+            })
+        };
+        media = media.or_else(|| bounds(b"MediaBox"));
+        crop = crop.or_else(|| bounds(b"CropBox"));
+        if media.is_some() && crop.is_some() {
+            break;
+        }
+        let Ok(parent) = dict.get(b"Parent").and_then(Object::as_reference) else {
+            break;
+        };
+        id = parent;
+    }
+    match (media, crop) {
+        (Some([l, b, r, t]), Some([cl, cb, cr, ct])) => {
+            Some([l.max(cl), b.max(cb), r.min(cr), t.min(ct)])
+        }
+        (media, crop) => media.or(crop),
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TextPaint {
+    fill_white: bool,
+    stroke_white: bool,
+    mode: i64,
+}
+
+impl TextPaint {
+    fn is_white(self) -> bool {
+        match self.mode {
+            0 | 4 => self.fill_white,
+            1 | 5 => self.stroke_white,
+            2 | 6 => self.fill_white && self.stroke_white,
+            _ => false,
+        }
+    }
+}
+
 struct PageReader<'a> {
     pdf: &'a Pdf,
     doc: &'a mut Document,
@@ -631,6 +691,9 @@ struct PageReader<'a> {
     rules: Vec<HorizontalRule>,
     verticals: Vec<VerticalRule>,
     active: Vec<lopdf::ObjectId>,
+    bounds: Option<[f32; 4]>,
+    user_unit: f64,
+    has_images: bool,
 }
 impl PageReader<'_> {
     fn content(
@@ -639,6 +702,7 @@ impl PageReader<'_> {
         resources: Option<&lopdf::Dictionary>,
         mut ctm: Matrix,
         mut stroke: Stroke,
+        mut paint: TextPaint,
     ) -> Result<()> {
         *self.total += bytes.len() + 64;
         if *self.total > 512 * MIB {
@@ -705,14 +769,15 @@ impl PageReader<'_> {
                     if stack.len() > 128 {
                         return Err("PDF graphics state depth exceeded".into());
                     }
-                    stack.push((ctm, font.clone(), state, stroke))
+                    stack.push((ctm, font.clone(), state, stroke, paint))
                 }
                 "Q" => {
-                    if let Some((m, f, s, line_style)) = stack.pop() {
+                    if let Some((m, f, s, line_style, text_paint)) = stack.pop() {
                         ctm = m;
                         font = f;
                         state = s;
                         stroke = line_style;
+                        paint = text_paint;
                         moved = true;
                     }
                 }
@@ -744,6 +809,24 @@ impl PageReader<'_> {
                         } else {
                             stroke.color
                         };
+                    }
+                    paint.stroke_white = if op.operator == "G" {
+                        num(0).is_ok_and(|v| v >= 1.)
+                    } else {
+                        (0..3).all(|i| num(i).is_ok_and(|v| v >= 1.))
+                    };
+                }
+                "g" | "rg" => {
+                    let count = if op.operator == "g" { 1 } else { 3 };
+                    paint.fill_white = (0..count).all(|i| num(i).is_ok_and(|v| v >= 1.));
+                }
+                "k" => paint.fill_white = (0..4).all(|i| num(i).is_ok_and(|v| v <= 0.)),
+                "K" => paint.stroke_white = (0..4).all(|i| num(i).is_ok_and(|v| v <= 0.)),
+                "cs" | "sc" | "scn" => paint.fill_white = false,
+                "CS" | "SC" | "SCN" => paint.stroke_white = false,
+                "Tr" => {
+                    if let Some(mode) = args.first().and_then(|v| v.as_i64().ok()) {
+                        paint.mode = mode;
                     }
                 }
                 "d" => {
@@ -1016,10 +1099,10 @@ impl PageReader<'_> {
                     };
                     for (text, start, end) in segments {
                         let (x, y) = basis.point(start, state.rise);
-                        let (end, _) = basis.point(end, state.rise);
+                        let (end_x, _) = basis.point(end, state.rise);
                         if !x.is_finite()
                             || !y.is_finite()
-                            || !end.is_finite()
+                            || !end_x.is_finite()
                             || !effective_size.is_finite()
                         {
                             return Err("non-finite PDF coordinates".into());
@@ -1028,23 +1111,49 @@ impl PageReader<'_> {
                         // dropped at a wrap without stripping compound hyphens.
                         let discretionary_hyphen =
                             moved && text == "-" && marked_spans.last() == Some(&true);
-                        let run = Run {
+                        let mut run = Run {
                             text,
                             style: style.clone(),
                             ..Run::default()
                         };
+                        if paint.is_white() {
+                            run.visibility_flags.push(VisibilityFlag::WhiteText);
+                        }
+                        if f64::from(effective_size) * self.user_unit < TINY_POINTS {
+                            run.visibility_flags.push(VisibilityFlag::TinyText);
+                        }
+                        if let Some([left, bottom, right, top]) = self.bounds {
+                            let points = [start, end].map(|x| {
+                                [state.rise - state.size * 0.25, state.rise + state.size]
+                                    .map(|y| basis.point(x, y))
+                            });
+                            if [
+                                points.iter().flatten().all(|p| p.0 < left - 0.5),
+                                points.iter().flatten().all(|p| p.1 < bottom - 0.5),
+                                points.iter().flatten().all(|p| p.0 > right + 0.5),
+                                points.iter().flatten().all(|p| p.1 > top + 0.5),
+                            ]
+                            .into_iter()
+                            .any(|outside| outside)
+                            {
+                                run.visibility_flags.push(VisibilityFlag::OffPage);
+                            }
+                        }
+                        if matches!(paint.mode, 3 | 7) {
+                            run.visibility_flags.push(VisibilityFlag::HiddenText);
+                        }
                         if !moved
                             && !separate_glyphs
                             && start == 0.
                             && let Some(f) = self.fragments.last_mut()
                         {
-                            f.end = f.end.max(end);
+                            f.end = f.end.max(end_x);
                             f.discretionary_hyphen = false;
                             push_run(&mut f.runs, run);
                         } else {
                             self.fragments.push(Fragment {
                                 x,
-                                end: x.max(end),
+                                end: x.max(end_x),
                                 y,
                                 size: effective_size,
                                 horizontal: basis.0[0] > 0. && basis.0[1].abs() < basis.0[0] * 0.15,
@@ -1055,6 +1164,7 @@ impl PageReader<'_> {
                         moved = separate_glyphs;
                     }
                 }
+                "BI" => self.has_images = true,
                 "Do" => {
                     let key = args.first().ok_or("PDF XObject name missing")?.as_name()?;
                     if let Some(obj) =
@@ -1084,11 +1194,12 @@ impl PageReader<'_> {
                                     .or(resources);
                                 let content = stream.get_plain_content_with_limit(PART_LIMIT)?;
                                 self.active.push(id);
-                                self.content(&content, r, ctm.concat(transform), stroke)?;
+                                self.content(&content, r, ctm.concat(transform), stroke, paint)?;
                                 self.active.pop();
                                 moved = true;
                             }
                             b"Image" => {
+                                self.has_images = true;
                                 let name = format!("pdf/{}-{}", id.0, id.1);
                                 if self.images && !self.doc.assets.contains_key(&name) {
                                     if let Some(bytes) = raster(stream)? {
@@ -1127,7 +1238,7 @@ impl PageReader<'_> {
         Ok(())
     }
 }
-pub fn parse(data: &[u8], images: bool) -> Result<Document> {
+pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<Document> {
     let pdf =
         Pdf::load_mem_with_options(data, LoadOptions::with_max_decompressed_size(PART_LIMIT))?;
     if pdf.is_encrypted() || pdf.encryption_state.is_some() {
@@ -1148,11 +1259,13 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
         }
     }
     let mut total = 0usize;
-    for (idx, id) in pdf.page_iter().enumerate() {
-        if idx >= 32768 {
-            return Err("PDF page limit exceeded".into());
-        }
-        let mut sec = Section::new("page", format!("{} {} R", id.0, id.1));
+    let pages: Vec<_> = pdf.page_iter().take(32769).collect();
+    if pages.len() > 32768 {
+        return Err("PDF page limit exceeded".into());
+    }
+    for idx in section_indices(range, pages.len())? {
+        let id = pages[idx];
+        let mut sec = Section::new("page", format!("{} {} R", id.0, id.1)).indexed(idx);
         let bytes = pdf.get_page_content_with_limit(id, PART_LIMIT)?;
         let (direct, ids) = pdf.get_page_resources(id)?;
         let resources = direct.or_else(|| ids.first().and_then(|id| pdf.get_dictionary(*id).ok()));
@@ -1165,8 +1278,23 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
             rules: Vec::new(),
             verticals: Vec::new(),
             active: Vec::new(),
+            bounds: page_box(&pdf, id),
+            user_unit: pdf
+                .get_dictionary(id)
+                .ok()
+                .and_then(|d| resolve_object(&pdf, d.get(b"UserUnit").ok()?))
+                .and_then(|v| v.as_float().ok())
+                .filter(|v| v.is_finite() && *v > 0.)
+                .map_or(1., f64::from),
+            has_images: false,
         };
-        reader.content(&bytes, resources, Matrix::ID, Stroke::default())?;
+        reader.content(
+            &bytes,
+            resources,
+            Matrix::ID,
+            Stroke::default(),
+            TextPaint::default(),
+        )?;
         annotations(&pdf, id, &mut reader.fragments)?;
         if !reader
             .fragments
@@ -1174,9 +1302,15 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
             .flat_map(|f| &f.runs)
             .any(|r| !r.text.trim().is_empty())
         {
-            reader
-                .doc
-                .warn("A PDF page has no extractable text. OCR is unavailable.");
+            let status = if reader.has_images {
+                reader.doc.warn("No text was extracted from a PDF page containing images. Text visible in the images requires OCR, which rdocs2md does not perform.");
+                "ocr_needed_for_image_text"
+            } else {
+                reader.doc.warn("No text was extracted from a PDF page. Text drawn as outlines or other graphics may still be visible.");
+                "no_text_extracted"
+            };
+            sec.properties
+                .insert("text_extraction".into(), status.into());
         }
         layout(reader.fragments, reader.rules, reader.verticals, &mut sec);
 

@@ -4,9 +4,32 @@ pub const SIDES: [&str; 4] = ["left", "right", "top", "bottom"];
 pub const BORDERS: [&str; 4] = ["border-left", "border-right", "border-top", "border-bottom"];
 
 pub fn color(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("white") {
+        return Some("#ffffff".into());
+    }
     let hex = value.strip_prefix('#').unwrap_or(value);
     (matches!(hex.len(), 3 | 6) && hex.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| format!("#{hex}"))
+}
+
+pub fn length_in_points(value: &str) -> Option<f64> {
+    let value = value.trim();
+    if value == "0" {
+        return Some(0.);
+    }
+    for (unit, scale) in [
+        ("pt", 1.),
+        ("px", 0.75),
+        ("pc", 12.),
+        ("mm", 72. / 25.4),
+        ("cm", 72. / 2.54),
+        ("in", 72.),
+    ] {
+        if let Some(number) = value.strip_suffix(unit) {
+            return Some(number.trim().parse::<f64>().ok()? * scale).filter(|v| v.is_finite());
+        }
+    }
+    None
 }
 
 pub fn length(value: &str, negative: bool) -> Option<String> {

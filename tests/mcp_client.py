@@ -19,7 +19,10 @@ async def check():
                 assert info.serverInfo.name == "rdocs2md"
                 await client.send_ping()
                 tools = await client.list_tools()
-                assert len(tools.tools) == 4
+                assert {t.name for t in tools.tools} == {
+                    "list_supported_formats", "inspect_document", "convert_document",
+                    "extract_document_range", "convert_documents", "search_document",
+                }
                 async def call(name, args):
                     res = await client.call_tool(name, args)
                     assert not res.isError, res
@@ -29,6 +32,18 @@ async def check():
                 assert len(doc["sections"]) == 2
                 res = await call("extract_document_range", {"path":"sample.rtf","range":"2"})
                 assert "Page two" in res and "Page one" not in res
+                search = json.loads(await call("search_document", {
+                    "path":"sample.rtf", "query":"TWO", "range":"2",
+                }))
+                assert search["matches"][0]["section_index"] == 2
+                assert search["matches"][0]["before"] == "Page "
+                (work / "nested").mkdir()
+                (work / "nested/copy.rtf").write_bytes((work / "sample.rtf").read_bytes())
+                batch = json.loads(await call("convert_documents", {
+                    "paths":["*.rtf", "bad.doc"], "recursive":True, "output_dir":"batch",
+                }))
+                assert batch["succeeded"] == 2 and batch["failed"] == 1
+                assert (work / "batch/copy.md").is_file()
                 await call("convert_document", {"path":"sample.rtf","output_path":"result.md"})
                 assert "Page one" in (work / "result.md").read_text(encoding="utf-8")
                 denied = await client.call_tool("inspect_document", {"path":str(root / "Cargo.toml")})

@@ -1,6 +1,9 @@
-use rdocs2md::{load, model::*, output, render::render};
+use rdocs2md::{batch, load_range, model::*, output, recover_document, render::render, search};
+use serde::Serialize;
 use std::{
     collections::HashSet,
+    ffi::OsStr,
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -11,22 +14,26 @@ Usage: rdocs2md INPUT... [options]
 
 Example: rdocs2md "report.pdf" -o "report.md"
 
-  -o, --output FILE        Destination for one input (default: beside input)
+  -o, --output PATH        Destination file, or a directory for multiple inputs
   --out-dir DIRECTORY      Destination directory for batch conversion
-  --stdout                 Write a single document to standard output
+  --stdout                 Write the document, or JSON Lines for multiple inputs
   --format md|html|json    Select output format (default: md)
   --mode semantic|layout|hybrid   Markdown rendering mode (default: hybrid)
   --pages RANGE            Select 1-based section indexes, e.g. 1-3,5
   --slides, --sheets, --chapters, --range   Aliases for --pages
-  --json FILE              Also save the selected document IR as UTF-8 JSON
+  --json PATH              Also save JSON IR to a file, or a directory for multiple inputs
   --extract-images         Extract supported embedded raster images
   --image-dir DIRECTORY    Select image destination (implies extraction)
+  -r, --recursive          Scan subfolders for directory and wildcard inputs
+  --search QUERY           Search extracted document text and return JSON matches
+  --case-sensitive         Perform case-sensitive search
+  --limit NUMBER           Maximum search matches per input (default: 50)
   --allow-outside-root     MCP only: permit local input and output outside the root
   --                       Treat remaining arguments as input files
 "#;
 #[derive(Default)]
 struct Args {
-    inputs: Vec<PathBuf>,
+    inputs: Vec<(PathBuf, bool)>,
     out: Option<PathBuf>,
     dir: Option<PathBuf>,
     meta: Option<PathBuf>,
@@ -36,6 +43,8 @@ struct Args {
     format: String,
     mode: String,
     range: Option<String>,
+    recursive: bool,
+    query: Option<search::Query>,
 }
 fn parse(args: Vec<String>) -> Result<Args> {
     let mut a = Args {
@@ -43,6 +52,9 @@ fn parse(args: Vec<String>) -> Result<Args> {
         mode: "hybrid".into(),
         ..Args::default()
     };
+    let mut query = None;
+    let mut case_sensitive = false;
+    let mut limit = None;
     let mut it = args.into_iter();
     while let Some(s) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("missing value for {s}"));
@@ -56,26 +68,25 @@ fn parse(args: Vec<String>) -> Result<Args> {
                 a.images = true
             }
             "--stdout" => a.stdout = true,
+            "-r" | "--recursive" => a.recursive = true,
+            "--search" => query = Some(val()?),
+            "--case-sensitive" => case_sensitive = true,
+            "--limit" => limit = Some(val()?.parse()?),
             "--format" => a.format = val()?,
             "--mode" => a.mode = val()?,
             "--range" | "--pages" | "--slides" | "--sheets" | "--chapters" => {
                 a.range = Some(val()?)
             }
             "--" => {
-                a.inputs.extend(it.map(PathBuf::from));
+                a.inputs.extend(it.map(|s| (PathBuf::from(s), true)));
                 break;
             }
             _ if s.starts_with('-') => return Err(format!("unknown option {s}").into()),
-            _ => a.inputs.push(s.into()),
+            _ => a.inputs.push((s.into(), false)),
         }
     }
     if a.inputs.is_empty() {
         return Err("missing input file (see --help)".into());
-    }
-    if a.inputs.len() > 1
-        && (a.stdout || a.meta.is_some() || a.out.is_some() || a.image_dir.is_some())
-    {
-        return Err("use --out-dir for multiple input files".into());
     }
     if a.stdout && (a.dir.is_some() || a.out.is_some()) || a.out.is_some() && a.dir.is_some() {
         return Err("choose one output destination".into());
@@ -88,53 +99,179 @@ fn parse(args: Vec<String>) -> Result<Args> {
     {
         return Err("invalid format or mode (see --help)".into());
     }
+    if let Some(query) = query {
+        if a.out.is_some() || a.dir.is_some() || a.meta.is_some() || a.images {
+            return Err("--search writes JSON to stdout and cannot be combined with conversion destinations or image extraction".into());
+        }
+        a.query = Some(search::Query::new(
+            &query,
+            case_sensitive,
+            limit.unwrap_or(search::DEFAULT_LIMIT),
+        )?);
+    } else if case_sensitive || limit.is_some() {
+        return Err("--case-sensitive and --limit require --search".into());
+    }
     Ok(a)
 }
-fn dest(a: &Args, input: &Path) -> PathBuf {
-    a.out.clone().unwrap_or_else(|| {
-        let file = input.with_extension(&a.format);
-        if let Some(dir) = &a.dir {
-            dir.join(file.file_name().unwrap_or_default())
-        } else {
-            file
-        }
-    })
-}
-fn convert(a: &Args, input: &Path) -> Result<()> {
-    let mut d = load(input, a.images)?;
-    if let Some(r) = &a.range {
-        d.select(r)?
+
+fn dest(a: &Args, input: &Path, stem: &OsStr, multi: bool) -> PathBuf {
+    if !multi && let Some(path) = &a.out {
+        return path.clone();
     }
-    let path = dest(a, input);
+    let dir = a
+        .dir
+        .as_deref()
+        .or(a.out.as_deref())
+        .unwrap_or_else(|| output::parent(input));
+    dir.join(batch::output_name(stem, &a.format))
+}
+
+fn print_json(value: impl Serialize) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &value)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct BatchContent<'a> {
+    input: &'a Path,
+    content: &'a str,
+}
+
+#[derive(Serialize)]
+struct BatchSearch<'a, 'doc> {
+    input: &'a Path,
+    result: search::SearchResult<'doc>,
+}
+
+fn convert(
+    a: &Args,
+    input: &Path,
+    stem: &OsStr,
+    path: &Path,
+    meta: Option<&Path>,
+    multi: bool,
+) -> Result<()> {
+    let d = load_range(input, a.images, a.range.as_deref())?;
+    if let Some(query) = &a.query {
+        let result = query.find(&d);
+        return if multi {
+            print_json(BatchSearch { input, result })
+        } else {
+            print_json(result)
+        };
+    }
     let base = if a.stdout {
         Path::new(".")
     } else {
-        output::parent(&path)
+        output::parent(path)
     };
     let mut links = Properties::new();
     if a.images {
-        let dir = a.image_dir.clone().unwrap_or_else(|| {
-            base.join(format!(
-                "{}_images",
-                input.file_stem().unwrap_or_default().to_string_lossy()
-            ))
-        });
+        let dir = match &a.image_dir {
+            Some(dir) if multi => dir.join(stem),
+            Some(dir) => dir.clone(),
+            None => {
+                let mut name = stem.to_os_string();
+                name.push("_images");
+                base.join(name)
+            }
+        };
         links = output::extract(&d, &dir, base)?;
     }
     let text = render(&d, &a.format, &a.mode, &links)?;
-    if let Some(p) = &a.meta {
+    if let Some(p) = meta {
         output::save(p, serde_json::to_string_pretty(&d)?.as_bytes(), false)?
     }
     if a.stdout {
-        io::stdout().lock().write_all(text.as_bytes())?
+        if multi {
+            print_json(BatchContent {
+                input,
+                content: &text,
+            })?;
+        } else {
+            io::stdout().lock().write_all(text.as_bytes())?;
+        }
     } else {
-        output::save(&path, text.as_bytes(), false)?;
+        output::save(path, text.as_bytes(), false)?;
         eprintln!("{} -> {}", input.display(), path.display())
     }
     for w in &d.warnings {
         eprintln!("{}: {w}", input.display())
     }
     Ok(())
+}
+
+fn process(a: &Args) -> Result<i32> {
+    let mut failed = false;
+    let mut inputs = Vec::new();
+    let mut names = HashSet::new();
+    let mut scanned = false;
+    for (spec, literal) in &a.inputs {
+        match batch::expand(spec, a.recursive, *literal, |p| Ok(p.canonicalize()?)) {
+            Ok(found) => {
+                scanned |= found.scanned;
+                inputs.extend(found.files.into_iter().filter(|p| names.insert(p.clone())));
+                for (path, error) in found.errors {
+                    eprintln!("{}: {error}", path.display());
+                    failed = true;
+                }
+            }
+            Err(e) => {
+                eprintln!("{}: {e}", spec.display());
+                failed = true;
+            }
+        }
+    }
+    if inputs.is_empty() {
+        return Ok(1);
+    }
+    let multi = scanned || a.inputs.len() > 1;
+    for dir in a
+        .dir
+        .iter()
+        .chain(a.out.iter().filter(|_| multi))
+        .chain(a.meta.iter().filter(|_| multi))
+    {
+        fs::create_dir_all(dir)?;
+    }
+    let mut stems = batch::OutputNames::default();
+    for input in inputs {
+        let stem = stems.next(&input);
+        let path = dest(a, &input, &stem, multi);
+        let meta = a.meta.as_ref().map(|p| {
+            if multi {
+                p.join(batch::output_name(&stem, "json"))
+            } else {
+                p.clone()
+            }
+        });
+        let result = recover_document(|| {
+            let mut targets = Vec::new();
+            for p in (a.query.is_none() && !a.stdout)
+                .then_some(&path)
+                .into_iter()
+                .chain(&meta)
+            {
+                let absolute = output::absolute(p)?;
+                if names.contains(&absolute) || targets.contains(&absolute) {
+                    return Err(format!("input/output path collision: {}", p.display()).into());
+                }
+                targets.push(absolute);
+            }
+            convert(a, &input, &stem, &path, meta.as_deref(), multi)?;
+            Ok(targets)
+        });
+        match result {
+            Ok(targets) => names.extend(targets),
+            Err(e) => {
+                eprintln!("{}: {e}", input.display());
+                failed = true;
+            }
+        }
+    }
+    Ok(i32::from(failed))
 }
 fn run() -> Result<i32> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -181,36 +318,7 @@ fn run() -> Result<i32> {
                     return Ok(2);
                 }
             };
-            if let Some(dir) = &a.dir {
-                std::fs::create_dir_all(dir)?
-            }
-            let mut names = HashSet::new();
-            for input in &a.inputs {
-                if input.exists() {
-                    names.insert(output::absolute(input)?);
-                }
-            }
-            for p in a
-                .inputs
-                .iter()
-                .filter(|_| !a.stdout)
-                .map(|p| dest(&a, p))
-                .chain(a.meta.iter().cloned())
-            {
-                if !names.insert(output::absolute(&p)?) {
-                    return Err(format!("input/output path collision: {}", p.display()).into());
-                }
-            }
-            let mut failed = false;
-            for input in &a.inputs {
-                if let Err(e) = convert(&a, input) {
-                    eprintln!("{}: {e}", input.display());
-                    failed = true
-                }
-            }
-            if failed {
-                return Ok(1);
-            }
+            return process(&a);
         }
     }
     Ok(0)

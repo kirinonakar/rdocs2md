@@ -1,5 +1,52 @@
 use crate::{flow::style_props, formatting, model::*, package::*};
 use std::collections::{HashMap, HashSet};
+
+pub(crate) fn record_hidden_axis(sec: &mut Section, key: &str, axis: &SectionRange) {
+    if !axis.0.is_empty() {
+        let ranges: Vec<_> = axis
+            .0
+            .iter()
+            .map(|&(a, b)| {
+                if a == b {
+                    a.to_string()
+                } else {
+                    format!("{a}-{b}")
+                }
+            })
+            .collect();
+        sec.properties.insert(key.into(), ranges.join(","));
+    }
+}
+
+pub(crate) fn hide_cell_axis(cell: &mut Cell, key: &str) {
+    cell.properties.insert(key.into(), "true".into());
+    cell.properties.insert("hidden".into(), "true".into());
+}
+
+pub(crate) fn ods_axis_hidden(axis: N, sheet: N) -> bool {
+    matches!(attr(axis, "visibility"), Some("collapse" | "filter"))
+        || axis
+            .ancestors()
+            .skip(1)
+            .take_while(|&n| n != sheet)
+            .any(|n| {
+                matches!(tag(n), "table-column-group" | "table-row-group")
+                    && matches!(attr(n, "display"), Some("false" | "0"))
+            })
+}
+
+fn address_label(r: usize, mut c: usize) -> String {
+    let mut letters = Vec::new();
+    loop {
+        letters.push(char::from(b'A' + (c % 26) as u8));
+        if c < 26 {
+            break;
+        }
+        c = c / 26 - 1;
+    }
+    let column: String = letters.into_iter().rev().collect();
+    format!("{column}{}", r + 1)
+}
 pub fn address(s: &str) -> Result<(usize, usize)> {
     let cut = s
         .find(|c: char| c.is_ascii_digit())
@@ -26,6 +73,8 @@ pub struct Grid {
     start: usize,
     last: Option<usize>,
     cells: usize,
+    pub hidden_rows: SectionRange,
+    pub hidden_columns: SectionRange,
 }
 impl Grid {
     pub fn new() -> Self {
@@ -35,9 +84,11 @@ impl Grid {
             start: 0,
             last: None,
             cells: 0,
+            hidden_rows: SectionRange::default(),
+            hidden_columns: SectionRange::default(),
         }
     }
-    pub fn add(&mut self, r: usize, c: usize, v: Cell, sec: &mut Section) -> Result<()> {
+    pub fn add(&mut self, r: usize, c: usize, mut v: Cell, sec: &mut Section) -> Result<()> {
         if self.last.is_some_and(|prev| r > prev + 1) {
             self.flush(sec)
         }
@@ -61,6 +112,15 @@ impl Grid {
                 return Err("spreadsheet expansion limit exceeded".into());
             }
             row.resize_with(c + 1, Cell::default)
+        }
+        v.properties
+            .entry("address".into())
+            .or_insert_with(|| address_label(r, c));
+        if self.hidden_rows.contains(r + 1) {
+            hide_cell_axis(&mut v, "hidden_row");
+        }
+        if self.hidden_columns.contains(c + 1) {
+            hide_cell_axis(&mut v, "hidden_column");
         }
         row[c] = v;
         self.last = Some(r);
@@ -199,6 +259,7 @@ pub fn xlsx(
     root: N,
     rels: &HashMap<String, String>,
     types: &HashMap<String, String>,
+    range: Option<&SectionRange>,
 ) -> Result<Document> {
     if tag(root) != "workbook" {
         return Err("invalid Excel workbook".into());
@@ -233,16 +294,21 @@ pub fn xlsx(
     let mut text_budget = 0usize;
     let epoch1904 = child(root, "workbookPr")
         .is_some_and(|n| matches!(attr(n, "date1904"), Some("1" | "true")));
-    for sheet in desc(root, "sheet") {
+    let sheets: Vec<_> = desc(root, "sheet").collect();
+    for i in section_indices(range, sheets.len())? {
+        let sheet = sheets[i];
         let path = attr(sheet, "id")
             .and_then(|id| rels.get(id))
             .ok_or("missing sheet relationship")?;
         let s = pkg.text(path)?;
         let x = xml(&s)?;
-        let mut sec = Section::new("sheet", path);
+        let mut sec = Section::new("sheet", path).indexed(i);
         sec.title = attr(sheet, "name").unwrap_or("").into();
         if let Some(state) = attr(sheet, "state") {
             sec.properties.insert("state".into(), state.into());
+            if matches!(state, "hidden" | "veryHidden") {
+                sec.properties.insert("hidden".into(), "true".into());
+            }
         }
         let parts = crate::office::relationships(pkg, path)?.0;
         let mut links = HashMap::new();
@@ -259,6 +325,23 @@ pub fn xlsx(
         }
         let mut merges = HashMap::new();
         let mut grid = Grid::new();
+        let mut hidden_columns = Vec::new();
+        for col in
+            desc(x.root(), "col").filter(|n| matches!(attr(*n, "hidden"), Some("1" | "true")))
+        {
+            let start = attr(col, "min")
+                .ok_or("hidden column range start missing")?
+                .parse::<usize>()?;
+            let end = attr(col, "max")
+                .ok_or("hidden column range end missing")?
+                .parse::<usize>()?;
+            if start == 0 || start > end || end > 16384 {
+                return Err("hidden column range out of bounds".into());
+            }
+            hidden_columns.push((start, end));
+        }
+        grid.hidden_columns = SectionRange::from_spans(hidden_columns);
+        record_hidden_axis(&mut sec, "hidden_columns", &grid.hidden_columns);
         let mut merge_area = 0usize;
         for m in desc(x.root(), "mergeCell") {
             if let Some((a, b)) = attr(m, "ref").and_then(|s| s.split_once(':')) {
@@ -282,6 +365,7 @@ pub fn xlsx(
             }
         }
         let mut next_row = 0;
+        let mut hidden_rows = Vec::new();
         for row in desc(x.root(), "row") {
             let r = match attr(row, "r") {
                 Some(n) => n.parse::<usize>()?.checked_sub(1).ok_or("invalid row")?,
@@ -291,6 +375,10 @@ pub fn xlsx(
                 return Err("row out of bounds".into());
             }
             next_row = r + 1;
+            let hidden = matches!(attr(row, "hidden"), Some("1" | "true"));
+            if hidden {
+                hidden_rows.push((r + 1, r + 1));
+            }
             let mut next_col = 0;
             for n in row.children().filter(|n| tag(*n) == "c") {
                 let pos = attr(n, "r")
@@ -330,8 +418,8 @@ pub fn xlsx(
                         }
                     }
                 }
-                if attr(row, "hidden") == Some("1") {
-                    c.properties.insert("hidden".into(), "true".into());
+                if hidden {
+                    hide_cell_axis(&mut c, "hidden_row");
                 }
                 if let Some(style) = attr(n, "s")
                     .and_then(|v| v.parse::<usize>().ok())
@@ -365,6 +453,11 @@ pub fn xlsx(
             }
         }
         grid.flush(&mut sec);
+        record_hidden_axis(
+            &mut sec,
+            "hidden_rows",
+            &SectionRange::from_spans(hidden_rows),
+        );
         doc.sections.push(sec);
     }
     Ok(doc)

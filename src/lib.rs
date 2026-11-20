@@ -1,3 +1,4 @@
+pub mod batch;
 mod epub;
 mod flow;
 mod formatting;
@@ -13,43 +14,70 @@ mod package;
 mod pdf;
 pub mod render;
 mod rtf;
+pub mod search;
 mod sheets;
+mod visibility;
 mod xls;
 use model::*;
 use std::{fs::File, io::Read, path::Path};
+
+pub fn recover_document<T>(
+    action: impl FnOnce() -> Result<T> + std::panic::UnwindSafe,
+) -> Result<T> {
+    std::panic::catch_unwind(action).unwrap_or_else(|_| Err("document processing panicked".into()))
+}
 pub fn load(path: &Path, images: bool) -> Result<Document> {
-    let f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    load_range(path, images, None)
+}
+
+pub fn load_range(path: &Path, images: bool, range: Option<&str>) -> Result<Document> {
+    let range = range.map(SectionRange::parse).transpose()?;
+    let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let m = f.metadata()?;
     if !m.is_file() || m.len() > FILE_LIMIT as u64 {
-        return Err("input must be a regular file of at most 256 MiB".into());
+        return Err("input must be a regular file of at most 2 GiB".into());
     }
     let mut bytes = Vec::new();
-    f.take(FILE_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > FILE_LIMIT {
+    bytes.try_reserve_exact(m.len() as usize)?;
+    (&mut f).take(FILE_LIMIT as u64).read_to_end(&mut bytes)?;
+    if bytes.len() == FILE_LIMIT && f.read(&mut [0])? != 0 {
         return Err("file limit exceeded".into());
     }
-    convert(&bytes, images)
+    convert_selected(&bytes, images, range.as_ref())
 }
 pub fn convert(b: &[u8], images: bool) -> Result<Document> {
+    convert_range(b, images, None)
+}
+
+pub fn convert_range(b: &[u8], images: bool, range: Option<&str>) -> Result<Document> {
+    let range = range.map(SectionRange::parse).transpose()?;
+    convert_selected(b, images, range.as_ref())
+}
+
+fn convert_selected(b: &[u8], images: bool, range: Option<&SectionRange>) -> Result<Document> {
     if b.len() > FILE_LIMIT {
-        return Err("document input exceeds 256 MiB".into());
+        return Err("document input exceeds 2 GiB".into());
     }
-    let d = if b.starts_with(b"%PDF-") {
-        pdf::parse(b, images)?
+    let mut d = if b.starts_with(b"%PDF-") {
+        pdf::parse(b, images, range)?
     } else if b.starts_with(b"{\\rtf") {
-        rtf::parse(b, images)?
+        rtf::parse(b, images, range)?
     } else if hwp3::matches(b) {
+        if let Some(range) = range {
+            range.validate(1)?;
+        }
         hwp3::parse(b)?
     } else if b.starts_with(b"PK\x03\x04") {
-        office::package(b, images)?
+        office::package(b, images, range)?
     } else if b.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") {
-        legacy::parse(b, images)?
+        legacy::parse(b, images, range)?
     } else {
         return Err("unrecognized document signature".into());
     };
     if d.sections.is_empty() {
         return Err(format!("{} contains no supported document sections", d.format).into());
     }
+    visibility::annotate(&mut d);
     Ok(d)
 }
 pub const FORMATS: &[(&str, &str, &str)] = &[

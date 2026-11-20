@@ -19,10 +19,15 @@ Open the folder that contains the executable in PowerShell and run it.
 .\rdocs2md.exe "book.epub" --extract-images --image-dir "book images" -o "book.md"
 .\rdocs2md.exe "statistics.xlsx" --sheets 2 --format html -o "sheet.html"
 .\rdocs2md.exe "document.doc" "data.ods" "presentation.odp" --out-dir "converted"
+.\rdocs2md.exe "reports" --recursive -o "converted" --json "ir" --image-dir "images"
+.\rdocs2md.exe "reports/**/*.pdf" --stdout
+.\rdocs2md.exe "report.pdf" --search "revenue" --pages 2-5 --limit 10
 .\rdocs2md.exe --help
 ```
 
-The default output is a `.md` file with the same name next to the input file. Both explicitly specified and default outputs can overwrite existing result files. A path collision between an input file and an output file is treated as an error. `--stdout` writes only the document and sends diagnostics to stderr. Batch mode records a result per input and returns exit code 1 if any of them fail. An invalid conversion option returns exit code 2.
+The default output is a `.md` file with the same name next to the input file. The CLI may replace an existing result file. A destination that resolves to an input file is rejected. With a single explicit file, `--stdout` writes its rendered content. With multiple inputs or a directory or wildcard scan, `--stdout` writes one JSON line per successful file with `input` and `content` fields. `content` holds the rendered text, including serialized JSON when `--format json` is selected. Diagnostics go to stderr. Batch mode continues when a file fails or its parser panics and returns exit code 1 if any input failed. Invalid command-line options return exit code 2.
+
+Pass files, directories and quoted patterns together. A directory scan discovers files with supported document extensions. A pattern matches filenames using `*`, `?`, or bracket sets such as `[ab]`. `**` matches across directory levels. `--recursive` scans subdirectories for a directory or a filename pattern such as `"reports/*.pdf"`. Discovered files are handled in sorted order within each input and duplicates are processed once. For batch output, repeated base names receive suffixes such as `report-2`.
 
 | Option | Behavior |
 |---|---|
@@ -30,12 +35,14 @@ The default output is a `.md` file with the same name next to the input file. Bo
 | `--mode hybrid` | Default mode. Keeps logical structure while using HTML for vertical text, RTL paragraphs, and similar cases |
 | `--mode layout` | HTML paragraphs that preserve line breaks and whitespace, supported character attributes, alignment, indentation, and HTML tables |
 | `--format md\|html\|json` | Renders the same document model in the specified format |
-| `--json FILE` | Saves the IR of the selected range to a separate file. Includes source references, formulas and caches, actual coordinates, and warnings |
+| `-o PATH`, `--out-dir DIR` | `-o` takes a filename for one explicit file and a directory for multiple inputs or a scan. `--out-dir` always takes a directory |
+| `--json PATH` | Saves a separate JSON IR file for one explicit file or one JSON IR file per input in the given directory for a batch |
 | `--pages`, `--slides`, `--sheets`, `--chapters`, `--range` | Aliases of the same range option. Comma-separated 1-based ranges, inclusive at both ends |
-| `--extract-images`, `--image-dir DIR` | Extracts supported raster images and writes result links relative to the output location |
+| `--extract-images`, `--image-dir DIR` | Extracts supported raster images and writes result links relative to the output location. Batch mode creates a separate image directory for each document |
+| `--search QUERY`, `--case-sensitive`, `--limit N` | Searches extracted text and writes JSON. Matching is case-insensitive by default, with 50 results per file unless a limit from 1 to 200 is specified |
 | `--list-formats`, `--version`, `--licenses` | Per-format support information (JSON), version, and built-in license notices |
 
-Ranges follow the order of the document model. PDF uses pages, presentations use slides, workbooks use sheets, and EPUB uses spine items. Flow-based documents use stored sections or explicit page breaks. In some Word documents, footnote and endnote groups are separate items as well. You can check the selectable units with MCP `inspect_document` or with `sections` in the JSON. Range selection is applied after the full parse.
+Ranges follow the order of the document model. PDF uses pages, presentations use slides, workbooks use sheets, and EPUB uses spine items. Flow-based documents use stored sections or explicit page breaks. In some Word documents, footnote and endnote groups are separate items as well. You can check the selectable units with MCP `inspect_document` or with `sections` in the JSON. The converter reads shared metadata and indexes and skips content outside the requested range for PDF, PPT/PPTX, XLS/XLSX, ODS/ODP, EPUB, and HWP 5. DOC, RTF and HWPX walk forward to find section boundaries and stop at the last requested section. DOCX and ODT resolve explicit breaks from the parsed body before selecting sections.
 
 ## MCP setup
 
@@ -52,7 +59,7 @@ Set `command` to the actual EXE path and `--root` to the local folder where read
 }
 ```
 
-To process local documents outside the root as well, set `args` in the MCP configuration as shown below and restart the server. `--allow-outside-root` applies to input documents, new output files (`output_path`), and image folders (`image_dir`). Relative paths are resolved against `--root`.
+To process local documents outside the root as well, set `args` in the MCP configuration as shown below and restart the server. `--allow-outside-root` applies to input documents and scans, output files and directories, and image folders. Relative paths are resolved against `--root`.
 
 ```json
 "args": ["mcp", "--root", "C:\\docu_path", "--allow-outside-root"]
@@ -64,10 +71,20 @@ To process local documents outside the root as well, set `args` in the MCP confi
 | `inspect_document` | `{"path":"presentation.pptx"}` |
 | `convert_document` | `{"path":"data.epub","format":"html","mode":"hybrid","extract_images":true,"output_path":"data.html"}` |
 | `extract_document_range` | `{"path":"report.pdf","range":"2-5,8","format":"json"}` |
+| `search_document` | `{"path":"report.pdf","query":"revenue","range":"2-5","limit":10}` |
+| `convert_documents` | `{"paths":["reports/*.pdf","data"],"recursive":true,"output_dir":"converted","format":"json"}` |
 
-Both conversion tools accept the optional `format` argument (`md`, `html`, or `json`). The default is `md`. When provided, `output_path` must name a new file with the corresponding `.md`, `.html`, or `.json` extension.
+All conversion tools accept `format` (`md`, `html`, or `json`, default `md`). `convert_document` and `extract_document_range` accept an optional `output_path` for a new file with the matching extension. `convert_documents` requires `output_dir` and preserves existing result files. The result reports the `succeeded` and `failed` counts and lists each processed file with its `output_path` or `error`. If the response reaches the inline size limit, `omitted_results` reports the number of entries left out. With `extract_images: true`, the tool writes per-document image folders next to the converted files, or under `image_dir` if supplied. The parent of a new directory must already exist.
+
+`search_document` and `--search` match literal text within a paragraph or table cell, including text divided across formatting runs. Each hit gives up to 60 characters on each side, the original 1-based section index, the source part and a 1-based path through blocks and table cells. Search also returns an Excel cell address or PDF block coordinates when available. `start_char` and `end_char` are zero-based character offsets within the paragraph or cell, with an exclusive end. `truncated` indicates additional matches beyond the limit. For CLI batch searches each line has `input` and `result` fields.
 
 The server handles line-delimited JSON-RPC 2.0, `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`. The negotiable versions are 2024-11-05, 2025-03-26, 2025-06-18, and 2025-11-25. The inline result text limit for MCP tools is 512 KiB. Large conversion results can be saved with `output_path` or retrieved in pieces with `range`. [MCP lifecycle specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+
+## Visibility and PDF image warnings
+
+The JSON IR keeps detected white, sub-3 pt, hidden, and out-of-bounds text and marks its runs with `visibility_flags`. Document warnings summarize detections. Bounds checks cover PDF page rectangles and top-level PPTX shape coordinates. Workbook sections mark hidden sheets and 1-based `hidden_rows` and `hidden_columns` ranges, and affected parsed cells carry `hidden_row` or `hidden_column` properties. Detection uses the formatting and geometry available to each parser. White text can be readable on a dark background.
+
+A PDF page with pictures and no extracted text is marked `ocr_needed_for_image_text`. Text visible inside those pictures requires OCR. Pages drawn with vector outlines can also contain visible text that text extraction cannot read.
 
 ## Agent skill
 
@@ -104,7 +121,7 @@ The shared model in `src/model.rs` stores documents, sections, paragraphs, text 
 
 | Item | Limit or behavior |
 |---|---|
-| Input file | Regular files up to 256 MiB. Format identified by signature and internal structure |
+| Input file | Regular files up to 2 GiB (2,147,483,648 bytes). Format identified by signature and internal structure |
 | ZIP | Up to 32,768 entries, 512 MiB each for the declared total uncompressed size and for cumulative reads, up to 64 MiB per entry read |
 | XML and RTF | XML tree depth and RTF group depth of 128, 1.5 million nodes per XML part. No external entity resolution and no macro execution |
 | Tables | A 250,000-cell threshold applies to XML tables, spreadsheet expansion, and recovered PDF grids. Repeated data has separate byte limits |
@@ -145,7 +162,7 @@ Real-document regression tests check known source phrases across **14 formats ×
 
 ## Dependencies and licenses
 
-There are 8 direct dependencies. Versions are pinned in `Cargo.lock`.
+There are 9 direct dependencies. Versions are pinned in `Cargo.lock`.
 
 | Crate | Purpose |
 |---|---|
@@ -153,6 +170,7 @@ There are 8 direct dependencies. Versions are pinned in `Cargo.lock`.
 | flate2 | Rust-backed DEFLATE, HWP streams, and decompression of embedded notices |
 | roxmltree | XML structure and namespace traversal |
 | cfb | Traversing sectors, directories, and streams of OLE compound files |
+| glob | Matching wildcard input paths |
 | encoding_rs | RTF code pages and character encodings |
 | lopdf | PDF objects, streams, resources, and font character mapping |
 | serde | Serialization of the shared document model |

@@ -33,6 +33,8 @@ rdocs2md "presentation.pptx" --slides 2-3 --mode layout --json "layout.json"
 rdocs2md "book.epub" --extract-images --image-dir "book images" -o "book.md"
 rdocs2md "statistics.xlsx" --sheets 2 --format html -o "sheet.html"
 rdocs2md "document.doc" "data.ods" "presentation.odp" --out-dir "converted"
+rdocs2md "reports/**/*.pdf" -o "converted" --json "ir" --image-dir "images"
+rdocs2md "report.pdf" --search "revenue" --pages 2-5 --limit 10
 rdocs2md --help
 ```
 
@@ -42,21 +44,23 @@ Default output is a `.md` file with the same name beside the input. Outputs are 
 
 | Option | Behavior |
 |---|---|
-| `-o`, `--output FILE` | Destination for a single input |
-| `--out-dir DIRECTORY` | Destination directory; required for multiple inputs (created if missing) |
-| `--stdout` | Write one document to stdout, diagnostics to stderr |
+| `-o`, `--output PATH` | File for one explicit input, directory for multiple inputs or a scan |
+| `--out-dir DIRECTORY` | Destination directory, created if missing |
+| `--stdout` | Write one document or JSON Lines (`input` and `content` per successful file). Diagnostics go to stderr |
+| `--recursive` | Include subdirectories when scanning directories or wildcard inputs |
 | `--format md\|html\|json` | Output format, default `md` (`markdown` is accepted) |
 | `--mode semantic\|hybrid\|layout` | Rendering mode, default `hybrid` |
 | `--pages RANGE` | 1-based inclusive range, e.g. `1-3,5` |
 | `--slides`, `--sheets`, `--chapters`, `--range` | Aliases of `--pages` |
-| `--json FILE` | Also save the selected document IR (source refs, formulas, coordinates, warnings) |
+| `--json PATH` | Also save the selected IR to a file for a single explicit input or per-file JSON in a directory for a batch |
 | `--extract-images` | Extract supported embedded raster images |
-| `--image-dir DIRECTORY` | Image destination; implies extraction |
+| `--image-dir DIRECTORY` | Image destination, with a subdirectory per document for a batch. Implies extraction |
+| `--search QUERY`, `--case-sensitive`, `--limit N` | Search extracted text and return JSON with snippets, section indexes, and available cell addresses or coordinates |
 | `--list-formats`, `--version`, `--licenses`, `--help` | Support matrix (JSON), version, license notices, usage |
 
 Exit codes: `0` success, `1` conversion or batch failure (each failed input is reported and the rest still run), `2` invalid option.
 
-Multiple inputs require `--out-dir`; `--stdout`, `-o`, and `--image-dir` accept only one input. `--` treats the remaining arguments as input files.
+A batch accepts files, directories and quoted glob patterns such as `"reports/**/*.pdf"`. Directory scans include supported extensions. `--` disables option and wildcard parsing for the remaining input paths.
 
 ## Choosing a mode
 
@@ -68,7 +72,7 @@ Reach for `layout` only when spacing and placement matter.
 
 ## Ranges
 
-Units follow the document model: PDF pages, presentation slides, workbook sheets, EPUB spine items, and stored sections or explicit page breaks for flow-based documents. Range selection happens after the full parse, so it reduces output size, not parse cost. Inspect the `sections` array in `--format json` or `--json FILE` output to see the selectable units.
+Units follow the document model: PDF pages, presentation slides, workbook sheets, EPUB spine items, and stored sections or explicit page breaks for flow-based documents. Indexed formats skip conversion of units outside the range. Flow formats read the content needed to locate section boundaries. Inspect `sections` in the JSON IR to see the selectable units.
 
 ## Images
 

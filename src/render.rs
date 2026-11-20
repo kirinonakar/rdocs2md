@@ -629,7 +629,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                     }
                 }
             }
-            if out.len() > FILE_LIMIT {
+            if out.len() > EXPANSION_LIMIT {
                 return Err("rendered document exceeds output limit".into());
             }
         }

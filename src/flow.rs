@@ -6,6 +6,7 @@ pub struct Rules {
     pub cell_styles: HashMap<String, Properties>,
     pub table_borders: HashMap<String, Properties>,
     pub table_cells: HashMap<String, Properties>,
+    pub table_display: HashMap<String, String>,
     pub hwpx_borders: HashMap<String, Properties>,
     pub table_bytes: std::rc::Rc<std::cell::Cell<usize>>,
     pub objects: HashMap<String, Run>,
@@ -33,6 +34,9 @@ fn apply_style(to: &mut Style, s: &Style) {
     if s.script.is_some() {
         to.script = s.script.clone()
     }
+    if s.hidden.is_some() {
+        to.hidden = s.hidden;
+    }
 }
 pub fn css_style(s: &str, st: &mut Style) {
     for d in s.split(';') {
@@ -49,6 +53,8 @@ pub fn css_style(s: &str, st: &mut Style) {
                 ("font-size", v) => st.size = Some(v.into()),
                 ("font-family", v) => st.font = Some(v.into()),
                 ("color", v) => st.color = formatting::color(v),
+                ("visibility", "hidden" | "collapse") => st.hidden = Some(true),
+                ("visibility", "visible") => st.hidden = Some(false),
                 _ => {}
             }
         }
@@ -70,6 +76,7 @@ pub fn style_props(n: N, st: &mut Style) {
             "color" | "textColor" => st.color = formatting::color(v),
             "text-position" if v.starts_with("super") => st.script = Some("sup".into()),
             "text-position" if v.starts_with("sub") => st.script = Some("sub".into()),
+            "display" if v == "none" => st.hidden = Some(true),
             _ => {}
         }
     }
@@ -84,6 +91,7 @@ pub fn style_props(n: N, st: &mut Style) {
             }
             "u" | "underline" => st.underline = on,
             "strike" => st.strike = on,
+            "vanish" | "specVanish" => st.hidden = Some(on),
             "vertAlign" => {
                 st.script = match v {
                     "superscript" => Some("sup".into()),
@@ -604,6 +612,10 @@ impl Flow<'_> {
         Ok(c)
     }
     pub fn table(&self, n: N) -> Result<Block> {
+        self.table_with_hidden_columns(n, &SectionRange::default())
+    }
+
+    pub fn table_with_hidden_columns(&self, n: N, hidden: &SectionRange) -> Result<Block> {
         let mut rows: Vec<Vec<Cell>> = Vec::new();
         let mut merges: HashMap<usize, (usize, usize)> = HashMap::new();
         let mut cells = 0usize;
@@ -626,7 +638,7 @@ impl Flow<'_> {
             }
             let mut line = Vec::new();
             let mut bytes = 0usize;
-            let mut column = 0;
+            let mut column = 0usize;
             let mut starts = Vec::new();
             for node in row.children().filter(|v| {
                 matches!(
@@ -634,12 +646,15 @@ impl Flow<'_> {
                     "td" | "th" | "tc" | "table-cell" | "covered-table-cell"
                 )
             }) {
-                if tag(node) == "covered-table-cell" {
-                    continue;
-                }
                 let repeat = attr(node, "number-columns-repeated")
                     .unwrap_or("1")
                     .parse::<usize>()?;
+                if tag(node) == "covered-table-cell" {
+                    if self.kind == "ods" {
+                        column = column.checked_add(repeat).ok_or("invalid table column")?;
+                    }
+                    continue;
+                }
                 let mut c = self.cell(node)?;
                 if self.kind == "hwpx"
                     && let Some(margins) = child(node, "cellMargin")
@@ -661,6 +676,9 @@ impl Flow<'_> {
                 }
                 if let Some(v) = attr(row, "visibility") {
                     c.properties.insert("row_visibility".into(), v.into());
+                }
+                if self.kind == "ods" && crate::sheets::ods_axis_hidden(row, n) {
+                    crate::sheets::hide_cell_axis(&mut c, "hidden_row");
                 }
                 if word.is_some() {
                     let col = column;
@@ -708,13 +726,23 @@ impl Flow<'_> {
                         repeat,
                     ));
                 }
+                let first = line.len();
                 line.extend(std::iter::repeat_n(c, repeat));
+                if self.kind == "ods" && repeat != 0 {
+                    let end = column.checked_add(repeat).ok_or("invalid table column")?;
+                    for (cell, col) in line[first..].iter_mut().zip(column + 1..=end) {
+                        if hidden.contains(col) {
+                            crate::sheets::hide_cell_axis(cell, "hidden_column");
+                        }
+                    }
+                    column = end;
+                }
             }
             cells = cells.saturating_add(line.len().max(1).saturating_mul(count));
             weight = weight.saturating_add(bytes.saturating_mul(count));
             if cells > CELL_LIMIT
                 || weight > PART_LIMIT
-                || self.rules.table_bytes.get().saturating_add(weight) > FILE_LIMIT
+                || self.rules.table_bytes.get().saturating_add(weight) > EXPANSION_LIMIT
             {
                 return Err("table row expansion limit exceeded".into());
             }

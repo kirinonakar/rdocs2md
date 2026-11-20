@@ -1,6 +1,11 @@
-use crate::{load, model::*, output, render::render, support};
+use crate::{
+    batch, load_range, model::*, output, recover_document, render::render, search, support,
+};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
+    fs,
     io::{self, BufRead, Write},
     path::{Component, Path, PathBuf},
 };
@@ -27,18 +32,34 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
             "Convert a 1-based page, slide, sheet, chapter or section range.",
         ),
         (
+            "search_document",
+            "Search extracted paragraph and cell text for a literal query. Return snippets and locations.",
+        ),
+        (
+            "convert_documents",
+            "Convert a batch of files, directories and wildcard patterns. Save each result and report per-file success or failure.",
+        ),
+        (
             "list_supported_formats",
             "List the implemented formats, features and limitations.",
         ),
     ] {
         let mut props = json!({});
         let mut required = vec![];
-        if name != "list_supported_formats" {
+        if name == "convert_documents" {
+            props["paths"] = json!({"type":"array","items":{"type":"string"},"minItems":1,"description":format!("Files, directories or wildcard patterns supporting *, ?, [], and **. {scope}")});
+            props["recursive"] = json!({"type":"boolean","description":"Scan subdirectories for directory and wildcard inputs."});
+            props["output_dir"] = json!({"type":"string","description":format!("Output directory. Its parent must exist if the directory is new. {scope}")});
+            required.extend(["paths", "output_dir"]);
+        } else if name != "list_supported_formats" {
             props["path"] =
                 json!({"type":"string","description":format!("Input document. {scope}")});
             required.push("path")
         }
-        if matches!(name, "convert_document" | "extract_document_range") {
+        if matches!(
+            name,
+            "convert_document" | "extract_document_range" | "convert_documents"
+        ) {
             props["format"] = json!({
                 "type":"string",
                 "enum":["md","html","json"],
@@ -50,7 +71,16 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
             props["image_dir"] = json!({"type":"string","description":format!("Image directory. Its parent must exist. {scope}")});
             props["range"] =
                 json!({"type":"string","description":"1-based inclusive ranges, e.g. 1-3,5."});
-            props["output_path"] = json!({"type":"string","description":format!("New filename with an extension that matches format. {scope}")});
+            if name != "convert_documents" {
+                props["output_path"] = json!({"type":"string","description":format!("New filename with an extension that matches format. {scope}")});
+            }
+        }
+        if name == "search_document" {
+            props["query"] = json!({"type":"string","minLength":1,"maxLength":1024});
+            props["case_sensitive"] = json!({"type":"boolean","default":false});
+            props["limit"] = json!({"type":"integer","minimum":1,"maximum":search::MAX_LIMIT,"default":search::DEFAULT_LIMIT});
+            props["range"] = json!({"type":"string","description":"Only search these 1-based sections, e.g. 1-3,5."});
+            required.push("query");
         }
         if name == "extract_document_range" {
             required.push("range")
@@ -64,16 +94,17 @@ struct Access {
     allow_outside_root: bool,
 }
 impl Access {
-    fn local(&self, path: &str, new: bool) -> Result<PathBuf> {
+    fn input_path(&self, path: &str) -> Result<PathBuf> {
         if path.is_empty()
-            || path.starts_with(['\\', '/'])
-                && path.get(..2).is_some_and(|p| matches!(p, "//" | "\\\\"))
+            || path
+                .as_bytes()
+                .get(..2)
+                .is_some_and(|p| p.iter().all(|c| matches!(c, b'\\' | b'/')))
             || path.contains('\0')
         {
             return Err("expected a local filesystem path".into());
         }
         let p = Path::new(path);
-        let full = self.root.join(p);
         #[cfg(windows)]
         for c in p.components() {
             if let Component::Normal(v) = c {
@@ -99,15 +130,25 @@ impl Access {
                 }
             }
         }
+        Ok(self.root.join(p))
+    }
+
+    fn scoped(&self, path: PathBuf) -> Result<PathBuf> {
+        if !self.allow_outside_root && !path.starts_with(&self.root) {
+            return Err("path is outside the MCP root".into());
+        }
+        Ok(path)
+    }
+
+    fn local(&self, path: &str, new: bool) -> Result<PathBuf> {
+        let full = self.input_path(path)?;
         let path = if new {
             let name = full.file_name().ok_or("expected output name")?;
             output::parent(&full).canonicalize()?.join(name)
         } else {
             full.canonicalize()?
         };
-        if !self.allow_outside_root && !path.starts_with(&self.root) {
-            return Err("path is outside the MCP root".into());
-        }
+        let path = self.scoped(path)?;
         if !self.allow_outside_root
             && new
             && path.exists()
@@ -117,60 +158,194 @@ impl Access {
         }
         Ok(path)
     }
+
+    fn directory(&self, path: &str) -> Result<PathBuf> {
+        let path = self.local(path, true)?;
+        fs::create_dir_all(&path)?;
+        self.scoped(path.canonicalize()?)
+    }
 }
+
+struct Conversion<'a> {
+    format: &'a str,
+    mode: &'a str,
+    range: Option<&'a str>,
+}
+
+impl Conversion<'_> {
+    fn render(
+        &self,
+        input: &Path,
+        out: Option<&Path>,
+        dir: Option<&Path>,
+        root: &Path,
+    ) -> Result<(String, Vec<String>)> {
+        let d = load_range(input, dir.is_some(), self.range)?;
+        let links = if let Some(dir) = dir {
+            output::extract(&d, dir, out.map(output::parent).unwrap_or(root))?
+        } else {
+            Properties::new()
+        };
+        let value = render(&d, self.format, self.mode, &links)?;
+        Ok((value, d.warnings))
+    }
+
+    fn save(&self, input: &Path, out: &Path, dir: Option<&Path>, root: &Path) -> Result<Value> {
+        if out.exists()
+            || out
+                .extension()
+                .is_none_or(|v| !v.eq_ignore_ascii_case(self.format))
+        {
+            return Err(format!("output_path must be a new .{} file", self.format).into());
+        }
+        let (value, warnings) = self.render(input, Some(out), dir, root)?;
+        output::save(out, value.as_bytes(), true)?;
+        Ok(json!({"output_path":out,"bytes":value.len(),"warnings":warnings}))
+    }
+}
+
+#[derive(Default, Serialize)]
+struct BatchReport {
+    succeeded: usize,
+    failed: usize,
+    omitted_results: usize,
+    results: Vec<Value>,
+    #[serde(skip)]
+    bytes: usize,
+}
+
+impl BatchReport {
+    fn push(&mut self, entry: Value) {
+        if entry.get("error").is_some() {
+            self.failed += 1;
+        } else {
+            self.succeeded += 1;
+        }
+        // Leave room for summary fields and JSON delimiters.
+        let bytes = entry.to_string().len() + 1;
+        if self.bytes + bytes <= INLINE - 256 {
+            self.bytes += bytes;
+            self.results.push(entry);
+        } else {
+            self.omitted_results += 1;
+        }
+    }
+}
+
+fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> Result<String> {
+    let paths = args["paths"].as_array().ok_or("missing paths")?;
+    let recursive = args["recursive"].as_bool().unwrap_or(false);
+    let mut inputs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut report = BatchReport::default();
+    for path in paths.iter().filter_map(Value::as_str) {
+        let expanded = access.input_path(path).and_then(|spec| {
+            batch::expand(&spec, recursive, false, |p| {
+                access.scoped(p.canonicalize()?)
+            })
+        });
+        match expanded {
+            Ok(found) => {
+                inputs.extend(found.files.into_iter().filter(|p| seen.insert(p.clone())));
+                for (path, error) in found.errors {
+                    report.push(json!({"input":path,"error":error}));
+                }
+            }
+            Err(e) => report.push(json!({"input":path,"error":e.to_string()})),
+        }
+    }
+    if !inputs.is_empty() {
+        let out_dir = access.directory(args["output_dir"].as_str().ok_or("missing output_dir")?)?;
+        let image_parent = if let Some(dir) = args["image_dir"].as_str() {
+            Some(access.directory(dir)?)
+        } else if args["extract_images"].as_bool().unwrap_or(false) {
+            Some(out_dir.clone())
+        } else {
+            None
+        };
+        let mut stems = batch::OutputNames::default();
+        for input in &inputs {
+            let stem = stems.next(input);
+            let out = out_dir.join(batch::output_name(&stem, conversion.format));
+            let result = recover_document(|| {
+                let dir = image_parent
+                    .as_ref()
+                    .map(|parent| {
+                        let mut name = stem.clone();
+                        if args["image_dir"].is_null() {
+                            name.push("_images");
+                        }
+                        let path = parent.join(name);
+                        if path.exists() {
+                            access.scoped(path.canonicalize()?)
+                        } else {
+                            Ok(path)
+                        }
+                    })
+                    .transpose()?;
+                let mut result = conversion.save(input, &out, dir.as_deref(), &access.root)?;
+                result["input"] = json!(input);
+                Ok(result)
+            });
+            match result {
+                Ok(result) => report.push(result),
+                Err(e) => report.push(json!({"input":input,"error":e.to_string()})),
+            }
+        }
+    }
+    Ok(serde_json::to_string(&report)?)
+}
+
 fn call(access: &Access, name: &str, args: &Value) -> Result<String> {
     if name == "list_supported_formats" {
         return Ok(serde_json::to_string(&support())?);
     }
     let text = |k: &str| args.get(k).and_then(Value::as_str);
+    let conversion = Conversion {
+        format: text("format").unwrap_or("md"),
+        mode: text("mode").unwrap_or("hybrid"),
+        range: text("range"),
+    };
+    if name == "convert_documents" {
+        return convert_batch(access, args, &conversion);
+    }
     let input = access.local(text("path").ok_or("missing path")?, false)?;
-    let mode = text("mode").unwrap_or("hybrid");
-    let images =
-        args["extract_images"].as_bool().unwrap_or(false) || args.get("image_dir").is_some();
-    let mut d = load(&input, images)?;
+    if name == "search_document" {
+        let query = search::Query::new(
+            text("query").ok_or("missing query")?,
+            args["case_sensitive"].as_bool().unwrap_or(false),
+            args["limit"]
+                .as_u64()
+                .map_or(search::DEFAULT_LIMIT, |n| n as usize),
+        )?;
+        let d = load_range(&input, false, conversion.range)?;
+        return Ok(serde_json::to_string(&query.find(&d))?);
+    }
     if name == "inspect_document" {
+        let d = load_range(&input, false, None)?;
         let sections:Vec<_>=d.sections.iter().enumerate().map(|(i,s)|json!({"index":i+1,"kind":s.kind,"title":s.title,"source":s.source,"blocks":s.blocks.len(),"properties":s.properties})).collect();
         return Ok(serde_json::to_string(
             &json!({"format":d.format,"metadata":d.metadata,"sections":sections,"warnings":d.warnings}),
         )?);
     }
-    if let Some(r) = text("range") {
-        d.select(r)?
-    }
-    let format = text("format").unwrap_or("md");
     let out = text("output_path")
         .map(|p| access.local(p, true))
         .transpose()?;
-    if let Some(p) = &out
-        && (p.exists()
-            || p.extension()
-                .is_none_or(|v| !v.eq_ignore_ascii_case(format)))
-    {
-        return Err(format!("output_path must be a new .{format} file").into());
-    }
-    let mut links = Properties::new();
+    let images = args["extract_images"].as_bool().unwrap_or(false) || text("image_dir").is_some();
+    let mut dir = None;
     if images {
         let default_dir = format!(
             "{}_images",
             input.file_stem().unwrap_or_default().to_string_lossy()
         );
-        let dir = access.local(text("image_dir").unwrap_or(&default_dir), true)?;
-        links = output::extract(
-            &d,
-            &dir,
-            out.as_ref()
-                .map(|p| output::parent(p))
-                .unwrap_or(&access.root),
-        )?;
+        dir = Some(access.local(text("image_dir").unwrap_or(&default_dir), true)?);
     }
-    let value = render(&d, format, mode, &links)?;
-    if let Some(p) = out {
-        output::save(&p, value.as_bytes(), true)?;
-        Ok(serde_json::to_string(
-            &json!({"output_path":p,"bytes":value.len(),"warnings":d.warnings}),
-        )?)
+    if let Some(out) = out {
+        let summary = conversion.save(&input, &out, dir.as_deref(), &access.root)?;
+        Ok(serde_json::to_string(&summary)?)
     } else {
-        Ok(value)
+        let (text, _) = conversion.render(&input, None, dir.as_deref(), &access.root)?;
+        Ok(text)
     }
 }
 fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
@@ -229,6 +404,13 @@ fn dispatch(access: &Access, req: Value, phase: &mut u8, defs: &[Value]) -> Opti
                     spec.is_null()
                         || match spec["type"].as_str() {
                             Some("boolean") => !v.is_boolean(),
+                            Some("integer") => v.as_u64().is_none_or(|n| {
+                                n < spec["minimum"].as_u64().unwrap_or(0)
+                                    || n > spec["maximum"].as_u64().unwrap_or(u64::MAX)
+                            }),
+                            Some("array") => v.as_array().is_none_or(|items| {
+                                items.is_empty() || items.iter().any(|v| !v.is_string())
+                            }),
                             _ => !v.is_string(),
                         }
                         || spec["enum"].as_array().is_some_and(|a| !a.contains(v))
@@ -240,16 +422,19 @@ fn dispatch(access: &Access, req: Value, phase: &mut u8, defs: &[Value]) -> Opti
                     "Arguments do not match the tool input schema",
                 ));
             }
-            let response =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(access, name, args)));
+            let response = recover_document(|| call(access, name, args));
             let (s, bad) = match response {
-                Ok(Ok(s)) if s.len() <= INLINE => (s, false),
-                Ok(Ok(_)) => (
-                    "Result exceeds 512 KiB. Use a smaller range or save with output_path.".into(),
+                Ok(s) if s.len() <= INLINE => (s, false),
+                Ok(_) => (
+                    if name == "search_document" {
+                        "Result exceeds 512 KiB. Use a smaller range or search limit."
+                    } else {
+                        "Result exceeds 512 KiB. Use a smaller range or save with output_path."
+                    }
+                    .into(),
                     true,
                 ),
-                Ok(Err(e)) => (e.to_string(), true),
-                Err(_) => ("Document parser failed".into(), true),
+                Err(e) => (e.to_string(), true),
             };
             json!({"content":[{"type":"text","text":s}],"isError":bad})
         }

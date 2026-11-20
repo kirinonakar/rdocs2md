@@ -64,7 +64,7 @@ fn add_css(css: &str, r: &mut Rules) {
         }
     }
 }
-pub fn parse(pkg: &mut Package) -> Result<Document> {
+pub fn parse(pkg: &mut Package, range: Option<&SectionRange>) -> Result<Document> {
     if pkg.has("META-INF/encryption.xml") {
         return Err("encrypted/DRM EPUB resources are unsupported".into());
     }
@@ -135,10 +135,12 @@ pub fn parse(pkg: &mut Package) -> Result<Document> {
             .insert("toc".into(), serde_json::to_string(&toc)?);
     }
     let mut css_cache = HashMap::new();
-    for item in spine.children().filter(|n| tag(*n) == "itemref") {
+    let chapters: Vec<_> = spine.children().filter(|n| tag(*n) == "itemref").collect();
+    for i in section_indices(range, chapters.len())? {
+        let item = chapters[i];
         let id = attr(item, "idref").ok_or("spine idref missing")?;
         let (p, kind) = items.get(id).ok_or("spine item missing from manifest")?;
-        let mut sec = Section::new("chapter", p);
+        let mut sec = Section::new("chapter", p).indexed(i);
         if attr(item, "linear") == Some("no") {
             sec.properties.insert("linear".into(), "no".into());
         }
@@ -185,16 +187,17 @@ pub fn parse(pkg: &mut Package) -> Result<Document> {
 fn link_chapters(doc: &mut Document) {
     let mut targets = HashMap::new();
     for (i, s) in doc.sections.iter().enumerate() {
+        let chapter = s.index.unwrap_or(i + 1);
         targets
             .entry(s.source.clone())
-            .or_insert_with(|| format!("chapter-{}", i + 1));
+            .or_insert_with(|| format!("chapter-{chapter}"));
         for (j, b) in s.blocks.iter().enumerate() {
             if let Block::Paragraph { properties, .. } = b
                 && let Some(id) = properties.get("id")
             {
                 targets
                     .entry(format!("{}#{id}", s.source))
-                    .or_insert_with(|| format!("chapter-{}-item-{}", i + 1, j + 1));
+                    .or_insert_with(|| format!("chapter-{chapter}-item-{}", j + 1));
             }
         }
     }

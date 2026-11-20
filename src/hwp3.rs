@@ -37,9 +37,9 @@ pub fn parse(data: &[u8]) -> Result<Document> {
     let body = if info[124] != 0 {
         let mut decoded = Vec::new();
         DeflateDecoder::new(&data[body_start..])
-            .take(FILE_LIMIT as u64 + 1)
+            .take(EXPANSION_LIMIT as u64 + 1)
             .read_to_end(&mut decoded)?;
-        if decoded.len() > FILE_LIMIT {
+        if decoded.len() > EXPANSION_LIMIT {
             return Err("HWP 3.0 expansion limit exceeded".into());
         }
         Cow::Owned(decoded)

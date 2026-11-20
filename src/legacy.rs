@@ -1,5 +1,6 @@
 use crate::{formatting, model::*};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     io::{Cursor, Read},
 };
@@ -39,7 +40,7 @@ fn stream(ole: &mut Ole, name: &str) -> Result<Vec<u8>> {
     st.take(PART_LIMIT as u64 + 1).read_to_end(&mut v)?;
     Ok(v)
 }
-pub fn parse(data: &[u8], images: bool) -> Result<Document> {
+pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<Document> {
     // The CFB reader validates allocation chains even in compatibility mode.
     // Some PowerPoint producers leave directory name terminators uninitialized.
     let mut ole = cfb::CompoundFile::open(Cursor::new(data))?;
@@ -47,13 +48,13 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
         return Err("encrypted Office package is unsupported".into());
     }
     if ole.is_stream("/FileHeader") {
-        hwp(&mut ole, images)
+        hwp(&mut ole, images, range)
     } else if ole.is_stream("/WordDocument") {
-        word(&mut ole)
+        word(&mut ole, range)
     } else if ole.is_stream("/PowerPoint Document") {
-        ppt(&mut ole)
+        ppt(&mut ole, range)
     } else if ole.is_stream("/Workbook") {
-        crate::xls::parse(&stream(&mut ole, "/Workbook")?)
+        crate::xls::parse(&stream(&mut ole, "/Workbook")?, range)
     } else {
         Err("unsupported OLE document streams".into())
     }
@@ -605,7 +606,7 @@ fn hwp_images(
         };
         let bytes = hwp_stream(ole, &path, packed)?;
         total += bytes.len();
-        if total > FILE_LIMIT {
+        if total > EXPANSION_LIMIT {
             return Err("HWP expansion limit exceeded".into());
         }
         if image_ext(&bytes).is_some() {
@@ -615,7 +616,7 @@ fn hwp_images(
     Ok(())
 }
 
-fn hwp(ole: &mut Ole, images: bool) -> Result<Document> {
+fn hwp(ole: &mut Ole, images: bool, range: Option<&SectionRange>) -> Result<Document> {
     let head = stream(ole, "/FileHeader")?;
     if !head.starts_with(b"HWP Document File") || head.get(35) != Some(&5) {
         return Err("expected HWP version 5".into());
@@ -646,13 +647,14 @@ fn hwp(ole: &mut Ole, images: bool) -> Result<Document> {
     };
     let mut total = info.len();
     let styles = HwpFormatting::read(&info);
-    for (_, path) in files {
-        let raw = hwp_stream(ole, &path, compressed)?;
+    for i in section_indices(range, files.len())? {
+        let (_, path) = &files[i];
+        let raw = hwp_stream(ole, path, compressed)?;
         total += raw.len();
-        if total > FILE_LIMIT {
+        if total > EXPANSION_LIMIT {
             return Err("HWP expansion limit exceeded".into());
         }
-        let mut sec = Section::new("section", &path);
+        let mut sec = Section::new("section", path).indexed(i);
         let mut remaining = raw.as_slice();
         let mut records = std::iter::from_fn(|| {
             if remaining.is_empty() {
@@ -671,7 +673,7 @@ fn hwp(ole: &mut Ole, images: bool) -> Result<Document> {
     }
     Ok(doc)
 }
-fn word(ole: &mut Ole) -> Result<Document> {
+fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     let data = stream(ole, "/WordDocument")?;
     if u16le(&data, 0)? != 0xa5ec || u16le(&data, 2)? < 0xc1 {
         return Err("expected Word 97–2003 FIB".into());
@@ -713,7 +715,13 @@ fn word(ole: &mut Ole) -> Result<Document> {
         return Err("malformed Word piece table".into());
     }
     let pieces = (len - 4) / 12;
-    let mut text = String::new();
+    let mut doc = Document::new("doc");
+    let mut sec = Section::new("section", "WordDocument");
+    let mut line = String::new();
+    let mut fields = Vec::new();
+    let mut index = 1;
+    let mut selected = range.is_none_or(|r| r.contains(index));
+    let mut text_bytes = 0;
     for n in 0..pieces {
         let cp = u32le(plc, n * 4)? as usize;
         let end = (u32le(plc, (n + 1) * 4)? as usize).min(main);
@@ -724,56 +732,66 @@ fn word(ole: &mut Ole) -> Result<Document> {
         let fc = u32le(plc, (pieces + 1) * 4 + n * 8 + 2)?;
         let compressed = fc & 0x40000000 != 0;
         let pos = (fc & 0x3fffffff) as usize;
-        if compressed {
+        let text = if compressed {
             let b = data
                 .get(pos / 2..pos / 2 + chars)
                 .ok_or("Word piece out of bounds")?;
-            text.push_str(&encoding_rs::WINDOWS_1252.decode(b).0)
+            encoding_rs::WINDOWS_1252.decode(b).0
         } else {
-            text.push_str(&utf16(
+            Cow::Owned(utf16(
                 data.get(pos..pos + 2 * chars)
                     .ok_or("Word Unicode piece out of bounds")?,
             )?)
-        }
-        if text.len() > PART_LIMIT {
+        };
+        text_bytes += text.len();
+        if text_bytes > PART_LIMIT {
             return Err("Word text exceeds limit".into());
         }
-    }
-    let mut doc = Document::new("doc");
-    let mut sec = Section::new("section", "WordDocument");
-    let mut line = String::new();
-    let mut fields = Vec::new();
-    for c in text.chars() {
-        match c {
-            '\u{13}' => {
-                if fields.len() > 64 {
-                    return Err("excessive Word field depth".into());
+        for c in text.chars() {
+            match c {
+                '\u{13}' => {
+                    if fields.len() > 64 {
+                        return Err("excessive Word field depth".into());
+                    }
+                    fields.push(false)
                 }
-                fields.push(false)
-            }
-            '\u{14}' => {
-                if let Some(s) = fields.last_mut() {
-                    *s = true
+                '\u{14}' => {
+                    if let Some(s) = fields.last_mut() {
+                        *s = true
+                    }
                 }
+                '\u{15}' => {
+                    fields.pop();
+                }
+                _ if fields.contains(&false) => {}
+                '\u{c}' => {
+                    if selected {
+                        sec.paragraph(std::mem::take(&mut line));
+                        doc.sections.push(sec.indexed(index - 1));
+                        sec = Section::new("section", "WordDocument");
+                    }
+                    if range.is_some_and(|r| r.ends_at(index)) {
+                        return Ok(doc);
+                    }
+                    index += 1;
+                    selected = range.is_none_or(|r| r.contains(index));
+                }
+                _ if !selected => {}
+                '\r' | '\u{7}' => sec.paragraph(std::mem::take(&mut line)),
+                '\u{b}' => line.push('\n'),
+                '\t' => line.push('\t'),
+                _ if !c.is_control() => line.push(c),
+                _ => {}
             }
-            '\u{15}' => {
-                fields.pop();
-            }
-            _ if fields.contains(&false) => {}
-            '\r' | '\u{7}' => sec.paragraph(std::mem::take(&mut line)),
-            '\u{c}' => {
-                sec.paragraph(std::mem::take(&mut line));
-                doc.sections.push(sec);
-                sec = Section::new("section", "WordDocument")
-            }
-            '\u{b}' => line.push('\n'),
-            '\t' => line.push('\t'),
-            _ if !c.is_control() => line.push(c),
-            _ => {}
         }
     }
-    sec.paragraph(line);
-    doc.sections.push(sec);
+    if let Some(range) = range {
+        range.validate(index)?;
+    }
+    if selected {
+        sec.paragraph(line);
+        doc.sections.push(sec.indexed(index - 1));
+    }
     Ok(doc)
 }
 struct Record<'a> {
@@ -834,7 +852,7 @@ fn shape_text(b: &[u8], sec: &mut Section, depth: usize) -> Result<()> {
     }
     Ok(())
 }
-fn ppt(ole: &mut Ole) -> Result<Document> {
+fn ppt(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     let data = stream(ole, "/PowerPoint Document")?;
     let user = stream(ole, "/Current User")?;
     let cu = record(&user, 0)?;
@@ -895,6 +913,7 @@ fn ppt(ole: &mut Ole) -> Result<Document> {
                     let id = u32le(item.body, 0)?;
                     slides.push((id, Section::new("slide", format!("persist:{id}"))))
                 } else if matches!(item.kind, 4000 | 4008)
+                    && range.is_none_or(|r| r.contains(slides.len()))
                     && let Some((_, s)) = slides.last_mut()
                 {
                     ppt_text(&item, s)?
@@ -902,8 +921,10 @@ fn ppt(ole: &mut Ole) -> Result<Document> {
             }
         }
     }
-    for (id, mut sec) in slides {
-        if let Some(p) = ids.get(&id) {
+    for i in section_indices(range, slides.len())? {
+        let (id, sec) = &mut slides[i];
+        let mut sec = std::mem::take(sec).indexed(i);
+        if let Some(p) = ids.get(id) {
             let r = record(&data, *p)?;
             let mut shape = Section::default();
             shape_text(r.body, &mut shape, 0)?;

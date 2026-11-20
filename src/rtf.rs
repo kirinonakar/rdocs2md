@@ -51,7 +51,7 @@ fn encoding(cp: u16) -> &'static Encoding {
         n => Encoding::for_label(format!("windows-{n}").as_bytes()).unwrap_or(WINDOWS_1252),
     }
 }
-struct Parser {
+struct Parser<'a> {
     doc: Document,
     section: Section,
     state: State,
@@ -70,15 +70,32 @@ struct Parser {
     picture: Vec<u8>,
     nibble: Option<u8>,
     images: bool,
+    range: Option<&'a SectionRange>,
+    page: usize,
     inst: String,
 }
-impl Parser {
+impl Parser<'_> {
+    fn selected(&self) -> bool {
+        self.range.is_none_or(|range| range.contains(self.page))
+    }
+
+    fn finish_page(&mut self) {
+        self.table();
+        self.paragraph();
+        let next = Section::new("page", format!("page {}", self.page + 1));
+        let finished = std::mem::replace(&mut self.section, next);
+        if self.selected() {
+            self.doc.sections.push(finished.indexed(self.page - 1));
+        }
+        self.page += 1;
+    }
+
     fn emit(&mut self, t: &str) {
         if self.state.dest == Dest::Instruction {
             if self.inst.len() < 65536 {
                 self.inst.push_str(t)
             }
-        } else if self.state.dest == Dest::Body {
+        } else if self.state.dest == Dest::Body && self.selected() {
             push_run(
                 &mut self.runs,
                 Run {
@@ -107,7 +124,8 @@ impl Parser {
             return Ok(());
         }
         match self.state.dest {
-            Dest::Body | Dest::Instruction => self.buf.push(b),
+            Dest::Body if self.selected() => self.buf.push(b),
+            Dest::Instruction => self.buf.push(b),
             Dest::Font if b == b';' => {
                 let name = encoding(self.state.cp)
                     .decode_without_bom_handling(&self.font_name)
@@ -128,7 +146,7 @@ impl Parser {
                         .map(|[r, g, b]| format!("#{r:02x}{g:02x}{b:02x}")),
                 );
             }
-            Dest::Picture if self.images && !b.is_ascii_whitespace() => {
+            Dest::Picture if self.images && self.selected() && !b.is_ascii_whitespace() => {
                 let hex = (b as char).to_digit(16).ok_or("invalid RTF picture hex")? as u8;
                 if let Some(n) = self.nibble.take() {
                     if self.picture.len() >= PART_LIMIT {
@@ -183,7 +201,7 @@ impl Parser {
                 return Err("incomplete RTF picture".into());
             }
             let key = format!("rtf/picture-{}", self.doc.assets.len() + 1);
-            if self.images && image_ext(&self.picture).is_some() {
+            if self.images && self.selected() && image_ext(&self.picture).is_some() {
                 self.doc
                     .assets
                     .insert(key.clone(), std::mem::take(&mut self.picture));
@@ -299,6 +317,7 @@ impl Parser {
             }
             "nosupersub" => self.state.style.script = None,
             "fs" => self.state.style.size = Some(format!("{}pt", n as f64 / 2.0)),
+            "v" => self.state.style.hidden = Some(n != 0),
             "plain" => self.state.style = Style::default(),
             "ls" | "pn" => self.state.list = true,
             "ilvl" => self.state.depth = n.clamp(0, 32) as usize,
@@ -332,15 +351,10 @@ impl Parser {
                 self.paragraph()
             }
             "page" | "sect" => {
-                self.table();
-                self.paragraph();
-                let next = Section::new("page", format!("page {}", self.doc.sections.len() + 2));
-                self.doc
-                    .sections
-                    .push(std::mem::replace(&mut self.section, next));
+                self.finish_page();
             }
             "trowd" => self.paragraph(),
-            "cell" => self.row.push(Cell {
+            "cell" if self.selected() => self.row.push(Cell {
                 runs: std::mem::take(&mut self.runs),
                 ..Cell::default()
             }),
@@ -363,7 +377,7 @@ impl Parser {
         Ok(())
     }
 }
-pub fn parse(data: &[u8], images: bool) -> Result<Document> {
+pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<Document> {
     let mut p = Parser {
         doc: Document::new("rtf"),
         section: Section::new("page", "page 1"),
@@ -383,6 +397,8 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
         picture: vec![],
         nibble: None,
         images,
+        range,
+        page: 1,
         inst: String::new(),
     };
     let mut i = 0;
@@ -441,7 +457,7 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
                         if size > PART_LIMIT || size > data.len() - i {
                             return Err("invalid RTF binary length".into());
                         }
-                        if p.images && p.state.dest == Dest::Picture {
+                        if p.images && p.selected() && p.state.dest == Dest::Picture {
                             if p.picture.len() + size > PART_LIMIT {
                                 return Err("RTF picture too large".into());
                             }
@@ -450,6 +466,9 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
                         i += size
                     } else {
                         p.word(k, arg)?
+                    }
+                    if range.is_some_and(|r| r.ends_at(p.page - 1)) {
+                        return Ok(p.doc);
                     }
                 } else {
                     match ch {
@@ -482,8 +501,9 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
     if !p.stack.is_empty() {
         return Err("unclosed RTF group".into());
     }
-    p.table();
-    p.paragraph();
-    p.doc.sections.push(p.section);
+    if let Some(range) = range {
+        range.validate(p.page)?;
+    }
+    p.finish_page();
     Ok(p.doc)
 }

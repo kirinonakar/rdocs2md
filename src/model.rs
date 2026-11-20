@@ -4,9 +4,74 @@ use std::collections::BTreeMap;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub type Properties = BTreeMap<String, String>;
 pub const MIB: usize = 1024 * 1024;
-pub const FILE_LIMIT: usize = 256 * MIB;
+pub const FILE_LIMIT: usize = 2 * 1024 * MIB;
+pub(crate) const EXPANSION_LIMIT: usize = 256 * MIB;
 pub const PART_LIMIT: usize = 64 * MIB;
 pub const CELL_LIMIT: usize = 250_000;
+
+#[derive(Default)]
+pub(crate) struct SectionRange(pub Vec<(usize, usize)>);
+
+impl SectionRange {
+    pub fn parse(range: &str) -> Result<Self> {
+        let mut spans = Vec::new();
+        for part in range.split(',') {
+            let part = part.trim();
+            let (start, end) = part.split_once('-').unwrap_or((part, part));
+            let (start, end) = (start.parse::<usize>()?, end.parse::<usize>()?);
+            if start == 0 || start > end {
+                return Err(format!("invalid section range {part}").into());
+            }
+            spans.push((start, end));
+        }
+        Ok(Self::from_spans(spans))
+    }
+
+    pub fn from_spans(mut spans: Vec<(usize, usize)>) -> Self {
+        spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in spans {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1.saturating_add(1)
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        Self(merged)
+    }
+
+    pub fn contains(&self, index: usize) -> bool {
+        self.0
+            .get(self.0.partition_point(|&(_, end)| end < index))
+            .is_some_and(|&(start, _)| start <= index)
+    }
+
+    pub fn ends_at(&self, index: usize) -> bool {
+        self.0.last().is_some_and(|&(_, end)| end == index)
+    }
+
+    pub fn validate(&self, count: usize) -> Result<()> {
+        if let Some(&(_, end)) = self.0.last().filter(|&&(_, end)| end > count) {
+            return Err(format!(
+                "invalid section range ending at {end} (document has {count} sections)"
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn section_indices(
+    range: Option<&SectionRange>,
+    count: usize,
+) -> Result<impl Iterator<Item = usize>> {
+    if let Some(range) = range {
+        range.validate(count)?;
+    }
+    Ok((0..count).filter(move |&i| range.is_none_or(|r| r.contains(i + 1))))
+}
 
 #[derive(Default, Serialize)]
 pub struct Document {
@@ -32,92 +97,29 @@ impl Document {
     /// Split only at recorded page breaks. Flow documents otherwise retain their logical sections.
     pub fn explicit_pages(&mut self) {
         let mut pages = Vec::new();
-        for mut s in std::mem::take(&mut self.sections) {
-            let blocks = std::mem::take(&mut s.blocks);
-            for b in blocks {
-                let Block::Paragraph {
-                    heading,
-                    list,
-                    runs,
-                    properties,
-                } = b
-                else {
-                    s.blocks.push(b);
-                    continue;
-                };
-                if properties.get("break-before").is_some_and(|v| v == "page")
-                    && !s.blocks.is_empty()
-                {
-                    let next = Section::new("page", &s.source);
-                    s.kind = "page".into();
-                    pages.push(std::mem::replace(&mut s, next));
-                }
-                if !runs.iter().any(|r| r.page_break) {
-                    s.blocks.push(Block::Paragraph {
-                        heading,
-                        list,
-                        runs,
-                        properties,
-                    });
-                    continue;
-                }
-                let mut segment = Vec::new();
-                for r in runs {
-                    if r.page_break {
-                        if !segment.is_empty() {
-                            s.blocks.push(Block::Paragraph {
-                                heading,
-                                list: list.clone(),
-                                runs: std::mem::take(&mut segment),
-                                properties: properties.clone(),
-                            })
-                        }
-                        let next = Section::new("page", &s.source);
-                        s.kind = "page".into();
-                        pages.push(std::mem::replace(&mut s, next));
-                    } else {
-                        segment.push(r)
-                    }
-                }
-                if !segment.is_empty() {
-                    s.blocks.push(Block::Paragraph {
-                        heading,
-                        list,
-                        runs: segment,
-                        properties,
-                    })
-                }
-            }
-            pages.push(s)
+        for section in std::mem::take(&mut self.sections) {
+            section.append_explicit_pages(&mut pages);
         }
         self.sections = pages;
     }
     pub fn select(&mut self, range: &str) -> Result<()> {
+        self.retain_sections(Some(&SectionRange::parse(range)?))
+    }
+
+    pub(crate) fn retain_sections(&mut self, range: Option<&SectionRange>) -> Result<()> {
+        let Some(range) = range else { return Ok(()) };
+        range.validate(self.sections.len())?;
         let mut slide_number = 0;
-        for section in &mut self.sections {
+        let mut index = 0;
+        self.sections.retain_mut(|section| {
+            index += 1;
+            section.index.get_or_insert(index);
             if section.kind == "slide" {
                 slide_number += 1;
                 section.slide_number.get_or_insert(slide_number);
             }
-        }
-        let mut keep = vec![false; self.sections.len()];
-        for part in range.split(',') {
-            let (a, b) = part
-                .trim()
-                .split_once('-')
-                .unwrap_or((part.trim(), part.trim()));
-            let (a, b) = (a.parse::<usize>()?, b.parse::<usize>()?);
-            if a == 0 || a > b || b > keep.len() {
-                return Err(format!(
-                    "invalid section range {part} (document has {} sections)",
-                    keep.len()
-                )
-                .into());
-            }
-            keep[a - 1..b].fill(true);
-        }
-        let mut flags = keep.into_iter();
-        self.sections.retain(|_| flags.next().unwrap_or(false));
+            range.contains(index)
+        });
         Ok(())
     }
 }
@@ -125,6 +127,8 @@ impl Document {
 pub struct Section {
     pub kind: String,
     pub source: String,
+    #[serde(skip)]
+    pub index: Option<usize>,
     #[serde(skip)]
     pub slide_number: Option<usize>,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -140,6 +144,71 @@ impl Section {
             source: source.into(),
             ..Self::default()
         }
+    }
+    pub(crate) fn append_explicit_pages(mut self, pages: &mut Vec<Section>) {
+        let blocks = std::mem::take(&mut self.blocks);
+        for b in blocks {
+            let Block::Paragraph {
+                heading,
+                list,
+                runs,
+                properties,
+            } = b
+            else {
+                self.blocks.push(b);
+                continue;
+            };
+            if properties.get("break-before").is_some_and(|v| v == "page")
+                && !self.blocks.is_empty()
+            {
+                let next = Section::new("page", &self.source);
+                self.kind = "page".into();
+                pages.push(std::mem::replace(&mut self, next));
+            }
+            if !runs.iter().any(|r| r.page_break) {
+                self.blocks.push(Block::Paragraph {
+                    heading,
+                    list,
+                    runs,
+                    properties,
+                });
+                continue;
+            }
+            let mut segment = Vec::new();
+            for r in runs {
+                if r.page_break {
+                    if !segment.is_empty() {
+                        self.blocks.push(Block::Paragraph {
+                            heading,
+                            list: list.clone(),
+                            runs: std::mem::take(&mut segment),
+                            properties: properties.clone(),
+                        })
+                    }
+                    let next = Section::new("page", &self.source);
+                    self.kind = "page".into();
+                    pages.push(std::mem::replace(&mut self, next));
+                } else {
+                    segment.push(r)
+                }
+            }
+            if !segment.is_empty() {
+                self.blocks.push(Block::Paragraph {
+                    heading,
+                    list,
+                    runs: segment,
+                    properties,
+                })
+            }
+        }
+        pages.push(self);
+    }
+    pub(crate) fn indexed(mut self, index: usize) -> Self {
+        self.index = Some(index + 1);
+        if self.kind == "slide" {
+            self.slide_number = self.index;
+        }
+        self
     }
     pub fn paragraph(&mut self, text: impl Into<String>) {
         let text = text.into();
@@ -208,6 +277,8 @@ impl Cell {
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct Style {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub bold: bool,
@@ -226,6 +297,8 @@ pub struct Style {
 }
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Run {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub visibility_flags: Vec<VisibilityFlag>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub page_break: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,6 +316,24 @@ pub struct Run {
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_layout: Option<ImageLayout>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisibilityFlag {
+    WhiteText,
+    TinyText,
+    OffPage,
+    HiddenText,
+}
+
+impl VisibilityFlag {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::WhiteText,
+        Self::TinyText,
+        Self::OffPage,
+        Self::HiddenText,
+    ];
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -274,6 +365,7 @@ pub fn push_run(out: &mut Vec<Run>, run: Run) {
             && prev.mathml.is_none()
             && prev.style == run.style
             && prev.link == run.link
+            && prev.visibility_flags == run.visibility_flags
         {
             prev.text.push_str(&run.text);
             return;
