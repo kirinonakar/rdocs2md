@@ -93,6 +93,13 @@ impl Document {
         self.sections = pages;
     }
     pub fn select(&mut self, range: &str) -> Result<()> {
+        let mut slide_number = 0;
+        for section in &mut self.sections {
+            if section.kind == "slide" {
+                slide_number += 1;
+                section.slide_number.get_or_insert(slide_number);
+            }
+        }
         let mut keep = vec![false; self.sections.len()];
         for part in range.split(',') {
             let (a, b) = part
@@ -118,6 +125,8 @@ impl Document {
 pub struct Section {
     pub kind: String,
     pub source: String,
+    #[serde(skip)]
+    pub slide_number: Option<usize>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub title: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]

@@ -312,7 +312,14 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             "article img { max-width: 100%; }\n</style>\n<article>\n",
         ));
     }
+    let mut next_slide_number = 0;
     for (i, s) in doc.sections.iter().enumerate() {
+        let slide_number = if s.kind == "slide" {
+            next_slide_number += 1;
+            Some(s.slide_number.unwrap_or(next_slide_number))
+        } else {
+            None
+        };
         if i > 0 && !out.is_empty() {
             if html {
                 out.push_str("\n<hr>\n")
@@ -328,6 +335,13 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         }
         if let Some(anchor) = s.properties.get("anchor") {
             writeln!(out, "<a id=\"{}\"></a>\n", escape(anchor))?;
+        }
+        if let Some(number) = slide_number {
+            if html {
+                writeln!(out, "<p class=\"slide-number\"><strong>Slide {number}</strong></p>")?;
+            } else {
+                writeln!(out, "**Slide {number}**\n")?;
+            }
         }
         if !s.title.is_empty() {
             if html {
