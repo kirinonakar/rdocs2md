@@ -62,6 +62,14 @@ impl Fragment {
     }
 }
 
+fn hyhwp_eq_font(fragment: &Fragment) -> bool {
+    fragment
+        .runs
+        .iter()
+        .find_map(|run| run.style.font.as_deref())
+        .is_some_and(|font| font.to_ascii_lowercase().contains("hyhwpeq"))
+}
+
 pub(super) fn approximate_width(text: &str) -> f32 {
     text.chars()
         .map(|c| match c {
@@ -127,10 +135,21 @@ fn attach_raised_text(pieces: &mut [Fragment]) {
         let drop_cap =
             f.size >= 20. && text.chars().count() == 1 && text.starts_with(char::is_uppercase);
         let note = text.len() <= 3 && !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit());
-        if !drop_cap && !note {
+        let math_script = hyhwp_eq_font(f)
+            && text.chars().count() <= 3
+            && text
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '+' | '-' | '−' | '=' | '(' | ')'));
+        if !drop_cap && !note && !math_script {
             continue;
         }
-        let reach = if drop_cap { f.size } else { f.size * 1.6 };
+        let reach = if drop_cap {
+            f.size
+        } else if math_script {
+            f.size * 3.
+        } else {
+            f.size * 1.6
+        };
         let start = pieces.partition_point(|p| p.y > f.y + reach);
         let end = pieces.partition_point(|p| p.y >= f.y - reach);
         let candidate = pieces[start..end]
@@ -146,23 +165,39 @@ fn attach_raised_text(pieces: &mut [Fragment]) {
                         && p.first_text().trim().len() > 3
                 } else {
                     let gap = f.x - p.end;
-                    p.size >= f.size * 1.25
+                    let nearby = p.size >= f.size * 1.25
                         && (p.size * 0.14..=p.size * 0.65).contains(&(f.y - p.y))
-                        && (-f.size * 0.2..=f.size * 0.6).contains(&gap)
+                        && (-f.size * 0.2..=f.size * 0.6).contains(&gap);
+                    if math_script && hyhwp_eq_font(p) {
+                        let radical_prefix = p.first_text().starts_with('√')
+                            && p.size >= f.size * 1.25
+                            && (p.size * 0.14..=p.size * 0.65).contains(&(f.y - p.y))
+                            && (-f.size * 1.6..=f.size * 0.6).contains(&(p.x - f.end));
+                        (nearby && hyhwp_eq_font(p)) || radical_prefix
+                    } else {
+                        nearby
+                    }
                 }
             })
             .max_by(|a, b| a.y.total_cmp(&b.y));
         if let Some(p) = candidate {
-            attachments.push((i, p.y, p.size, drop_cap, p.x));
+            let root_prefix = math_script
+                && hyhwp_eq_font(p)
+                && p.first_text().starts_with('√')
+                && (-f.size * 1.6..=f.size * 0.6).contains(&(p.x - f.end));
+            attachments.push((i, p.y, p.size, drop_cap, p.x, root_prefix));
         }
     }
-    for (i, y, size, drop_cap, next_x) in attachments {
+    for (i, y, size, drop_cap, next_x, root_prefix) in attachments {
         let f = &mut pieces[i];
         f.y = y;
         f.size = size;
         if drop_cap {
             f.end = next_x;
         } else {
+            if root_prefix {
+                f.x = next_x - size * 0.55;
+            }
             f.runs[0].style.script = Some("sup".into());
         }
     }
@@ -1068,6 +1103,43 @@ fn grid_tables(
             continue;
         }
 
+        // A framed callout can overlap a long page divider and look like a
+        // one-row grid. Keep multi-line prose in reading flow instead of
+        // turning unrelated text on both sides into table cells.
+        if row_count == 1 && columns > 1 {
+            let mut characters = vec![0usize; columns];
+            let mut line_y = vec![Vec::<i32>::new(); columns];
+            for fragment in bands.iter().flatten().filter(|fragment| {
+                fragment.y <= top + 2.
+                    && fragment.y >= bottom - 2.
+                    && fragment.end > left
+                    && fragment.x < right
+            }) {
+                let center = (fragment.x + fragment.end) * 0.5;
+                let Some(column) = (0..columns).find(|&column| {
+                    center >= x_edges[column] - 1. && center <= x_edges[column + 1] + 1.
+                }) else {
+                    continue;
+                };
+                characters[column] += fragment
+                    .runs
+                    .iter()
+                    .map(|run| run.text.chars().count())
+                    .sum::<usize>();
+                let y = (fragment.y * 10.).round() as i32;
+                if !line_y[column].iter().any(|&known| (known - y).abs() <= 11) {
+                    line_y[column].push(y);
+                }
+            }
+            if characters
+                .iter()
+                .zip(&line_y)
+                .any(|(&count, lines)| count >= 40 && lines.len() >= 2)
+            {
+                continue;
+            }
+        }
+
         let mut contents: Vec<Vec<Vec<Fragment>>> = (0..row_count)
             .map(|_| (0..columns).map(|_| Vec::new()).collect())
             .collect();
@@ -1588,7 +1660,51 @@ fn page_items(bands: Vec<Vec<Fragment>>, rules: &[HorizontalRule]) -> Vec<Item> 
     items
 }
 
-fn gutter(items: &[Item]) -> Option<f32> {
+fn gutter(items: &[Item], verticals: &[VerticalRule]) -> Option<f32> {
+    let line_items: Vec<_> = items
+        .iter()
+        .filter(|item| item.line_size().is_some())
+        .collect();
+    let top = line_items
+        .iter()
+        .map(|item| item.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = line_items
+        .iter()
+        .map(|item| item.y)
+        .fold(f32::INFINITY, f32::min);
+    let text_height = top - bottom;
+    if text_height.is_finite() {
+        let ruled_cut = verticals
+            .iter()
+            .filter_map(|rule| {
+                let rule_height = rule.top - rule.bottom;
+                if rule_height < (text_height * 0.6).max(120.) {
+                    return None;
+                }
+                let (mut left, mut right, mut crossing) = (0, 0, 0);
+                for item in &line_items {
+                    if item.end <= rule.x - 2. {
+                        left += 1;
+                    } else if item.x >= rule.x + 2. {
+                        right += 1;
+                    } else if item.x < rule.x && item.end > rule.x {
+                        crossing += 1;
+                    }
+                }
+                let support = left.min(right);
+                (support >= 3 && crossing < support * 2 + 4).then_some((
+                    support,
+                    rule_height.min(text_height),
+                    rule.x,
+                ))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        if let Some((_, _, cut)) = ruled_cut {
+            return Some(cut);
+        }
+    }
+
     // Use repeated right-column starts and actual occupied line widths. A split
     // must separate nearby lines on both sides, including staggered baselines.
     let mut origins = BTreeMap::<i32, (usize, f32)>::new();
@@ -1643,12 +1759,12 @@ fn gutter(items: &[Item]) -> Option<f32> {
         .map(|(_, cut)| cut)
 }
 
-fn read_region(items: Vec<Item>, out: &mut Vec<Block>, depth: usize) {
+fn read_region(items: Vec<Item>, out: &mut Vec<Block>, depth: usize, verticals: &[VerticalRule]) {
     if items.is_empty() {
         return;
     }
     if depth < 8
-        && let Some(cut) = gutter(&items)
+        && let Some(cut) = gutter(&items, verticals)
     {
         let mut left = Vec::new();
         let mut right = Vec::new();
@@ -1661,14 +1777,14 @@ fn read_region(items: Vec<Item>, out: &mut Vec<Block>, depth: usize) {
                 reflow(std::mem::take(&mut spanning), out);
                 left.push(item);
             } else {
-                read_region(std::mem::take(&mut left), out, depth + 1);
-                read_region(std::mem::take(&mut right), out, depth + 1);
+                read_region(std::mem::take(&mut left), out, depth + 1, verticals);
+                read_region(std::mem::take(&mut right), out, depth + 1, verticals);
                 spanning.push(item);
             }
         }
         reflow(spanning, out);
-        read_region(left, out, depth + 1);
-        read_region(right, out, depth + 1);
+        read_region(left, out, depth + 1, verticals);
+        read_region(right, out, depth + 1, verticals);
     } else {
         reflow(items, out);
     }
@@ -1679,7 +1795,9 @@ fn continues(prev: &LineInfo, next: &LineInfo, right: f32) -> bool {
     let gap = prev.y - next.y;
     let indent = next.x - prev.x;
     let hanging_indent = prev.list_marker() && indent <= size * 2.;
-    if gap < size * 0.55
+    let hanging_label = hanging_indent && indent >= -size * 0.55 && !next.list_marker();
+    let same_baseline_label = hanging_label && gap.abs() <= 1.15;
+    if (gap < size * 0.55 && !same_baseline_label)
         || gap > size * 1.8
         || prev.size.min(next.size) < size * 0.85
         || prev.bold != next.bold
@@ -1694,7 +1812,21 @@ fn continues(prev: &LineInfo, next: &LineInfo, right: f32) -> bool {
         prev.last.ends_with(['-', '\u{ad}']) && next.first.starts_with(char::is_alphabetic);
     let sentence_end = prev.last.ends_with(['.', '!', '?', ':', '。', '！', '？']);
     let continuation = next.first.starts_with(char::is_lowercase) && !sentence_end;
+    let korean_continuation = indent.abs() <= size * 0.55
+        && prev
+            .last
+            .chars()
+            .next_back()
+            .is_some_and(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c))
+        && next
+            .first
+            .chars()
+            .next()
+            .is_some_and(|c| ('\u{ac00}'..='\u{d7a3}').contains(&c))
+        && !sentence_end;
     wraps_word
+        || hanging_label
+        || korean_continuation
         || (size >= 18. && (prev.x - next.x).abs() < size * 0.3)
         || (continuation && prev.end - prev.x > size * 9.)
         || (filled && prev.end - prev.x > size * 12.)
@@ -1715,6 +1847,11 @@ struct LineInfo {
 impl LineInfo {
     fn list_marker(&self) -> bool {
         self.first.starts_with(['•', '▪', '■', '◦'])
+            || self
+                .first
+                .chars()
+                .next()
+                .is_some_and(|c| ('①'..='⑳').contains(&c) || ('❶'..='❿').contains(&c))
             || self.first.strip_suffix(['.', ')']).is_some_and(|n| {
                 !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit())
             })
@@ -1874,15 +2011,22 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     .fold(item.end, f32::max);
                 if let Some(prev) = &previous
                     && continues(prev, &info, right)
-                    && let Some(Block::Paragraph { runs: para, .. }) = out.last_mut()
+                    && let Some(Block::Paragraph {
+                        runs: para,
+                        properties,
+                        ..
+                    }) = out.last_mut()
                 {
                     join_wrapped_line(para, runs, prev.discretionary_hyphen);
+                    properties.insert("last_y_pt".into(), y.to_string());
                 } else {
+                    let mut properties = coordinates(x, y);
+                    properties.insert("last_y_pt".into(), y.to_string());
                     out.push(Block::Paragraph {
                         heading: 0,
                         list: None,
                         runs,
-                        properties: coordinates(x, y),
+                        properties,
                     });
                 }
                 previous = Some(info);
@@ -1954,10 +2098,10 @@ pub(super) fn layout(
                 && gap > (size * 2.1).max(19.).max(typical_gap * 1.9);
             let after_title = idx <= 12 && gap > (size * 2.1).max(40.).max(typical_gap * 3.5);
             if near_edge || after_title {
-                read_region(std::mem::take(&mut region), &mut sec.blocks, 0);
+                read_region(std::mem::take(&mut region), &mut sec.blocks, 0, &verticals);
             }
         }
         region.push(item);
     }
-    read_region(region, &mut sec.blocks, 0);
+    read_region(region, &mut sec.blocks, 0, &verticals);
 }

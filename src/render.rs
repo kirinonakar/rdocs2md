@@ -45,6 +45,31 @@ fn markdown(s: &str) -> String {
     }
     out
 }
+
+fn pdf_font_size(runs: &[Run]) -> f32 {
+    runs.iter()
+        .filter_map(|run| run.style.size.as_deref())
+        .find_map(|size| size.strip_suffix("pt")?.parse::<f32>().ok())
+        .filter(|size| size.is_finite() && *size > 0.)
+        .unwrap_or(12.)
+}
+
+fn pdf_baseline(properties: &Properties) -> Option<f32> {
+    properties
+        .get("y_pt")?
+        .parse::<f32>()
+        .ok()
+        .filter(|y| y.is_finite())
+}
+
+fn pdf_last_baseline(properties: &Properties) -> Option<f32> {
+    properties
+        .get("last_y_pt")
+        .or_else(|| properties.get("y_pt"))?
+        .parse::<f32>()
+        .ok()
+        .filter(|y| y.is_finite())
+}
 fn safe_link(link: &str) -> bool {
     !link.contains(['\\', '\r', '\n', '\0'])
         && !link.chars().any(char::is_control)
@@ -303,7 +328,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
     if html {
         out.push_str(concat!(
             "<!doctype html>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<style>\n",
-            "article { box-sizing: border-box; max-width: 76rem; margin-inline: auto; padding: 1.25rem; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 18px; line-height: 1.65; overflow-wrap: break-word; print-color-adjust: exact; -webkit-print-color-adjust: exact; }\n",
+            "article { box-sizing: border-box; max-width: 76rem; margin-inline: auto; padding: 1.25rem; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 16px; line-height: 1.5; overflow-wrap: break-word; print-color-adjust: exact; -webkit-print-color-adjust: exact; }\n",
             "article span[style*=\"font-size\"] { zoom: 1.2; }\n",
             "article table { border-collapse: collapse; max-width: 100%; margin-block: 0.5em; font: inherit; }\n",
             "article td, article th { border: 1px solid #a0a0a0; padding: 0.3em 0.5em; vertical-align: top; white-space: pre-wrap; }\n",
@@ -315,6 +340,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
     }
     let mut next_slide_number = 0;
     for (i, s) in doc.sections.iter().enumerate() {
+        let mut previous_pdf_line: Option<(f32, f32)> = None;
         let slide_number = if s.kind == "slide" {
             next_slide_number += 1;
             Some(s.slide_number.unwrap_or(next_slide_number))
@@ -419,6 +445,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                                 || properties.contains_key("writing-mode")));
                     let val = runs(items, use_html, links);
                     if use_html {
+                        previous_pdf_line = None;
                         let elem = if *heading > 0 {
                             format!("h{}", heading.clamp(&1, &6))
                         } else {
@@ -441,6 +468,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                             writeln!(out, "<{elem}{dir} style=\"{attrs}\">{val}</{elem}>\n")?
                         }
                     } else if let Some(l) = list {
+                        previous_pdf_line = None;
                         writeln!(
                             out,
                             "{}{} {val}",
@@ -454,11 +482,29 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                         if *heading > 0 {
                             write!(out, "{} ", "#".repeat((*heading).min(6) as usize))?
                         }
-                        writeln!(out, "{val}\n")?
+                        if doc.format == "pdf" && *heading == 0 {
+                            let y = pdf_baseline(properties);
+                            let size = pdf_font_size(items);
+                            let adjacent = y.is_some_and(|y| {
+                                previous_pdf_line.is_some_and(|(previous_y, previous_size)| {
+                                    previous_y - y <= previous_size.max(size) * 1.8
+                                })
+                            });
+                            if adjacent {
+                                write!(out, "{val}  \n")?;
+                            } else {
+                                writeln!(out, "{val}\n")?;
+                            }
+                            previous_pdf_line = pdf_last_baseline(properties).map(|y| (y, size));
+                        } else {
+                            previous_pdf_line = None;
+                            writeln!(out, "{val}\n")?
+                        }
                     }
                     in_list = list.is_some();
                 }
                 Block::Table { rows } => {
+                    previous_pdf_line = None;
                     in_list = false;
                     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
                     if width == 0 {

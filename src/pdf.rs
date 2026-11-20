@@ -205,6 +205,186 @@ fn math_pi_encoding(pdf: &Pdf, font: &lopdf::Dictionary) -> Option<HashMap<u8, c
     Some(mapping)
 }
 
+// The embedded HYhwpEQ font uses private-use characters for ordinary math glyphs.
+fn hyhwp_eq_unicode(character: char) -> Option<char> {
+    let code = character as u32;
+    match code {
+        0xe000..=0xe019 => char::from_u32(u32::from(b'A') + code - 0xe000),
+        0xe01a..=0xe02b => char::from_u32(u32::from(b'a') + code - 0xe01a),
+        0xe02c => Some('S'),
+        0xe02d => Some('t'),
+        0xe02e => Some('u'),
+        0xe02f => Some('V'),
+        0xe030 => Some('W'),
+        0xe031 => Some('X'),
+        0xe032 => Some('y'),
+        0xe033 => Some('z'),
+        0xe034 => Some('1'),
+        0xe035 => Some('2'),
+        0xe036 => Some('3'),
+        0xe037 => Some('4'),
+        0xe038 => Some('5'),
+        0xe039 => Some('6'),
+        0xe03a => Some('7'),
+        0xe03b => Some('8'),
+        0xe03c => Some('9'),
+        0xe03d => Some('0'),
+        0xe03e => Some('!'),
+        0xe03f => Some('@'),
+        0xe040 => Some('#'),
+        0xe041 => Some('$'),
+        0xe042 => Some('%'),
+        0xe043 => Some('*'),
+        0xe044 => Some('('),
+        0xe045 => Some(')'),
+        0xe046 | 0xe06d | 0xe0c5 => Some('−'),
+        0xe047 => Some('='),
+        0xe048 => Some('+'),
+        0xe049 | 0xe07a | 0xe081 | 0xe084 => Some('['),
+        0xe04a | 0xe07b | 0xe085 => Some(']'),
+        0xe04b | 0xe078 | 0xe083 => Some('{'),
+        0xe04c | 0xe079 => Some('}'),
+        0xe04d | 0xe07d => Some('|'),
+        0xe04e => Some(';'),
+        0xe04f => Some(':'),
+        0xe050 => Some('\''),
+        0xe051 => Some('"'),
+        0xe052 => Some(','),
+        0xe053 | 0xe080 => Some('.'),
+        0xe054 => Some('/'),
+        0xe055 => Some('<'),
+        0xe056 => Some('>'),
+        0xe057 => Some('?'),
+        0xe058 | 0xe06c => Some('←'),
+        0xe059 => Some('¯'),
+        0xe05a | 0xe061 | 0xe06e => Some('→'),
+        0xe05b | 0xe072 => Some('∫'),
+        0xe05c => Some('√'),
+        0xe05d => Some('´'),
+        0xe05e => Some('`'),
+        0xe05f => Some('·'),
+        0xe060 => Some('∴'),
+        0xe062 => Some('↔'),
+        0xe063 => Some('↑'),
+        0xe064 => Some('↓'),
+        0xe065 => Some('⌒'),
+        0xe066 => Some('~'),
+        0xe067 => Some('Σ'),
+        0xe068 => Some('Π'),
+        0xe06a => Some('∩'),
+        0xe06b => Some('∪'),
+        0xe06f => Some('⇐'),
+        0xe070 => Some('≡'),
+        0xe071 => Some('⇒'),
+        0xe073 => Some('∬'),
+        0xe074 => Some('∭'),
+        0xe075 => Some('∮'),
+        0xe076 => Some('∯'),
+        0xe077 => Some('∰'),
+        0xe07c | 0xe07e => Some('('),
+        0xe07f | 0xe082 => Some(')'),
+        0xe086 => Some('Α'),
+        0xe087 => Some('Β'),
+        0xe088 | 0xe0c1 => Some('Γ'),
+        0xe089 => Some('Δ'),
+        0xe08a => Some('Ε'),
+        0xe08b => Some('Ζ'),
+        0xe08c => Some('Η'),
+        0xe08d => Some('Θ'),
+        0xe08e => Some('Ι'),
+        0xe08f => Some('Κ'),
+        0xe090 => Some('Μ'),
+        0xe091 => Some('Ν'),
+        0xe092 => Some('Ξ'),
+        0xe093 => Some('Ο'),
+        0xe094 => Some('Π'),
+        0xe095 => Some('Ρ'),
+        0xe096 => Some('Σ'),
+        0xe097 => Some('Τ'),
+        0xe098 => Some('Υ'),
+        0xe099 => Some('Φ'),
+        0xe09a => Some('Χ'),
+        0xe09b => Some('Ψ'),
+        0xe09c => Some('Ω'),
+        0xe09d => Some('α'),
+        0xe09e => Some('β'),
+        0xe09f => Some('γ'),
+        0xe0a0 => Some('δ'),
+        0xe0a1 => Some('ε'),
+        0xe0a2 => Some('ζ'),
+        0xe0a3 => Some('η'),
+        0xe0a4 => Some('θ'),
+        0xe0a5 => Some('ι'),
+        0xe0a6 => Some('κ'),
+        0xe0a7 => Some('λ'),
+        0xe0a8 => Some('μ'),
+        0xe0a9 => Some('ν'),
+        0xe0aa => Some('ξ'),
+        0xe0ab => Some('ο'),
+        0xe0ac => Some('π'),
+        0xe0ad => Some('ρ'),
+        0xe0ae => Some('σ'),
+        0xe0af => Some('τ'),
+        0xe0b0 => Some('υ'),
+        0xe0b1 | 0xe0c2 => Some('φ'),
+        0xe0b2 => Some('χ'),
+        0xe0b3 => Some('ψ'),
+        0xe0b4 => Some('ω'),
+        0xe0b5 => Some('ℵ'),
+        0xe0b6 => Some('ℏ'),
+        0xe0b7 | 0xe0ba | 0xe0bb => Some('ℓ'),
+        0xe0c0 => Some('ς'),
+        0xe0c4 => Some('∂'),
+        0xe0c6 => Some('↔'),
+        0xe0c7 => Some('⇔'),
+        0xe0c8 => Some('°'),
+        0xe0c9 => Some('†'),
+        0xe0ca => Some('‡'),
+        0xe0cb..=0xe0e4 => char::from_u32(u32::from(b'A') + code - 0xe0cb),
+        0xe0e5..=0xe0fe => char::from_u32(u32::from(b'a') + code - 0xe0e5),
+        0xe0ff => Some('□'),
+        _ => None,
+    }
+}
+
+fn hyhwp_eq_cid(cid: u16) -> Option<char> {
+    // Its subset CIDs start at 0x00f9 for U+E000; this recovers entries omitted
+    // from the PDF's incomplete ToUnicode map.
+    let offset = u32::from(cid.checked_sub(0x00f9)?);
+    hyhwp_eq_unicode(char::from_u32(0xe000 + offset)?)
+}
+
+fn decode_hyhwp_eq(encoding: &lopdf::Encoding<'_>, bytes: &[u8]) -> String {
+    let mut text = String::new();
+    for code in bytes.chunks_exact(2) {
+        let decoded = Pdf::decode_text(encoding, code).unwrap_or_else(|_| "�".into());
+        if decoded.contains('�')
+            && let Some(cid) = code
+                .first()
+                .copied()
+                .zip(code.get(1).copied())
+                .map(|(high, low)| u16::from_be_bytes([high, low]))
+            && let Some(character) = hyhwp_eq_cid(cid)
+        {
+            text.push(character);
+            continue;
+        }
+        for character in decoded.chars() {
+            text.push(hyhwp_eq_unicode(character).unwrap_or(character));
+        }
+    }
+    if bytes.len() % 2 != 0 {
+        if let Ok(decoded) = Pdf::decode_text(encoding, &bytes[bytes.len() - 1..]) {
+            text.extend(
+                decoded
+                    .chars()
+                    .map(|character| hyhwp_eq_unicode(character).unwrap_or(character)),
+            );
+        }
+    }
+    text
+}
+
 struct FontMetrics<'a> {
     widths: &'a [Object],
     first: i64,
@@ -719,6 +899,14 @@ impl PageReader<'_> {
                             .warn("Text using an unmapped PDF font was skipped.");
                         continue;
                     };
+                    let base = fonts
+                        .get(&font)
+                        .and_then(|f| f.get(b"BaseFont").ok())
+                        .and_then(|n| n.as_name().ok())
+                        .map(|n| String::from_utf8_lossy(n).into_owned());
+                    let hyhwp_eq = base
+                        .as_deref()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains("hyhwpeq"));
                     let obj = args.last().ok_or("PDF text operand missing")?;
                     let parts = if let Object::Array(a) = obj {
                         a.as_slice()
@@ -743,7 +931,11 @@ impl PageReader<'_> {
                     for part in parts {
                         if let Ok(b) = part.as_str() {
                             let decoded = if let Some(e) = enc.get(&font) {
-                                Pdf::decode_text(e, b)?
+                                if hyhwp_eq {
+                                    decode_hyhwp_eq(e, b)
+                                } else {
+                                    Pdf::decode_text(e, b)?
+                                }
                             } else {
                                 let mapping = &math_pi[&font];
                                 b.iter()
@@ -812,11 +1004,6 @@ impl PageReader<'_> {
                     if !text.is_empty() {
                         segments.push((text, start, advance));
                     }
-                    let base = fonts
-                        .get(&font)
-                        .and_then(|f| f.get(b"BaseFont").ok())
-                        .and_then(|n| n.as_name().ok())
-                        .map(|n| String::from_utf8_lossy(n).into_owned());
                     let lower = base.as_deref().unwrap_or("").to_ascii_lowercase();
                     let effective_size = state.size.abs() * basis.0[2].hypot(basis.0[3]);
                     let style = Style {
