@@ -202,6 +202,9 @@ struct DocumentCache {
 impl DocumentCache {
     fn load(&mut self, path: &Path, range: Option<&str>) -> Result<Rc<Document>> {
         let key = Self::key(path, range)?;
+        // A rewritten file must not keep its earlier version cached, whichever
+        // range that entry was parsed from.
+        self.drop_stale(&key);
         if let Some(position) = self.entries.iter().position(|entry| entry.key == key) {
             // Move the hit to the back so that the first entry is the oldest.
             let entry = self.entries.remove(position);
@@ -232,6 +235,21 @@ impl DocumentCache {
     fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
+    }
+
+    /// Evict cached versions of this file whose size or timestamp is stale, so
+    /// that a rewrite cannot leave two entries for one path.
+    fn drop_stale(&mut self, key: &CacheKey) {
+        let mut stale = 0;
+        self.entries.retain(|entry| {
+            let old = entry.key.path == key.path
+                && (entry.key.len != key.len || entry.key.modified != key.modified);
+            if old {
+                stale += entry.bytes;
+            }
+            !old
+        });
+        self.bytes -= stale;
     }
 
     /// Size and modification time invalidate a cached document in place.
@@ -351,36 +369,26 @@ impl BatchReport {
     }
 }
 
-/// A tool reply. Structured replies keep the plain text result so that clients
-/// without structured content still see the document and its warnings.
+/// A tool reply: the text result plus optional conversion warnings, which are
+/// sent as a second text block. No tool returns `structuredContent`, so a JSON
+/// report is the text result itself.
 enum Reply {
     Text(String),
-    Structured {
+    Report {
         text: String,
         warnings: Vec<String>,
-        value: Value,
     },
 }
 
 impl Reply {
     fn json(value: &impl Serialize) -> Result<Self> {
-        let text = serde_json::to_string(value)?;
-        Ok(Self::Structured {
-            // Reparse so that the text and the structured form stay identical.
-            value: serde_json::from_str(&text)?,
-            text,
-            warnings: Vec::new(),
-        })
+        Ok(Self::Text(serde_json::to_string(value)?))
     }
 
-    fn into_parts(self) -> (String, Vec<String>, Option<Value>) {
+    fn into_parts(self) -> (String, Vec<String>) {
         match self {
-            Self::Text(text) => (text, Vec::new(), None),
-            Self::Structured {
-                text,
-                warnings,
-                value,
-            } => (text, warnings, Some(value)),
+            Self::Text(text) => (text, Vec::new()),
+            Self::Report { text, warnings } => (text, warnings),
         }
     }
 }
@@ -540,7 +548,9 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
     }
     if let Some(out) = out {
         let summary = conversion.save(&input, &out, dir.as_deref(), &access.root)?;
-        return Reply::json(&summary);
+        // The summary is already the text result, so a structured copy would
+        // only repeat it.
+        return Ok(Reply::Text(serde_json::to_string(&summary)?));
     }
     // Without images the parsed document can be reused by later read-only
     // requests; image extraction changes the returned links, so it is not cached.
@@ -555,29 +565,23 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
         None => Properties::new(),
     };
     let content = render(document, conversion.format, conversion.mode, &links)?;
-    let sections: Vec<_> = document
-        .sections
-        .iter()
-        .enumerate()
-        .map(|(i, s)| s.index.unwrap_or(i + 1))
-        .collect();
-    let warnings = document.warnings.clone();
-    let value = json!({
-        "format": document.format,
-        "source": text("path").unwrap_or_default(),
-        "sections": sections,
-        "content": &content,
-        "warnings": &warnings,
-        "truncated": false,
-    });
-    Ok(Reply::Structured {
+    // Conversion tools keep the document in the text block only; warnings still
+    // travel as a second text block, and no body is sent twice.
+    Ok(Reply::Report {
         text: content,
-        warnings,
-        value,
+        warnings: document.warnings.clone(),
     })
 }
 fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+}
+/// Message returned when a reply does not fit the inline limit.
+fn oversized(name: &str) -> &'static str {
+    if name == "search_document" {
+        "Result exceeds 512 KiB. Use a smaller range or search limit."
+    } else {
+        "Result exceeds 512 KiB. Use a smaller range or save with output_path."
+    }
 }
 fn dispatch(access: &Access, req: Value, phase: &mut u8, defs: &[Value]) -> Option<Value> {
     let id = &req["id"];
@@ -653,31 +657,20 @@ fn dispatch(access: &Access, req: Value, phase: &mut u8, defs: &[Value]) -> Opti
             // The cache uses a `RefCell`, which is not `UnwindSafe`; it is only
             // mutated after parsing succeeds, so a caught panic leaves it intact.
             let response = recover_document(AssertUnwindSafe(|| call(access, name, args)));
-            let (text, warnings, structured, bad): (String, Vec<String>, Option<Value>, bool) =
-                match response {
-                    Ok(reply) => {
-                        let (text, warnings, structured) = reply.into_parts();
-                        if text.len() <= INLINE {
-                            (text, warnings, structured, false)
-                        } else {
-                            (
-                                if name == "search_document" {
-                                    "Result exceeds 512 KiB. Use a smaller range or search limit."
-                                } else {
-                                    "Result exceeds 512 KiB. Use a smaller range or save with output_path."
-                                }
-                                .into(),
-                                Vec::new(),
-                                None,
-                                true,
-                            )
-                        }
+            let (text, warnings, bad): (String, Vec<String>, bool) = match response {
+                Ok(reply) => {
+                    let (text, warnings) = reply.into_parts();
+                    if text.len() <= INLINE {
+                        (text, warnings, false)
+                    } else {
+                        (oversized(name).into(), Vec::new(), true)
                     }
-                    Err(e) => (e.to_string(), Vec::new(), None, true),
-                };
+                }
+                Err(e) => (e.to_string(), Vec::new(), true),
+            };
             let mut content = vec![json!({"type":"text","text":text})];
             if !warnings.is_empty() {
-                // Clients that ignore structured content still see the warnings.
+                // Warnings are a second text block, so no client misses them.
                 content.push(json!({
                     "type":"text",
                     "text":format!(
@@ -687,8 +680,13 @@ fn dispatch(access: &Access, req: Value, phase: &mut u8, defs: &[Value]) -> Opti
                 }));
             }
             let mut result = json!({"content":content,"isError":bad});
-            if let Some(value) = structured {
-                result["structuredContent"] = value;
+            // The limit covers the whole reply: JSON escaping and the warning
+            // block can grow it past the text measured above.
+            if !bad && serde_json::to_string(&result).is_ok_and(|reply| reply.len() > INLINE) {
+                result = json!({
+                    "content":[{"type":"text","text":oversized(name)}],
+                    "isError":true,
+                });
             }
             result
         }
@@ -779,6 +777,9 @@ mod tests {
         let changed = cache.load(&path, None).unwrap();
         assert_eq!(changed.sections.len(), 2);
         assert!(!Rc::ptr_eq(&first, &changed));
+        // The stale version is dropped as soon as the newer one is loaded.
+        assert_eq!(cache.entries.len(), 1);
+        assert!(Rc::ptr_eq(&cache.entries[0].document, &changed));
         cache.clear();
         assert!(cache.entries.is_empty());
         assert_eq!(cache.bytes, 0);

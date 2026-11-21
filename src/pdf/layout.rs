@@ -1995,6 +1995,9 @@ fn clean_line(runs: &mut Vec<Run>) {
 
 fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
     let mut previous: Option<LineInfo> = None;
+    // Start x, top baseline and the widest end of the paragraph on top of
+    // `out`: a merged paragraph has to keep the box of every line it holds.
+    let mut bounds: Option<(f32, f32, f32)> = None;
     // Compare line endings among similarly sized neighbors. Titles, footers and
     // side notes can have different margins from the surrounding body.
     let right_edges: Vec<_> = items.iter().map(|i| (i.end, i.line_size())).collect();
@@ -2041,6 +2044,9 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                             info.x - prev.end,
                         )
                     };
+                    // Earlier rows may already be merged, so measure the box
+                    // from the first line instead of restarting at this row.
+                    let (x0, top) = bounds.map_or((x, row_y), |(x0, top, _)| (x0, top));
                     let last = info.last.clone();
                     if let Some(Block::Paragraph {
                         runs: para,
@@ -2050,9 +2056,13 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     {
                         join_runs(para, runs, gap > size * 0.12);
                         properties.insert("last_y_pt".into(), y.to_string());
-                        properties.insert("w_pt".into(), (end - x).max(0.).to_string());
-                        properties.insert("h_pt".into(), row_size.to_string());
+                        properties.insert("w_pt".into(), (end - x0).max(0.).to_string());
+                        properties.insert(
+                            "h_pt".into(),
+                            (top - row_y + row_size).max(0.).to_string(),
+                        );
                     }
+                    bounds = Some((x0, top, end));
                     previous = Some(LineInfo {
                         x,
                         end,
@@ -2080,20 +2090,23 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     }) = out.last_mut()
                 {
                     join_wrapped_line(para, runs, prev.discretionary_hyphen);
+                    // Keep the first line's origin and the widest line, so that
+                    // a paragraph of three or more lines is fully covered.
+                    let (x0, top, end) = bounds.map_or((prev.x, prev.y, prev.end), |b| b);
+                    let end = end.max(info.end);
+                    bounds = Some((x0, top, end));
                     properties.insert("last_y_pt".into(), y.to_string());
-                    properties.insert(
-                        "w_pt".into(),
-                        (prev.end.max(info.end) - prev.x).max(0.).to_string(),
-                    );
+                    properties.insert("w_pt".into(), (end - x0).max(0.).to_string());
                     properties.insert(
                         "h_pt".into(),
-                        (prev.y - info.y + info.size).max(0.).to_string(),
+                        (top - info.y + info.size).max(0.).to_string(),
                     );
                 } else {
                     let mut properties = coordinates(x, y);
                     properties.insert("last_y_pt".into(), y.to_string());
                     properties.insert("w_pt".into(), (info.end - x).max(0.).to_string());
                     properties.insert("h_pt".into(), size.to_string());
+                    bounds = Some((x, y, info.end));
                     out.push(Block::Paragraph {
                         heading: 0,
                         list: None,
@@ -2110,6 +2123,7 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     runs,
                     properties: coordinates(x, y),
                 });
+                bounds = None;
                 previous = None;
             }
             Content::Table {
@@ -2120,6 +2134,7 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                 reflow(prefix, out);
                 out.push(Block::Table { rows });
                 reflow(suffix, out);
+                bounds = None;
                 previous = None;
             }
         }

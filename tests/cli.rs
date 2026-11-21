@@ -364,16 +364,10 @@ fn mcp_advertises_and_renders_output_formats() {
     }
     assert_eq!(result(3)["isError"], false);
     assert!(content(3).starts_with("First page"));
-    // Structured content keeps the plain text result and adds warnings and
-    // section numbers for clients that can use them.
-    let structured = &result(3)["structuredContent"];
-    assert_eq!(structured["format"], "rtf");
-    assert_eq!(structured["source"], "sample.rtf");
-    assert_eq!(structured["sections"], json!([1, 2]));
-    assert_eq!(structured["warnings"], json!([]));
-    assert_eq!(structured["content"], content(3));
-    assert_eq!(structured["truncated"], false);
+    // Conversion tools answer with text only, so the body is not sent twice.
+    assert!(result(3).get("structuredContent").is_none());
     assert_eq!(result(4)["isError"], false);
+    assert!(result(4).get("structuredContent").is_none());
     let html = fs::read_to_string(work.path("sample.html")).unwrap();
     assert!(html.starts_with("<!doctype html>"));
     assert!(html.contains("First page"));
@@ -384,11 +378,8 @@ fn mcp_advertises_and_renders_output_formats() {
     assert!(!content(5).contains("First page"));
     // Section indexes survive range extraction in the JSON IR.
     assert_eq!(document["sections"][0]["index"], 2);
-    // Structured content uses one envelope for every format, so a JSON result
-    // keeps the document JSON in `content`.
-    assert_eq!(result(5)["structuredContent"]["content"], content(5));
-    assert_eq!(result(5)["structuredContent"]["sections"], json!([2]));
-    assert_eq!(result(5)["structuredContent"]["format"], "rtf");
+    // Range extraction is text-only as well.
+    assert!(result(5).get("structuredContent").is_none());
     assert_eq!(replies[5]["error"]["code"], -32602);
     assert_eq!(result(7)["isError"], true);
     assert!(content(7).contains("new .json file"));
@@ -401,15 +392,19 @@ fn mcp_advertises_and_renders_output_formats() {
     // Citations carry the source section, a stable block id and the page.
     assert_eq!(search["matches"][0]["source_section_index"], 2);
     assert_eq!(search["matches"][0]["block_id"], "s2-b1");
-    assert_eq!(result(9)["structuredContent"], search);
+    assert!(result(9).get("structuredContent").is_none());
     assert_eq!(replies[9]["error"]["code"], -32602);
     assert_eq!(result(11)["isError"], false);
     let batch: Value = serde_json::from_str(content(11)).unwrap();
     assert_eq!(batch["succeeded"], 2, "{batch}");
     assert_eq!(batch["failed"], 2, "{batch}");
-    assert_eq!(result(11)["structuredContent"], batch);
+    assert!(result(11).get("structuredContent").is_none());
     assert!(content(11).contains("outside the MCP root"));
     assert!(work.path("batch/copy.json").is_file());
     assert!(work.path("batch/sample.json").is_file());
     assert!(!work.path("batch/broken.json").exists());
+    // No tool returns structuredContent, so no result is sent twice.
+    for id in 1..=11 {
+        assert!(result(id).get("structuredContent").is_none(), "id {id}");
+    }
 }
