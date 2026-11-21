@@ -46,6 +46,8 @@ To process local documents outside the root as well, set `args` in the MCP confi
 "args": ["mcp", "--root", "C:\\docu_path", "--allow-outside-root"]
 ```
 
+The server discloses the resolved root instead of only naming a scope: every path argument in `tools/list` starts with `MCP root: <path>`, and `initialize` returns the same text in `instructions` for clients that forward it to the model. An agent can therefore send root-relative paths without discovering the working directory of the server process, and only `--allow-outside-root` widens which paths are accepted.
+
 | Tool | Example input |
 |---|---|
 | `list_supported_formats` | `{}` |

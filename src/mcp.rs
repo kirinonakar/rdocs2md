@@ -22,11 +22,20 @@ const TIMEOUT: u64 = 300;
 /// Parsed documents kept for repeated read-only MCP requests.
 const CACHE_ENTRIES: usize = 8;
 const CACHE_BYTES: usize = 128 * MIB;
-fn definitions(allow_outside_root: bool) -> Vec<Value> {
+fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
+    // The agent cannot infer the working directory of this process, so every
+    // path argument states the resolved root instead of only naming a scope.
+    let root = root.display();
     let scope = if allow_outside_root {
-        "Local paths may be outside the root. Relative paths start at the root."
+        format!(
+            "MCP root: {root}. Relative paths are resolved against this root; \
+             absolute local paths are also accepted."
+        )
     } else {
-        "Paths must be within the configured root."
+        format!(
+            "MCP root: {root}. Relative paths are resolved against this root; \
+             paths outside it are rejected."
+        )
     };
     let mut tools = Vec::new();
     for (name, description) in [
@@ -83,11 +92,11 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
             });
             props["mode"] = json!({"type":"string","enum":["semantic","hybrid","layout"]});
             props["extract_images"] = json!({"type":"boolean"});
-            props["image_dir"] = json!({"type":"string","description":"Image directory. Its parent must exist."});
+            props["image_dir"] = json!({"type":"string","description":format!("Image directory. Its parent must exist. {scope}")});
             props["range"] =
                 json!({"type":"string","description":"1-based inclusive ranges, e.g. 1-3,5."});
             if name != "convert_documents" {
-                props["output_path"] = json!({"type":"string","description":"New filename with an extension that matches format."});
+                props["output_path"] = json!({"type":"string","description":format!("New filename with an extension that matches format. {scope}")});
             }
         }
         if name == "search_document" {
@@ -636,7 +645,21 @@ fn dispatch(access: &Access, req: Value, phase: &mut u8, defs: &[Value]) -> Opti
                 _ => "2025-11-25",
             };
             *phase = 1;
-            json!({"protocolVersion":v,"capabilities":{"tools":{}},"serverInfo":{"name":"rdocs2md","version":env!("CARGO_PKG_VERSION")}})
+            // Clients that forward `instructions` to the model learn the same
+            // root as the tool schemas, so the agent does not probe for it.
+            let root = access.root.display();
+            let instructions = if access.allow_outside_root {
+                format!(
+                    "Document root: {root}. Relative file paths are resolved against \
+                     this directory; absolute local paths outside it are also accepted."
+                )
+            } else {
+                format!(
+                    "Document root: {root}. Relative file paths are resolved against \
+                     this directory; paths outside it are rejected."
+                )
+            };
+            json!({"protocolVersion":v,"capabilities":{"tools":{}},"serverInfo":{"name":"rdocs2md","version":env!("CARGO_PKG_VERSION")},"instructions":instructions})
         }
         _ if *phase != 2 => return Some(rpc_error(id, -32002, "Server is not initialized")),
         "tools/list" => json!({"tools":defs}),
@@ -736,7 +759,7 @@ pub fn serve_with_access(path: &Path, allow_outside_root: bool) -> Result<()> {
         allow_outside_root,
         cache: RefCell::default(),
     };
-    let defs = definitions(allow_outside_root);
+    let defs = definitions(&access.root, allow_outside_root);
     loop {
         line.clear();
         // A closed or broken input stream means the client disconnected.
@@ -833,5 +856,30 @@ mod tests {
         assert!(cache.entries.is_empty());
         assert_eq!(cache.bytes, 0);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn path_descriptions_name_the_root() {
+        for allow in [false, true] {
+            let defs = definitions(Path::new("C:/docs-root"), allow);
+            let text = serde_json::to_string(&defs).unwrap();
+            assert!(text.contains("MCP root: C:/docs-root"));
+            assert_eq!(text.contains("paths outside it are rejected"), !allow);
+            // No path argument may leave the agent guessing where relative paths start.
+            for tool in &defs {
+                for (key, prop) in tool["inputSchema"]["properties"].as_object().unwrap() {
+                    if matches!(
+                        key.as_str(),
+                        "path" | "paths" | "output_dir" | "output_path" | "image_dir"
+                    ) {
+                        let description = prop["description"].as_str().unwrap_or("");
+                        assert!(
+                            description.contains("MCP root: C:/docs-root"),
+                            "{key} does not name the root: {description}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
