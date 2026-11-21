@@ -6,7 +6,7 @@
 
 <h3 align="center">rdocs2md</h3>
 
-rdocs2md is a simple portable executable written in Rust, with AI-agent-friendly MCP and CLI interfaces. This single offline executable for Windows x64 converts a wide range of document formats such as PDF, Hangul (HWP/HWPX), Office, OpenDocument, RTF, and EPUB into UTF-8 Markdown, HTML, or JSON, keeping reading order and document structure as readable as possible.
+rdocs2md is a simple portable executable written in Rust, with AI-agent-friendly MCP and CLI interfaces. This single offline executable for Windows x64 converts a wide range of document formats such as PDF, Hangul (HWP/HWPX), Office, OpenDocument, RTF, and EPUB into UTF-8 Markdown, HTML, JSON, or CSV (workbook sheets), keeping reading order and document structure as readable as possible.
 
 ## Quick start
 
@@ -18,6 +18,7 @@ Open the folder that contains the executable in PowerShell and run it.
 .\rdocs2md.exe "data.epub" --format html --extract-images -o "data.html"
 .\rdocs2md.exe "document.doc" "data.ods" "reports/**/*.pdf" --recursive --out-dir "converted"
 .\rdocs2md.exe "report.pdf" --search "revenue" --pages 2-5 --limit 10
+.\rdocs2md.exe "book.xlsx" --format csv --sheet "Summary" -o "Summary.csv"
 .\rdocs2md.exe --help
 ```
 
@@ -56,8 +57,9 @@ The server discloses the resolved root instead of only naming a scope: every pat
 | `extract_document_range` | `{"path":"report.pdf","range":"2-5,8","format":"json"}` |
 | `search_document` | `{"path":"report.pdf","query":"revenue","range":"2-5","limit":10}` |
 | `convert_documents` | `{"paths":["reports/*.pdf","data"],"recursive":true,"output_dir":"converted","format":"json"}` |
+| `convert_document` (CSV) | `{"path":"book.xlsx","format":"csv","sheet":"Summary","output_path":"Summary.csv"}` |
 
-All conversion tools accept `format` (`md`, `html`, or `json`, default `md`), `mode`, `range`, `extract_images`, and `image_dir`. `convert_document` and `extract_document_range` accept an optional `output_path` with an extension that matches `format`. `convert_documents` requires `output_dir`, keeps existing result files, and reports `succeeded` and `failed` counts with each `output_path` or `error`; `jobs` and `max_inflight_bytes` behave as in the CLI. The parent of a new output or image directory must already exist, and extracted images go to a per-document folder next to the converted file or under `image_dir`.
+All conversion tools accept `format` (`md`, `html`, `json`, or `csv`, default `md`), `mode`, `range`, `sheet`, `extract_images`, and `image_dir`. `convert_document` and `extract_document_range` accept an optional `output_path` with an extension that matches `format`. `convert_documents` requires `output_dir`, keeps existing result files, and reports `succeeded` and `failed` counts with each `output_path` or `error`; `jobs` and `max_inflight_bytes` behave as in the CLI. The parent of a new output or image directory must already exist, and extracted images go to a per-document folder next to the converted file or under `image_dir`.
 
 `search_document` and `--search` match literal text within a paragraph or table cell, including text divided across formatting runs, and return snippets with up to 60 characters of context per side plus the source section, page, block id, and an Excel cell address or PDF coordinates for citation. The [skill](skills/rdocs2md/SKILL.md#search) documents every field.
 

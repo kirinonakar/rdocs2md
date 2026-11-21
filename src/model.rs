@@ -106,6 +106,43 @@ impl Document {
         self.retain_sections(Some(&SectionRange::parse(range)?))
     }
 
+    /// Keep only the named workbook sheets. Names match ASCII case-insensitively,
+    /// because workbook sheet titles are unique that way; the stored 1-based
+    /// `index` stays valid for the sheets that remain.
+    pub fn select_sheets(&mut self, names: &[String]) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        if !matches!(self.format.as_str(), "xls" | "xlsx" | "ods") {
+            return Err(format!(
+                "sheet selection supports xls, xlsx and ods workbooks, not {}",
+                self.format
+            )
+            .into());
+        }
+        let wanted: Vec<&str> = names.iter().map(|n| n.trim()).collect();
+        for name in &wanted {
+            if name.is_empty() {
+                return Err("sheet name must not be empty".into());
+            }
+            if !self.sections.iter().any(|s| s.title.eq_ignore_ascii_case(name)) {
+                let mut available: Vec<&str> =
+                    self.sections.iter().map(|s| s.title.as_str()).collect();
+                let more = available.len() > 20;
+                available.truncate(20);
+                return Err(format!(
+                    "sheet {name:?} not found (sheets: {}{})",
+                    available.join(", "),
+                    if more { ", ..." } else { "" }
+                )
+                .into());
+            }
+        }
+        self.sections
+            .retain(|s| wanted.iter().any(|name| s.title.eq_ignore_ascii_case(name)));
+        Ok(())
+    }
+
     pub(crate) fn retain_sections(&mut self, range: Option<&SectionRange>) -> Result<()> {
         let Some(range) = range else { return Ok(()) };
         range.validate(self.sections.len())?;

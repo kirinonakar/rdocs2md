@@ -1,5 +1,5 @@
 use rdocs2md::{
-    batch, load_range, model::*, output, parallel, recover_document, render::render, search,
+    batch, load_sheets, model::*, output, parallel, recover_document, render::render, search,
 };
 use serde::Serialize;
 use std::{
@@ -16,14 +16,16 @@ Usage: rdocs2md INPUT... [options]
        rdocs2md --list-formats | --licenses | --version | --help
 
 Example: rdocs2md "report.pdf" -o "report.md"
+         rdocs2md "book.xlsx" --format csv --sheet "Sales" -o "sales.csv"
 
   -o, --output PATH        Destination file, or a directory for multiple inputs
   --out-dir DIRECTORY      Destination directory for batch conversion
   --stdout                 Write the document, or JSON Lines for multiple inputs
-  --format md|html|json    Select output format (default: md)
+  --format md|html|json|csv  Select output format (default: md); csv needs a workbook
   --mode semantic|layout|hybrid   Markdown rendering mode (default: hybrid)
   --pages RANGE            Select 1-based section indexes, e.g. 1-3,5
   --slides, --sheets, --chapters, --range   Aliases for --pages
+  --sheet NAME             Select workbook sheets by name (repeatable; xls, xlsx, ods)
   --json PATH              Also save JSON IR to a file, or a directory for multiple inputs
   --extract-images         Extract supported embedded raster images
   --image-dir DIRECTORY    Select image destination (implies extraction)
@@ -49,6 +51,7 @@ struct Args {
     format: String,
     mode: String,
     range: Option<String>,
+    sheets: Vec<String>,
     recursive: bool,
     jobs: Option<usize>,
     inflight: u64,
@@ -96,6 +99,7 @@ fn parse(args: Vec<String>) -> Result<Args> {
             "--range" | "--pages" | "--slides" | "--sheets" | "--chapters" => {
                 a.range = Some(val()?)
             }
+            "--sheet" => a.sheets.push(val()?),
             "--" => {
                 a.inputs.extend(it.map(|s| (PathBuf::from(s), true)));
                 break;
@@ -113,7 +117,7 @@ fn parse(args: Vec<String>) -> Result<Args> {
     if a.format == "markdown" {
         a.format = "md".into()
     }
-    if !matches!(a.format.as_str(), "md" | "json" | "html")
+    if !matches!(a.format.as_str(), "md" | "json" | "html" | "csv")
         || !matches!(a.mode.as_str(), "semantic" | "layout" | "hybrid")
     {
         return Err("invalid format or mode (see --help)".into());
@@ -198,7 +202,7 @@ fn convert(
 ) -> Result<Completed> {
     // Workers run this closure on their own thread, so the budget is per input.
     let _budget = rdocs2md::limits::start(a.timeout);
-    let d = load_range(input, a.images, a.range.as_deref())?;
+    let d = load_sheets(input, a.images, a.range.as_deref(), &a.sheets)?;
     if let Some(query) = &a.query {
         let result = query.find(&d);
         let mut emit = if multi {

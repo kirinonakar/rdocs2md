@@ -1,5 +1,5 @@
 use crate::{
-    batch, load_range, model::*, output, parallel, recover_document, render::render, search,
+    batch, load_sheets, model::*, output, parallel, recover_document, render::render, search,
     support,
 };
 use serde::Serialize;
@@ -43,7 +43,7 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
     for (name, description) in [
         (
             "convert_document",
-            "Convert a local document to Markdown, HTML, or JSON. Supply a new output_path for large results.",
+            "Convert a local document to Markdown, HTML, JSON, or CSV (workbook sheets). Supply a new output_path for large results.",
         ),
         (
             "inspect_document",
@@ -89,14 +89,16 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
         ) {
             props["format"] = json!({
                 "type":"string",
-                "enum":["md","html","json"],
-                "default":"md"
+                "enum":["md","html","json","csv"],
+                "default":"md",
+                "description":"csv writes xls, xlsx and ods workbook sheets as RFC 4180 text; fields containing commas, quotes or line breaks are quoted."
             });
             props["mode"] = json!({"type":"string","enum":["semantic","hybrid","layout"]});
             props["extract_images"] = json!({"type":"boolean"});
             props["image_dir"] = json!({"type":"string","description":format!("Image directory. Its parent must exist. {scope}")});
             props["range"] =
                 json!({"type":"string","description":"1-based inclusive ranges, e.g. 1-3,5."});
+            props["sheet"] = json!({"type":"string","minLength":1,"description":"Convert only this workbook sheet (xls, xlsx, ods). Take the title from inspect_document sections."});
             if name != "convert_documents" {
                 props["output_path"] = json!({"type":"string","description":format!("New filename with an extension that matches format. {scope}")});
             }
@@ -199,6 +201,7 @@ struct CacheKey {
     len: u64,
     modified: Option<SystemTime>,
     range: Option<String>,
+    sheets: Vec<String>,
 }
 
 struct CachedDocument {
@@ -216,8 +219,13 @@ struct DocumentCache {
 }
 
 impl DocumentCache {
-    fn load(&mut self, path: &Path, range: Option<&str>) -> Result<Rc<Document>> {
-        let key = Self::key(path, range)?;
+    fn load(
+        &mut self,
+        path: &Path,
+        range: Option<&str>,
+        sheets: &[String],
+    ) -> Result<Rc<Document>> {
+        let key = Self::key(path, range, sheets)?;
         // A rewritten file must not keep its earlier version cached, whichever
         // range that entry was parsed from.
         self.drop_stale(&key);
@@ -228,7 +236,7 @@ impl DocumentCache {
             self.entries.push(entry);
             return Ok(document);
         }
-        let document = Rc::new(load_range(path, false, range)?);
+        let document = Rc::new(load_sheets(path, false, range, sheets)?);
         // A parse that ran out of time returns fewer pages, so it must not be
         // reused: the next request may allow more time and would otherwise get
         // the truncated copy back immediately.
@@ -275,13 +283,14 @@ impl DocumentCache {
     }
 
     /// Size and modification time invalidate a cached document in place.
-    fn key(path: &Path, range: Option<&str>) -> Result<CacheKey> {
+    fn key(path: &Path, range: Option<&str>, sheets: &[String]) -> Result<CacheKey> {
         let metadata = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(CacheKey {
             path: path.to_path_buf(),
             len: metadata.len(),
             modified: metadata.modified().ok(),
             range: range.map(str::to_owned),
+            sheets: sheets.to_vec(),
         })
     }
 }
@@ -329,9 +338,15 @@ struct Conversion<'a> {
     format: &'a str,
     mode: &'a str,
     range: Option<&'a str>,
+    sheet: Option<&'a str>,
 }
 
 impl Conversion<'_> {
+    /// Named sheet filter in the form the loader and the cache key expect.
+    fn sheets(&self) -> Vec<String> {
+        self.sheet.map(str::to_owned).into_iter().collect()
+    }
+
     fn render(
         &self,
         input: &Path,
@@ -339,7 +354,8 @@ impl Conversion<'_> {
         dir: Option<&Path>,
         root: &Path,
     ) -> Result<(String, Vec<String>)> {
-        let d = load_range(input, dir.is_some(), self.range)?;
+        let sheets = self.sheets();
+        let d = load_sheets(input, dir.is_some(), self.range, &sheets)?;
         let links = if let Some(dir) = dir {
             output::extract(&d, dir, out.map(output::parent).unwrap_or(root))?
         } else {
@@ -529,6 +545,7 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
         format: text("format").unwrap_or("md"),
         mode: text("mode").unwrap_or("hybrid"),
         range: text("range"),
+        sheet: text("sheet"),
     };
     if name == "convert_documents" {
         return convert_batch(access, args, &conversion, timeout);
@@ -542,11 +559,15 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
                 .as_u64()
                 .map_or(search::DEFAULT_LIMIT, |n| n as usize),
         )?;
-        let document = access.cache.borrow_mut().load(&input, conversion.range)?;
+        let sheets = conversion.sheets();
+        let document = access
+            .cache
+            .borrow_mut()
+            .load(&input, conversion.range, &sheets)?;
         return Reply::json(&query.find(&document));
     }
     if name == "inspect_document" {
-        let document = access.cache.borrow_mut().load(&input, None)?;
+        let document = access.cache.borrow_mut().load(&input, None, &[])?;
         let document = &*document;
         let sections: Vec<_> = document
             .sections
@@ -590,10 +611,14 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
     }
     // Without images the parsed document can be reused by later read-only
     // requests; image extraction changes the returned links, so it is not cached.
+    let sheets = conversion.sheets();
     let document = if dir.is_none() {
-        access.cache.borrow_mut().load(&input, conversion.range)?
+        access
+            .cache
+            .borrow_mut()
+            .load(&input, conversion.range, &sheets)?
     } else {
-        Rc::new(load_range(&input, true, conversion.range)?)
+        Rc::new(load_sheets(&input, true, conversion.range, &sheets)?)
     };
     let document = &*document;
     let links = match dir.as_deref() {
@@ -822,11 +847,11 @@ mod tests {
         ));
         fs::write(&path, br"{\rtf1 first}").unwrap();
         let mut cache = DocumentCache::default();
-        let first = cache.load(&path, None).unwrap();
+        let first = cache.load(&path, None, &[]).unwrap();
         assert_eq!(first.sections.len(), 1);
-        assert!(Rc::ptr_eq(&first, &cache.load(&path, None).unwrap()));
+        assert!(Rc::ptr_eq(&first, &cache.load(&path, None, &[]).unwrap()));
         fs::write(&path, br"{\rtf1 second\page third}").unwrap();
-        let changed = cache.load(&path, None).unwrap();
+        let changed = cache.load(&path, None, &[]).unwrap();
         assert_eq!(changed.sections.len(), 2);
         assert!(!Rc::ptr_eq(&first, &changed));
         // The stale version is dropped as soon as the newer one is loaded.
@@ -851,11 +876,11 @@ mod tests {
         let mut cache = DocumentCache::default();
         // Without a budget this document caches normally.
         let _budget = crate::limits::start(None);
-        let complete = cache.load(&path, None).unwrap();
+        let complete = cache.load(&path, None, &[]).unwrap();
         cache.clear();
         assert_eq!(complete.sections.len(), 2);
         crate::limits::expire();
-        let truncated = cache.load(&path, None).unwrap();
+        let truncated = cache.load(&path, None, &[]).unwrap();
         assert!(!Rc::ptr_eq(&complete, &truncated));
         assert!(cache.entries.is_empty());
         assert_eq!(cache.bytes, 0);

@@ -29,10 +29,20 @@ pub fn recover_document<T>(
     std::panic::catch_unwind(action).unwrap_or_else(|_| Err("document processing panicked".into()))
 }
 pub fn load(path: &Path, images: bool) -> Result<Document> {
-    load_range(path, images, None)
+    load_sheets(path, images, None, &[])
 }
 
 pub fn load_range(path: &Path, images: bool, range: Option<&str>) -> Result<Document> {
+    load_sheets(path, images, range, &[])
+}
+
+/// Load a document and keep only the named workbook sheets, if any.
+pub fn load_sheets(
+    path: &Path,
+    images: bool,
+    range: Option<&str>,
+    sheets: &[String],
+) -> Result<Document> {
     let range = range.map(SectionRange::parse).transpose()?;
     let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let m = f.metadata()?;
@@ -45,18 +55,33 @@ pub fn load_range(path: &Path, images: bool, range: Option<&str>) -> Result<Docu
     if bytes.len() == FILE_LIMIT && f.read(&mut [0])? != 0 {
         return Err("file limit exceeded".into());
     }
-    convert_selected(&bytes, images, range.as_ref())
+    convert_selected(&bytes, images, range.as_ref(), sheets)
 }
 pub fn convert(b: &[u8], images: bool) -> Result<Document> {
-    convert_range(b, images, None)
+    convert_sheets(b, images, None, &[])
 }
 
 pub fn convert_range(b: &[u8], images: bool, range: Option<&str>) -> Result<Document> {
-    let range = range.map(SectionRange::parse).transpose()?;
-    convert_selected(b, images, range.as_ref())
+    convert_sheets(b, images, range, &[])
 }
 
-fn convert_selected(b: &[u8], images: bool, range: Option<&SectionRange>) -> Result<Document> {
+/// Convert in-memory bytes and keep only the named workbook sheets, if any.
+pub fn convert_sheets(
+    b: &[u8],
+    images: bool,
+    range: Option<&str>,
+    sheets: &[String],
+) -> Result<Document> {
+    let range = range.map(SectionRange::parse).transpose()?;
+    convert_selected(b, images, range.as_ref(), sheets)
+}
+
+fn convert_selected(
+    b: &[u8],
+    images: bool,
+    range: Option<&SectionRange>,
+    sheets: &[String],
+) -> Result<Document> {
     if b.len() > FILE_LIMIT {
         return Err("document input exceeds 2 GiB".into());
     }
@@ -76,6 +101,7 @@ fn convert_selected(b: &[u8], images: bool, range: Option<&SectionRange>) -> Res
     } else {
         return Err("unrecognized document signature".into());
     };
+    d.select_sheets(sheets)?;
     if d.sections.is_empty() {
         return Err(format!("{} contains no supported document sections", d.format).into());
     }

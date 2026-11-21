@@ -364,16 +364,105 @@ fn html_table(
     out.push_str("</table>\n");
     Ok(())
 }
+
+/// Quote one RFC 4180 field. A field that contains the delimiter, a quote or a
+/// line break is wrapped in quotes and its own quotes are doubled, so `A, B`
+/// and `그는 "좋다"` stay inside one cell when the CSV is read back.
+fn csv_field(text: &str) -> String {
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text.into()
+    }
+}
+
+fn csv_cell(cell: &Cell) -> String {
+    let mut text = String::new();
+    for run in &cell.runs {
+        text.push_str(&run.text);
+    }
+    for block in &cell.blocks {
+        let Block::Paragraph { runs, .. } = block else {
+            continue;
+        };
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        for run in runs {
+            text.push_str(&run.text);
+        }
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Workbook sheets as CSV. Every selected sheet is written in order; when more
+/// than one remains, a `# Sheet: NAME` line marks the sheet so that joining
+/// sheets into one file loses no information.
+fn csv(doc: &Document) -> Result<String> {
+    if !matches!(doc.format.as_str(), "xls" | "xlsx" | "ods") {
+        return Err(format!(
+            "csv output supports xls, xlsx and ods workbooks, not {}",
+            doc.format
+        )
+        .into());
+    }
+    let marked = doc.sections.len() > 1;
+    let mut out = String::new();
+    for (i, section) in doc.sections.iter().enumerate() {
+        if marked {
+            if i > 0 {
+                out.push('\n');
+            }
+            let title: String = if section.title.trim().is_empty() {
+                (i + 1).to_string()
+            } else {
+                section
+                    .title
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+            };
+            writeln!(out, "# Sheet: {title}")?;
+        }
+        for block in &section.blocks {
+            let Block::Table { rows } = block else {
+                continue;
+            };
+            let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+            for row in rows {
+                for column in 0..width {
+                    if column > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&csv_field(
+                        &row.get(column).map(csv_cell).unwrap_or_default(),
+                    ));
+                }
+                out.push('\n');
+                if out.len() > EXPANSION_LIMIT {
+                    return Err("rendered document exceeds output limit".into());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> Result<String> {
     if !matches!(mode, "semantic" | "layout" | "hybrid") {
         return Err("mode must be semantic, layout or hybrid".into());
+    }
+    if format == "csv" {
+        return csv(doc);
     }
     if format == "json" {
         return Ok(serde_json::to_string_pretty(doc)? + "\n");
     }
     let html = format == "html";
     if !html && format != "md" {
-        return Err("format must be md, html or json".into());
+        return Err("format must be md, html, json or csv".into());
     }
     let mut out = String::new();
     if html {
@@ -672,5 +761,38 @@ mod tests {
     fn markup_is_still_escaped() {
         assert_eq!(markdown("<div>"), "\\<div>");
         assert_eq!(markdown("<https://example.com>"), "\\<https://example.com>");
+    }
+
+    #[test]
+    fn csv_quotes_commas_and_marks_sheets() {
+        let mut doc = Document::new("xlsx");
+        let mut sales = Section::new("sheet", "xl/worksheets/sheet1.xml").indexed(0);
+        sales.title = "매출".into();
+        sales.blocks.push(Block::Table {
+            rows: vec![
+                vec![Cell::text("이름"), Cell::text("금액, 단위")],
+                vec![Cell::text("A, B"), Cell::text("그는 \"좋다\"")],
+                vec![Cell::text("줄\n바꿈")],
+            ],
+        });
+        let mut summary = Section::new("sheet", "xl/worksheets/sheet2.xml").indexed(1);
+        summary.title = "Summary".into();
+        summary.blocks.push(Block::Table {
+            rows: vec![vec![Cell::text("42")]],
+        });
+        doc.sections.push(sales);
+        doc.sections.push(summary);
+        let out = render(&doc, "csv", "hybrid", &Properties::new()).unwrap();
+        assert_eq!(
+            out,
+            "# Sheet: 매출\n이름,\"금액, 단위\"\n\"A, B\",\"그는 \"\"좋다\"\"\"\n\"줄\n바꿈\",\n\n# Sheet: Summary\n42\n"
+        );
+        // A single selected sheet stays plain CSV without sheet markers.
+        doc.sections.remove(0);
+        assert_eq!(
+            render(&doc, "csv", "hybrid", &Properties::new()).unwrap(),
+            "42\n"
+        );
+        assert!(render(&Document::new("docx"), "csv", "hybrid", &Properties::new()).is_err());
     }
 }

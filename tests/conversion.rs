@@ -1,4 +1,4 @@
-use rdocs2md::{convert, convert_range, model::*, render::render, search::Query};
+use rdocs2md::{convert, convert_range, convert_sheets, model::*, render::render, search::Query};
 use serde_json::{json, to_value};
 use std::io::{Cursor, Write};
 fn package(entries: &[(&str, &str)]) -> Vec<u8> {
@@ -908,6 +908,48 @@ fn xlsx_cached_formula_dates_sparse_cells_and_merge() {
     let html = render(&d, "html", "hybrid", &Properties::new()).unwrap();
     assert!(html.contains("background-color:#F0E0D0;border-right:2px dashed #123456;text-align:right;vertical-align:middle;"));
     assert!(html.contains("font-size:14pt;color:#001122;\"><strong>1900-03-01</strong>"));
+}
+
+#[test]
+fn xlsx_csv_selects_sheets_and_quotes_fields() {
+    let data = package(&[
+        (
+            "[Content_Types].xml",
+            "<Types><Override PartName='/xl/book.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'/></Types>",
+        ),
+        (
+            "_rels/.rels",
+            "<Relationships><Relationship Id='r' Type='rel/officeDocument' Target='xl/book.xml'/></Relationships>",
+        ),
+        (
+            "xl/book.xml",
+            "<workbook><sheets><sheet id='a' name='매출'/><sheet id='b' name='Summary'/></sheets></workbook>",
+        ),
+        (
+            "xl/_rels/book.xml.rels",
+            "<Relationships><Relationship Id='a' Type='rel/worksheet' Target='a.xml'/><Relationship Id='b' Type='rel/worksheet' Target='b.xml'/></Relationships>",
+        ),
+        (
+            "xl/a.xml",
+            "<worksheet><sheetData><row r='1'><c r='A1' t='inlineStr'><is><t>이름</t></is></c><c r='B1' t='inlineStr'><is><t>값, 단위</t></is></c></row></sheetData></worksheet>",
+        ),
+        (
+            "xl/b.xml",
+            "<worksheet><sheetData><row r='1'><c r='A1'><v>42</v></c></row></sheetData></worksheet>",
+        ),
+    ]);
+    let d = convert(&data, false).unwrap();
+    let all = render(&d, "csv", "hybrid", &Properties::new()).unwrap();
+    assert!(all.starts_with("# Sheet: 매출\n이름,\"값, 단위\"\n"), "{all}");
+    assert!(all.ends_with("# Sheet: Summary\n42\n"), "{all}");
+    let d = convert_sheets(&data, false, None, &["summary".into()]).unwrap();
+    assert_eq!(d.sections.len(), 1);
+    assert_eq!(d.sections[0].title, "Summary");
+    assert_eq!(
+        render(&d, "csv", "hybrid", &Properties::new()).unwrap(),
+        "42\n"
+    );
+    assert!(convert_sheets(&data, false, None, &["없는 시트".into()]).is_err());
 }
 
 #[test]

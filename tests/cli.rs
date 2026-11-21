@@ -101,6 +101,27 @@ fn extract_raster_and_reuse_existing_result() {
 }
 
 #[test]
+fn csv_and_sheet_options_require_a_workbook() {
+    let work = Scratch::new();
+    fs::write(work.path("note.rtf"), br"{\rtf1 text}").unwrap();
+    let csv = work.run(&["note.rtf", "--format", "csv", "--stdout"]);
+    assert_eq!(csv.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&csv.stderr).contains("xls, xlsx and ods"),
+        "{}",
+        String::from_utf8_lossy(&csv.stderr)
+    );
+    let sheet = work.run(&["note.rtf", "--sheet", "Sheet1", "--stdout"]);
+    assert_eq!(sheet.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&sheet.stderr).contains("sheet selection"),
+        "{}",
+        String::from_utf8_lossy(&sheet.stderr)
+    );
+    assert_eq!(work.run(&["note.rtf", "--format", "tsv"]).status.code(), Some(2));
+}
+
+#[test]
 fn recursive_batch_with_destinations_and_stdout() {
     let work = Scratch::new();
     fs::create_dir_all(work.path("docs/sub")).unwrap();
@@ -344,7 +365,7 @@ fn mcp_advertises_and_renders_output_formats() {
         let format = &schema["properties"]["format"];
         match tool["name"].as_str().unwrap() {
             "convert_document" | "extract_document_range" | "convert_documents" => {
-                assert_eq!(format["enum"], json!(["md", "html", "json"]));
+                assert_eq!(format["enum"], json!(["md", "html", "json", "csv"]));
                 assert_eq!(format["default"], "md");
                 assert!(
                     !schema["required"]
