@@ -28,22 +28,20 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
     let root = root.display();
     let scope = if allow_outside_root {
         format!(
-            "MCP root: {root}. Relative paths are resolved against this root; if your \
-             workspace root differs, use absolute paths. Absolute paths outside this \
-             root are also accepted."
+            "MCP root: {root}. Relative paths resolve here; if your workspace root \
+             differs, use absolute paths. Paths outside it are also accepted."
         )
     } else {
         format!(
-            "MCP root: {root}. Relative paths are resolved against this root; if your \
-             workspace root differs, use absolute paths. Paths outside this root are \
-             rejected."
+            "MCP root: {root}. Relative paths resolve here; if your workspace root \
+             differs, use absolute paths. Paths outside it are rejected."
         )
     };
     let mut tools = Vec::new();
     for (name, description) in [
         (
             "convert_document",
-            "Convert a local document to Markdown, HTML, JSON, or CSV (workbook sheets). Supply a new output_path for large results.",
+            "Convert a local document to Markdown, HTML, JSON, or CSV. Use output_path for results that may be large.",
         ),
         (
             "inspect_document",
@@ -69,9 +67,9 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
         let mut props = json!({});
         let mut required = vec![];
         if name == "convert_documents" {
-            props["paths"] = json!({"type":"array","items":{"type":"string"},"minItems":1,"description":format!("Files, directories or wildcard patterns supporting *, ?, [], and **. {scope}")});
+            props["paths"] = json!({"type":"array","items":{"type":"string"},"minItems":1,"description":format!("Files, directories or wildcard patterns (*, ?, [], **). {scope}")});
             props["recursive"] = json!({"type":"boolean","description":"Scan subdirectories for directory and wildcard inputs."});
-            props["output_dir"] = json!({"type":"string","description":format!("Output directory. Its parent must exist if the directory is new. {scope}")});
+            props["output_dir"] = json!({"type":"string","description":format!("Output directory; parent must exist when new. {scope}")});
             props["jobs"] = json!({"type":"integer","minimum":1,"maximum":parallel::MAX_JOBS,"description":"Defaults to the CPU count."});
             props["max_inflight_bytes"] = json!({"type":"integer","minimum":0,"description":"Defaults to 1 GiB; 0 removes the cap."});
             required.extend(["paths", "output_dir"]);
@@ -81,7 +79,7 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
             required.push("path")
         }
         if name != "list_supported_formats" {
-            props["timeout_seconds"] = json!({"type":"integer","minimum":0,"description":"Time limit for this call in seconds; 0 disables it. Defaults to 300."});
+            props["timeout_seconds"] = json!({"type":"integer","minimum":0,"description":"Seconds for this call; 0 disables. Default 300."});
         }
         if matches!(
             name,
@@ -91,16 +89,16 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
                 "type":"string",
                 "enum":["md","html","json","csv"],
                 "default":"md",
-                "description":"csv writes xls, xlsx and ods workbook sheets as RFC 4180 text; fields containing commas, quotes or line breaks are quoted."
+                "description":"csv writes workbook sheets (xls, xlsx, ods) as RFC 4180 text."
             });
             props["mode"] = json!({"type":"string","enum":["semantic","hybrid","layout"]});
             props["extract_images"] = json!({"type":"boolean"});
-            props["image_dir"] = json!({"type":"string","description":format!("Image directory. Its parent must exist. {scope}")});
+            props["image_dir"] = json!({"type":"string","description":format!("Image directory; parent must exist. {scope}")});
             props["range"] =
                 json!({"type":"string","description":"1-based inclusive ranges, e.g. 1-3,5."});
-            props["sheet"] = json!({"type":"string","minLength":1,"description":"Convert only this workbook sheet (xls, xlsx, ods). Take the title from inspect_document sections."});
+            props["sheet"] = json!({"type":"string","minLength":1,"description":"Only this workbook sheet (xls, xlsx, ods); title from inspect_document sections."});
             if name != "convert_documents" {
-                props["output_path"] = json!({"type":"string","description":format!("New filename with an extension that matches format. {scope}")});
+                props["output_path"] = json!({"type":"string","description":format!("New file with an extension matching format. {scope}")});
             }
         }
         if name == "search_document" {
@@ -894,7 +892,7 @@ mod tests {
             let text = serde_json::to_string(&defs).unwrap();
             assert!(text.contains("MCP root: C:/docs-root"));
             assert!(text.contains("if your workspace root differs, use absolute paths"));
-            assert_eq!(text.contains("outside this root are rejected"), !allow);
+            assert_eq!(text.contains("outside it are rejected"), !allow);
             // No path argument may leave the agent guessing where relative paths start.
             for tool in &defs {
                 for (key, prop) in tool["inputSchema"]["properties"].as_object().unwrap() {
