@@ -2047,10 +2047,12 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     // Earlier rows may already be merged, so measure the box
                     // from the first line instead of restarting at this row.
                     // The widest end of the earlier rows has to survive as well.
-                    let (x0, top, old_end) = bounds.unwrap_or((x, row_y, end));
+                    // A fragment of this row may also start left of the first one.
+                    let (old_left, top, old_end) = bounds.unwrap_or((x, row_y, end));
                     // `previous` keeps this row's own right edge so that the gap
                     // to the next fragment is still measured inside the row.
                     let row_end = end;
+                    let left = old_left.min(info.x);
                     let end = old_end.max(end);
                     let last = info.last.clone();
                     if let Some(Block::Paragraph {
@@ -2061,13 +2063,14 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     {
                         join_runs(para, runs, gap > size * 0.12);
                         properties.insert("last_y_pt".into(), y.to_string());
-                        properties.insert("w_pt".into(), (end - x0).max(0.).to_string());
+                        properties.insert("x_pt".into(), left.to_string());
+                        properties.insert("w_pt".into(), (end - left).max(0.).to_string());
                         properties.insert(
                             "h_pt".into(),
                             (top - row_y + row_size).max(0.).to_string(),
                         );
                     }
-                    bounds = Some((x0, top, end));
+                    bounds = Some((left, top, end));
                     previous = Some(LineInfo {
                         x,
                         end: row_end,
@@ -2095,13 +2098,15 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     }) = out.last_mut()
                 {
                     join_wrapped_line(para, runs, prev.discretionary_hyphen);
-                    // Keep the first line's origin and the widest line, so that
-                    // a paragraph of three or more lines is fully covered.
-                    let (x0, top, end) = bounds.map_or((prev.x, prev.y, prev.end), |b| b);
-                    let end = end.max(info.end);
-                    bounds = Some((x0, top, end));
+                    // Merge the horizontal extent of every line: the top row keeps
+                    // its origin, but an outdented continuation row must stay in.
+                    let (old_left, top, old_end) = bounds.unwrap_or((prev.x, prev.y, prev.end));
+                    let left = old_left.min(info.x);
+                    let end = old_end.max(info.end);
+                    bounds = Some((left, top, end));
+                    properties.insert("x_pt".into(), left.to_string());
                     properties.insert("last_y_pt".into(), y.to_string());
-                    properties.insert("w_pt".into(), (end - x0).max(0.).to_string());
+                    properties.insert("w_pt".into(), (end - left).max(0.).to_string());
                     properties.insert(
                         "h_pt".into(),
                         (top - info.y + info.size).max(0.).to_string(),
