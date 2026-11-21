@@ -28,13 +28,15 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
     let root = root.display();
     let scope = if allow_outside_root {
         format!(
-            "MCP root: {root}. Relative paths are resolved against this root; \
-             absolute local paths are also accepted."
+            "MCP root: {root}. Relative paths are resolved against this root; if your \
+             workspace root differs, use absolute paths. Absolute paths outside this \
+             root are also accepted."
         )
     } else {
         format!(
-            "MCP root: {root}. Relative paths are resolved against this root; \
-             paths outside it are rejected."
+            "MCP root: {root}. Relative paths are resolved against this root; if your \
+             workspace root differs, use absolute paths. Paths outside this root are \
+             rejected."
         )
     };
     let mut tools = Vec::new();
@@ -650,13 +652,15 @@ fn dispatch(access: &Access, req: Value, phase: &mut u8, defs: &[Value]) -> Opti
             let root = access.root.display();
             let instructions = if access.allow_outside_root {
                 format!(
-                    "Document root: {root}. Relative file paths are resolved against \
-                     this directory; absolute local paths outside it are also accepted."
+                    "Document root: {root}. Relative file paths are resolved against this \
+                     directory; if your workspace root differs from it, send absolute \
+                     paths. Absolute local paths outside it are also accepted."
                 )
             } else {
                 format!(
-                    "Document root: {root}. Relative file paths are resolved against \
-                     this directory; paths outside it are rejected."
+                    "Document root: {root}. Relative file paths are resolved against this \
+                     directory; if your workspace root differs from it, send absolute \
+                     paths. Paths outside it are rejected."
                 )
             };
             json!({"protocolVersion":v,"capabilities":{"tools":{}},"serverInfo":{"name":"rdocs2md","version":env!("CARGO_PKG_VERSION")},"instructions":instructions})
@@ -864,7 +868,8 @@ mod tests {
             let defs = definitions(Path::new("C:/docs-root"), allow);
             let text = serde_json::to_string(&defs).unwrap();
             assert!(text.contains("MCP root: C:/docs-root"));
-            assert_eq!(text.contains("paths outside it are rejected"), !allow);
+            assert!(text.contains("if your workspace root differs, use absolute paths"));
+            assert_eq!(text.contains("outside this root are rejected"), !allow);
             // No path argument may leave the agent guessing where relative paths start.
             for tool in &defs {
                 for (key, prop) in tool["inputSchema"]["properties"].as_object().unwrap() {
@@ -881,5 +886,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn initialize_instructions_name_the_root() {
+        let access = Access {
+            root: PathBuf::from("C:/docs-root"),
+            allow_outside_root: false,
+            cache: RefCell::default(),
+        };
+        let defs = definitions(&access.root, access.allow_outside_root);
+        let mut phase = 0;
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}
+        });
+        let reply = dispatch(&access, request, &mut phase, &defs).unwrap();
+        let instructions = reply["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("Document root: C:/docs-root"));
+        assert!(instructions.contains("if your workspace root differs from it"));
+        assert!(instructions.contains("send absolute paths"));
+        assert!(instructions.contains("Paths outside it are rejected"));
     }
 }
