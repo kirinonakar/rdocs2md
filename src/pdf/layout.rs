@@ -2046,7 +2046,12 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     };
                     // Earlier rows may already be merged, so measure the box
                     // from the first line instead of restarting at this row.
-                    let (x0, top) = bounds.map_or((x, row_y), |(x0, top, _)| (x0, top));
+                    // The widest end of the earlier rows has to survive as well.
+                    let (x0, top, old_end) = bounds.unwrap_or((x, row_y, end));
+                    // `previous` keeps this row's own right edge so that the gap
+                    // to the next fragment is still measured inside the row.
+                    let row_end = end;
+                    let end = old_end.max(end);
                     let last = info.last.clone();
                     if let Some(Block::Paragraph {
                         runs: para,
@@ -2065,7 +2070,7 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     bounds = Some((x0, top, end));
                     previous = Some(LineInfo {
                         x,
-                        end,
+                        end: row_end,
                         y: row_y,
                         size: row_size,
                         bold,
