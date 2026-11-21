@@ -49,6 +49,7 @@ Default output is a `.md` file with the same name beside the input. Outputs are 
 | `--stdout` | Write one document or JSON Lines (`input` and `content` per successful file). Diagnostics go to stderr |
 | `-r`, `--recursive` | Include subdirectories when scanning directories or wildcard inputs |
 | `-j`, `--jobs N` | Parallel workers for a batch, 1 to 64, default the detected CPU count |
+| `--max-inflight-bytes SIZE` | Cap on the input bytes converted at once, e.g. `512`, `4MiB`, `1.5GiB`. Default 1 GiB; `0` removes the cap |
 | `--format md\|html\|json` | Output format, default `md` (`markdown` is accepted) |
 | `--mode semantic\|hybrid\|layout` | Rendering mode, default `hybrid` |
 | `--pages RANGE` | 1-based inclusive range, e.g. `1-3,5` |
@@ -56,18 +57,20 @@ Default output is a `.md` file with the same name beside the input. Outputs are 
 | `--json PATH` | Also save the selected IR to a file for a single explicit input or per-file JSON in a directory for a batch |
 | `--extract-images` | Extract supported embedded raster images |
 | `--image-dir DIRECTORY` | Image destination, with a subdirectory per document for a batch. Implies extraction |
-| `--search QUERY`, `--case-sensitive`, `--limit N` | Search extracted text and return JSON with snippets, section indexes, and available cell addresses or coordinates. Case-insensitive with 50 matches per file unless a limit from 1 to 200 is given |
+| `--search QUERY`, `--case-sensitive`, `--limit N` | Search extracted text and return JSON with snippets, source section/page, block ids, and available cell addresses or coordinates. Case-insensitive with 50 matches per file unless a limit from 1 to 200 is given |
 | `--list-formats`, `--version`, `--licenses`, `--help` | Support matrix (JSON), version, license notices, usage |
 
 Exit codes: `0` success, `1` conversion or batch failure (each failed input is reported and the rest still run), `2` invalid option.
 
 A batch accepts files, directories and quoted glob patterns such as `"reports/**/*.pdf"`. Directory scans include supported extensions, files from one input run in sorted order, duplicates run once, and repeated base names get suffixes such as `report-2`. `--` disables option and wildcard parsing for the remaining input paths. Batches run on several workers when more than one file is found, `--jobs 1` forces sequential processing, and per-file results keep the expanded input order.
 
+`--max-inflight-bytes` lowers the worker count when large inputs would otherwise be parsed at the same time, so a batch of big documents does not consume memory on every core. The default is 1 GiB of input bytes at once; `0` disables the cap.
+
 ## Search
 
 `--search QUERY` matches literal text inside a paragraph or table cell, including text split across formatting runs, and writes JSON to stdout instead of a converted file. Combine it with `--pages` to narrow the searched units. Matching is case-insensitive unless `--case-sensitive` is given, and `--limit` caps matches per file (default 50, range 1-200). `--case-sensitive` and `--limit` are rejected without `--search`, and search cannot be combined with `-o`, `--out-dir`, `--json`, or image extraction.
 
-Each match carries `section_index`, `section_kind`, `source`, a 1-based `path` through blocks and table cells, `before`/`text`/`after` with up to 60 characters of context per side, and zero-based `start_char`/`end_char` offsets within the paragraph or cell (exclusive end). Spreadsheet cells add `address`, and positioned PDF blocks add `x_pt` and `y_pt`. The result reports `format`, `warnings`, `matches`, and `truncated`, which is `true` when more matches exist than the limit allowed. A batch search writes one JSON line per input with `input` and `result`.
+Each match carries `section_index` and `source_section_index`, `section_kind`, `source`, a 1-based `path` through blocks and table cells, a stable `block_id` such as `s2-b1` (`-r2c3` for a table cell), `before`/`text`/`after` with up to 60 characters of context per side, and zero-based `start_char`/`end_char` offsets within the paragraph or cell (exclusive end). PDF pages and slides add `source_page`. Spreadsheet cells add `address`; positioned PDF blocks add `x_pt`, `y_pt` and, when the parser recorded a size, `bounding_box` with `x_pt`, `y_pt`, `width_pt`, and `height_pt`. Use these fields to cite a page, block, or rectangle in the source document. The result reports `format`, `warnings`, `matches`, and `truncated`, which is `true` when more matches exist than the limit allowed. A batch search writes one JSON line per input with `input` and `result`.
 
 ## Choosing a mode
 
@@ -80,6 +83,8 @@ Reach for `layout` only when spacing and placement matter.
 ## Ranges
 
 Units follow the document model: PDF pages, presentation slides, workbook sheets, EPUB spine items, and stored sections or explicit page breaks for flow-based documents. Indexed formats skip conversion of units outside the range. Flow formats read the content needed to locate section boundaries. Inspect `sections` in the JSON IR to see the selectable units.
+
+Each section in the JSON IR keeps a 1-based `index` for its original position, so numbering stays valid when a range selected a subset.
 
 ## Images
 
