@@ -363,14 +363,14 @@ fn table_from_cells(positions: Vec<(usize, usize)>, cells: Vec<Vec<Block>>) -> R
     let max_col = positions.iter().map(|(_, col)| *col).max().unwrap_or(0);
     let row_count = max_row.saturating_add(1);
     let col_count = max_col.saturating_add(1);
-    let grid_size = row_count.checked_mul(col_count).unwrap_or(usize::MAX);
+    let grid_size = row_count.saturating_mul(col_count);
     let sequential = duplicate || grid_size > CELL_LIMIT || grid_size < cells.len();
     let (rows, columns) = if sequential {
         (1, cells.len())
     } else {
         (row_count, col_count)
     };
-    if rows.checked_mul(columns).unwrap_or(usize::MAX) > CELL_LIMIT {
+    if rows.saturating_mul(columns) > CELL_LIMIT {
         return Err("HWP 3.0 table cell limit exceeded".into());
     }
     let mut grid = (0..rows * columns)
@@ -399,8 +399,8 @@ fn flush_text(out: &mut Vec<Block>, text: &mut String) {
 
 fn decode_hchar_array(data: &[u8]) -> String {
     let mut text = String::new();
-    for pair in data.chunks_exact(2) {
-        let code = u16::from_le_bytes([pair[0], pair[1]]);
+    for pair in data.as_chunks::<2>().0 {
+        let code = u16::from_le_bytes(*pair);
         if code == 0 {
             break;
         }

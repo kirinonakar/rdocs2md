@@ -97,40 +97,6 @@ fn pdf_font_size(runs: &[Run]) -> f32 {
         .unwrap_or(12.)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::markdown;
-
-    #[test]
-    fn annotations_keep_literal_brackets() {
-        assert_eq!(markdown("값은? [2점]"), "값은? [2점]");
-        assert_eq!(markdown("보기는 [1～3] 이다"), "보기는 [1～3] 이다");
-        assert_eq!(markdown("[A] 대응된다"), "[A] 대응된다");
-        assert_eq!(markdown("[보 기]"), "[보 기]");
-    }
-
-    #[test]
-    fn link_syntax_stays_escaped() {
-        assert_eq!(markdown("[text](target)"), "\\[text\\](target)");
-        assert_eq!(markdown("[ref][label]"), "\\[ref\\][label]");
-    }
-
-    #[test]
-    fn labels_keep_literal_angle_brackets() {
-        assert_eq!(markdown("<보기>는"), "<보기>는");
-        assert_eq!(markdown("<"), "<");
-        assert_eq!(markdown(">"), ">");
-        assert_eq!(markdown("고개 > 고개"), "고개 > 고개");
-        assert_eq!(markdown("<A> 참조"), "<A> 참조");
-    }
-
-    #[test]
-    fn markup_is_still_escaped() {
-        assert_eq!(markdown("<div>"), "\\<div>");
-        assert_eq!(markdown("<https://example.com>"), "\\<https://example.com>");
-    }
-}
-
 fn pdf_baseline(properties: &Properties) -> Option<f32> {
     properties
         .get("y_pt")?
@@ -578,7 +544,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                                 })
                             });
                             if adjacent {
-                                write!(out, "{val}  \n")?;
+                                writeln!(out, "{val}  ")?;
                             } else {
                                 writeln!(out, "{val}\n")?;
                             }
@@ -641,4 +607,38 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         out.push_str("</article>\n")
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::markdown;
+
+    #[test]
+    fn annotations_keep_literal_brackets() {
+        assert_eq!(markdown("값은? [2점]"), "값은? [2점]");
+        assert_eq!(markdown("보기는 [1～3] 이다"), "보기는 [1～3] 이다");
+        assert_eq!(markdown("[A] 대응된다"), "[A] 대응된다");
+        assert_eq!(markdown("[보 기]"), "[보 기]");
+    }
+
+    #[test]
+    fn link_syntax_stays_escaped() {
+        assert_eq!(markdown("[text](target)"), "\\[text\\](target)");
+        assert_eq!(markdown("[ref][label]"), "\\[ref\\][label]");
+    }
+
+    #[test]
+    fn labels_keep_literal_angle_brackets() {
+        assert_eq!(markdown("<보기>는"), "<보기>는");
+        assert_eq!(markdown("<"), "<");
+        assert_eq!(markdown(">"), ">");
+        assert_eq!(markdown("고개 > 고개"), "고개 > 고개");
+        assert_eq!(markdown("<A> 참조"), "<A> 참조");
+    }
+
+    #[test]
+    fn markup_is_still_escaped() {
+        assert_eq!(markdown("<div>"), "\\<div>");
+        assert_eq!(markdown("<https://example.com>"), "\\<https://example.com>");
+    }
 }

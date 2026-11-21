@@ -154,7 +154,7 @@ fn fold_radicals(mut items: Vec<Glyph>, depth: usize) -> Vec<Glyph> {
         }
         // The stretched drawing glyph can leave dashes around the radical sign.
         let prefix = prefix
-            .trim_start_matches(|c| matches!(c, '-' | '−' | '─' | ' '))
+            .trim_start_matches(['-', '−', '─', ' '])
             .to_string();
         let overline = items.iter().enumerate().position(|(j, g)| {
             j != i

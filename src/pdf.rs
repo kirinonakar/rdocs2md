@@ -357,7 +357,7 @@ fn hyhwp_eq_cid(cid: u16) -> Option<char> {
 
 fn decode_hyhwp_eq(encoding: &lopdf::Encoding<'_>, bytes: &[u8]) -> String {
     let mut text = String::new();
-    for code in bytes.chunks_exact(2) {
+    for code in bytes.as_chunks::<2>().0 {
         let decoded = Pdf::decode_text(encoding, code).unwrap_or_else(|_| "�".into());
         if decoded.contains('�')
             && let Some(cid) = code
@@ -374,14 +374,14 @@ fn decode_hyhwp_eq(encoding: &lopdf::Encoding<'_>, bytes: &[u8]) -> String {
             text.push(hyhwp_eq_unicode(character).unwrap_or(character));
         }
     }
-    if bytes.len() % 2 != 0 {
-        if let Ok(decoded) = Pdf::decode_text(encoding, &bytes[bytes.len() - 1..]) {
-            text.extend(
-                decoded
-                    .chars()
-                    .map(|character| hyhwp_eq_unicode(character).unwrap_or(character)),
-            );
-        }
+    if !bytes.len().is_multiple_of(2)
+        && let Ok(decoded) = Pdf::decode_text(encoding, &bytes[bytes.len() - 1..])
+    {
+        text.extend(
+            decoded
+                .chars()
+                .map(|character| hyhwp_eq_unicode(character).unwrap_or(character)),
+        );
     }
     text
 }
@@ -859,10 +859,10 @@ impl PageReader<'_> {
                             path_vertical_rules.push((x, y.min(end_y), y.max(end_y)));
                         }
                     }
-                    if let Some(point) = next {
-                        if path_shape.len() <= 4 {
-                            path_shape.push(point);
-                        }
+                    if let Some(point) = next
+                        && path_shape.len() <= 4
+                    {
+                        path_shape.push(point);
                     }
                     path_point = next;
                 }
@@ -872,15 +872,15 @@ impl PageReader<'_> {
                 }
                 "re" => {
                     finish_path_shape(&mut path_shape, &mut path_shapes);
-                    if let (Ok(x), Ok(y), Ok(w), Ok(h)) = (num(0), num(1), num(2), num(3)) {
-                        if path_shapes.len() < PDF_RULE_LIMIT {
-                            path_shapes.push(vec![
-                                ctm.point(x, y),
-                                ctm.point(x + w, y),
-                                ctm.point(x + w, y + h),
-                                ctm.point(x, y + h),
-                            ]);
-                        }
+                    if let (Ok(x), Ok(y), Ok(w), Ok(h)) = (num(0), num(1), num(2), num(3))
+                        && path_shapes.len() < PDF_RULE_LIMIT
+                    {
+                        path_shapes.push(vec![
+                            ctm.point(x, y),
+                            ctm.point(x + w, y),
+                            ctm.point(x + w, y + h),
+                            ctm.point(x, y + h),
+                        ]);
                     }
                     path_point = None;
                 }

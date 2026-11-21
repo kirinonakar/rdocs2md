@@ -1350,8 +1350,7 @@ fn segmented_table(
     let mut plan = Vec::new();
     let mut row = 0;
     let mut previous = None;
-    for i in first..last {
-        let band = &bands[i];
+    for (i, band) in bands.iter().enumerate().skip(first).take(last - first) {
         let start = band.partition_point(|f| f.x < left - 1.);
         let end = band.partition_point(|f| f.x <= right + 1.);
         let line = &band[start..end];
