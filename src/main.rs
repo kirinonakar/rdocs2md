@@ -25,7 +25,7 @@ Example: rdocs2md "report.pdf" -o "report.md"
   --mode semantic|layout|hybrid   Markdown rendering mode (default: hybrid)
   --pages RANGE            Select 1-based section indexes, e.g. 1-3,5
   --slides, --sheets, --chapters, --range   Aliases for --pages
-  --sheet NAME             Select workbook sheets by name (repeatable; xls, xlsx, ods)
+  --sheet NAME|NUMBER      Select workbook sheets by title or 1-based number (repeatable; xls, xlsx, ods)
   --json PATH              Also save JSON IR to a file, or a directory for multiple inputs
   --extract-images         Extract supported embedded raster images
   --image-dir DIRECTORY    Select image destination (implies extraction)

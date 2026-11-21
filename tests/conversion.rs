@@ -949,6 +949,14 @@ fn xlsx_csv_selects_sheets_and_quotes_fields() {
         render(&d, "csv", "hybrid", &Properties::new()).unwrap(),
         "42\n"
     );
+    let d = convert_sheets(&data, false, None, &["1".into()]).unwrap();
+    assert_eq!(d.sections.len(), 1);
+    assert_eq!(d.sections[0].title, "매출");
+    let d = convert_sheets(&data, false, None, &["2".into()]).unwrap();
+    assert_eq!(d.sections.len(), 1);
+    assert_eq!(d.sections[0].title, "Summary");
+    assert!(convert_sheets(&data, false, None, &["0".into()]).is_err());
+    assert!(convert_sheets(&data, false, None, &["3".into()]).is_err());
     assert!(convert_sheets(&data, false, None, &["없는 시트".into()]).is_err());
 }
 

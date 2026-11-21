@@ -96,7 +96,7 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
             props["image_dir"] = json!({"type":"string","description":format!("Image directory; parent must exist. {scope}")});
             props["range"] =
                 json!({"type":"string","description":"1-based inclusive ranges, e.g. 1-3,5."});
-            props["sheet"] = json!({"type":"string","minLength":1,"description":"Only this workbook sheet (xls, xlsx, ods); title from inspect_document sections."});
+            props["sheet"] = json!({"type":"string","minLength":1,"description":"Only this workbook sheet (xls, xlsx, ods), by title or 1-based number; titles from inspect_document sections."});
             if name != "convert_documents" {
                 props["output_path"] = json!({"type":"string","description":format!("New file with an extension matching format. {scope}")});
             }

@@ -33,7 +33,7 @@ Default output is a UTF-8 `.md` file next to the input. Existing results may be 
 | `--format md\|html\|json\|csv` | Output format, default `md` |
 | `--mode semantic\|hybrid\|layout` | Rendering mode, default `hybrid` |
 | `--pages RANGE` (`--slides`, `--sheets`, `--chapters`, `--range`) | 1-based inclusive units, e.g. `1-3,5` |
-| `--sheet NAME` | Only the named workbook sheet; repeatable |
+| `--sheet NAME\|NUMBER` | Only this workbook sheet, by title or 1-based number; repeatable |
 | `--json PATH` | Also write the JSON IR |
 | `--extract-images`, `--image-dir DIR` | Export embedded raster images |
 | `--search QUERY`, `--case-sensitive`, `--limit N` | Search text, return JSON |
@@ -66,7 +66,7 @@ Cite from a hit using `block_id` (`s2-b1`, plus `-r2c3` for a table cell), `sour
 
 `--format csv` writes xls, xlsx, and ods workbooks as RFC 4180, quoting fields that contain a comma, a double quote, or a line break. Values are the displayed text, so cached formula results, dates, and percentages appear as shown; `--mode` has no effect and CSV is rejected for other formats.
 
-`--sheet NAME` selects by title (ASCII case-insensitive, repeatable; an unknown name fails with the available titles) and `--sheets RANGE` by workbook position. Without either, every sheet is written in workbook order, each preceded by a `# Sheet: NAME` line — convert one sheet at a time when a consumer needs plain CSV. `--sheet` filters after the range.
+`--sheet` takes a title (ASCII case-insensitive) or a 1-based workbook sheet number such as `--sheet 2`; titles win when a sheet is literally named like a number, and an unknown selector fails with the available titles. It is repeatable, and `--sheets RANGE` selects by workbook position. Without either, every sheet is written in workbook order, each preceded by a `# Sheet: NAME` line — convert one sheet at a time when a consumer needs plain CSV. `--sheet` filters after the range.
 
 ## Images
 

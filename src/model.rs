@@ -106,11 +106,13 @@ impl Document {
         self.retain_sections(Some(&SectionRange::parse(range)?))
     }
 
-    /// Keep only the named workbook sheets. Names match ASCII case-insensitively,
-    /// because workbook sheet titles are unique that way; the stored 1-based
-    /// `index` stays valid for the sheets that remain.
-    pub fn select_sheets(&mut self, names: &[String]) -> Result<()> {
-        if names.is_empty() {
+    /// Keep only the selected workbook sheets. Titles match ASCII
+    /// case-insensitively, because workbook titles are unique that way, and take
+    /// precedence; any other selector is read as a 1-based workbook sheet
+    /// number, so `1` is the first sheet. The stored 1-based `index` stays valid
+    /// for the sheets that remain.
+    pub fn select_sheets(&mut self, selectors: &[String]) -> Result<()> {
+        if selectors.is_empty() {
             return Ok(());
         }
         if !matches!(self.format.as_str(), "xls" | "xlsx" | "ods") {
@@ -120,26 +122,44 @@ impl Document {
             )
             .into());
         }
-        let wanted: Vec<&str> = names.iter().map(|n| n.trim()).collect();
-        for name in &wanted {
-            if name.is_empty() {
-                return Err("sheet name must not be empty".into());
+        let titles: Vec<&str> = self.sections.iter().map(|s| s.title.as_str()).collect();
+        let mut keep = vec![false; titles.len()];
+        for selector in selectors {
+            let selector = selector.trim();
+            if selector.is_empty() {
+                return Err("sheet selector must not be empty".into());
             }
-            if !self.sections.iter().any(|s| s.title.eq_ignore_ascii_case(name)) {
-                let mut available: Vec<&str> =
-                    self.sections.iter().map(|s| s.title.as_str()).collect();
-                let more = available.len() > 20;
-                available.truncate(20);
-                return Err(format!(
-                    "sheet {name:?} not found (sheets: {}{})",
-                    available.join(", "),
-                    if more { ", ..." } else { "" }
-                )
-                .into());
+            if let Some(pos) = titles.iter().position(|t| t.eq_ignore_ascii_case(selector)) {
+                keep[pos] = true;
+                continue;
             }
+            if let Ok(number) = selector.parse::<usize>() {
+                if !(1..=titles.len()).contains(&number) {
+                    return Err(format!(
+                        "sheet number {number} is outside 1-{}",
+                        titles.len()
+                    )
+                    .into());
+                }
+                keep[number - 1] = true;
+                continue;
+            }
+            let mut available = titles.clone();
+            let more = available.len() > 20;
+            available.truncate(20);
+            return Err(format!(
+                "sheet {selector:?} not found (sheets: {}{})",
+                available.join(", "),
+                if more { ", ..." } else { "" }
+            )
+            .into());
         }
-        self.sections
-            .retain(|s| wanted.iter().any(|name| s.title.eq_ignore_ascii_case(name)));
+        let mut pos = 0;
+        self.sections.retain(|_| {
+            let selected = keep[pos];
+            pos += 1;
+            selected
+        });
         Ok(())
     }
 
