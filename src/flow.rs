@@ -16,6 +16,9 @@ pub struct Rules {
     pub rels: HashMap<String, String>,
     pub images: HashMap<String, String>,
     pub css: HashMap<String, String>,
+    /// Set when a tracked deletion is dropped, so the caller can warn that the
+    /// extracted text no longer matches the printed document.
+    pub deleted: std::rc::Rc<std::cell::Cell<bool>>,
 }
 fn apply_style(to: &mut Style, s: &Style) {
     to.bold |= s.bold;
@@ -186,6 +189,9 @@ impl Flow<'_> {
         }
         if matches!(name,"pPr"|"rPr"|"script"|"style"|"delText"|"instrText"|"del" if self.kind=="docx")
         {
+            if matches!(name, "del" | "delText") {
+                self.rules.deleted.set(true);
+            }
             return Ok(());
         }
         if matches!(

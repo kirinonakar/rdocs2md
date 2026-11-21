@@ -326,6 +326,60 @@ fn ooxml(
                     }
                 }
             }
+            if rules.deleted.get() {
+                doc.warn("The document has tracked deletions. The deleted text was omitted, so the extracted text reflects only the current content.");
+            }
+            // Review comments carry the reviewer's intent, which is often the
+            // reason the document is being read at all, so they get their own
+            // section with the author and date kept as properties.
+            if let Some(p) = types.get("comments") {
+                let s = pkg.text(p)?;
+                let n = xml(&s)?;
+                let mut section = Section::new("comments", p);
+                let mut comment_rules = rules.clone();
+                comment_rules.rels = relationships(pkg, p)?.0;
+                let flow = Flow {
+                    kind,
+                    base: p,
+                    rules: &comment_rules,
+                };
+                for comment in n
+                    .root_element()
+                    .children()
+                    .filter(|c| c.is_element() && tag(*c) == "comment")
+                {
+                    let begin = section.blocks.len();
+                    flow.blocks(comment, &mut section.blocks)?;
+                    let Some(Block::Paragraph {
+                        runs, properties, ..
+                    }) = section.blocks.get_mut(begin)
+                    else {
+                        continue;
+                    };
+                    let mut label = String::from("[comment");
+                    if let Some(id) = attr(comment, "id") {
+                        label.push(' ');
+                        label.push_str(id);
+                        properties.insert("comment_id".into(), id.into());
+                    }
+                    if let Some(author) = attr(comment, "author").filter(|a| !a.is_empty()) {
+                        label.push_str(" by ");
+                        label.push_str(author);
+                        properties.insert("author".into(), author.into());
+                    }
+                    if let Some(date) = attr(comment, "date").filter(|d| !d.is_empty()) {
+                        label.push_str(", ");
+                        label.push_str(date);
+                        properties.insert("date".into(), date.into());
+                    }
+                    label.push_str("] ");
+                    properties.insert("role".into(), "comment".into());
+                    runs.insert(0, Run::text(label));
+                }
+                if !section.blocks.is_empty() {
+                    doc.sections.push(section)
+                }
+            }
         }
         "pptx" => {
             if tag(root) != "presentation" {

@@ -33,6 +33,7 @@ Example: rdocs2md "report.pdf" -o "report.md"
   --search QUERY           Search extracted document text and return JSON matches
   --case-sensitive         Perform case-sensitive search
   --limit NUMBER           Maximum search matches per input (default: 50)
+  --timeout SECONDS        Stop page or section parsing after this long (0: no limit)
   --allow-outside-root     MCP only: permit local input and output outside the root
   --                       Treat remaining arguments as input files
 "#;
@@ -51,6 +52,7 @@ struct Args {
     recursive: bool,
     jobs: Option<usize>,
     inflight: u64,
+    timeout: Option<u64>,
     query: Option<search::Query>,
 }
 fn parse(args: Vec<String>) -> Result<Args> {
@@ -88,6 +90,7 @@ fn parse(args: Vec<String>) -> Result<Args> {
             "--max-inflight-bytes" => a.inflight = parse_size(&val()?)?,
             "--case-sensitive" => case_sensitive = true,
             "--limit" => limit = Some(val()?.parse()?),
+            "--timeout" => a.timeout = Some(val()?.parse()?),
             "--format" => a.format = val()?,
             "--mode" => a.mode = val()?,
             "--range" | "--pages" | "--slides" | "--sheets" | "--chapters" => {
@@ -193,6 +196,8 @@ fn convert(
     meta: Option<&Path>,
     multi: bool,
 ) -> Result<Completed> {
+    // Workers run this closure on their own thread, so the budget is per input.
+    let _budget = rdocs2md::limits::start(a.timeout);
     let d = load_range(input, a.images, a.range.as_deref())?;
     if let Some(query) = &a.query {
         let result = query.find(&d);

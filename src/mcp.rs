@@ -16,6 +16,9 @@ use std::{
 };
 const INLINE: usize = 512 * 1024;
 const FRAME: u64 = 1024 * 1024;
+/// Default per-call budget, so that one pathological document cannot block the
+/// single-threaded stdio loop (and the `ping` that follows it) indefinitely.
+const TIMEOUT: u64 = 300;
 /// Parsed documents kept for repeated read-only MCP requests.
 const CACHE_ENTRIES: usize = 8;
 const CACHE_BYTES: usize = 128 * MIB;
@@ -65,6 +68,9 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
             props["path"] =
                 json!({"type":"string","description":format!("Input document. {scope}")});
             required.push("path")
+        }
+        if name != "list_supported_formats" {
+            props["timeout_seconds"] = json!({"type":"integer","minimum":0,"description":"Time limit for this call in seconds; 0 disables it. Defaults to 300."});
         }
         if matches!(
             name,
@@ -392,7 +398,12 @@ impl Reply {
     }
 }
 
-fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> Result<Reply> {
+fn convert_batch(
+    access: &Access,
+    args: &Value,
+    conversion: &Conversion<'_>,
+    timeout: Option<u64>,
+) -> Result<Reply> {
     let paths = args["paths"].as_array().ok_or("missing paths")?;
     let recursive = args["recursive"].as_bool().unwrap_or(false);
     let jobs = args["jobs"].as_u64().map(|n| n as usize);
@@ -464,6 +475,9 @@ fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> 
             &tasks,
             parallel::jobs_within(jobs, &sizes, budget),
             |(input, out, dir)| {
+                // Each worker thread needs its own budget; the caller's guard
+                // does not cross the thread boundary.
+                let _budget = crate::limits::start(timeout);
                 // Errors cross the worker boundary as text; the report shape stays the same.
                 let result = recover_document(AssertUnwindSafe(|| {
                     conversion.save(input, out, dir.as_deref(), root)
@@ -487,6 +501,12 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
     if name == "list_supported_formats" {
         return Ok(Reply::Text(serde_json::to_string(&support())?));
     }
+    let seconds = args
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(TIMEOUT);
+    let timeout = (seconds > 0).then_some(seconds);
+    let _budget = crate::limits::start(timeout);
     let text = |k: &str| args.get(k).and_then(Value::as_str);
     let conversion = Conversion {
         format: text("format").unwrap_or("md"),
@@ -494,7 +514,7 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
         range: text("range"),
     };
     if name == "convert_documents" {
-        return convert_batch(access, args, &conversion);
+        return convert_batch(access, args, &conversion, timeout);
     }
     let input = access.local(text("path").ok_or("missing path")?, false)?;
     if name == "search_document" {

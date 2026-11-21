@@ -5,6 +5,7 @@ mod formatting;
 mod hwp3;
 mod latex;
 mod legacy;
+pub mod limits;
 mod math;
 pub mod mcp;
 pub mod model;
@@ -84,7 +85,7 @@ fn convert_selected(b: &[u8], images: bool, range: Option<&SectionRange>) -> Res
 pub const FORMATS: &[(&str, &str, &str)] = &[
     (
         "pdf",
-        "Pages, font mappings, text origins, Form XObjects, simple columns and grids, embedded JPEG",
+        "Pages, font mappings, text origins, Form XObjects, simple columns and grids, outline titles as headings, JPEG and raster images as PNG",
         "No OCR, full vector math or irregular table recognition",
     ),
     (
@@ -104,8 +105,8 @@ pub const FORMATS: &[(&str, &str, &str)] = &[
     ),
     (
         "docx",
-        "Sections, headings, styled runs, numbering, links, tables, notes, embedded images",
-        "Floating layout, vertical merges, headers and equations are partial",
+        "Sections, headings, styled runs, numbering, links, tables, notes, comments, embedded images",
+        "Tracked deletions are omitted with a warning; floating layout, vertical merges, headers and equations are partial",
     ),
     (
         "ppt",

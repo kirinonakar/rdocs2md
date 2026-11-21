@@ -221,6 +221,40 @@ fn pdf_with_pages(contents: &[&str]) -> Vec<u8> {
 }
 
 #[test]
+fn pdf_decrypts_permission_only_encryption_and_rejects_user_passwords() {
+    use lopdf::{Document as Pdf, EncryptionState, EncryptionVersion, Object, Permissions};
+
+    fn encrypted(owner: &str, user: &str) -> Vec<u8> {
+        let mut pdf = Pdf::load_mem(&pdf_with_pages(&[
+            "BT /F 12 Tf 1 0 0 1 30 180 Tm (Permission only text) Tj ET",
+        ]))
+        .unwrap();
+        // lopdf derives the file key from the trailer's ID pair.
+        pdf.trailer
+            .set("ID", vec![Object::string_literal("0123456789abcdef"); 2]);
+        let state = EncryptionState::try_from(EncryptionVersion::V2 {
+            document: &pdf,
+            owner_password: owner,
+            user_password: user,
+            key_length: 128,
+            permissions: Permissions::empty(),
+        })
+        .unwrap();
+        pdf.encrypt(&state).unwrap();
+        let mut bytes = Vec::new();
+        pdf.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    let open = encrypted("owner-secret", "");
+    let rendered = md(&convert(&open, false).unwrap());
+    assert!(rendered.contains("Permission only text"), "{rendered}");
+
+    let locked = encrypted("owner-secret", "user-secret");
+    assert!(convert(&locked, false).is_err());
+}
+
+#[test]
 fn pdf_range_skips_bad_page_and_marks_visibility() {
     let bytes = pdf_with_pages(&[
         "1 0 cm",
@@ -230,7 +264,15 @@ fn pdf_range_skips_bad_page_and_marks_visibility() {
          BT /F 10 Tf 0 Tr 1 0 0 1 400 40 Tm (Outside) Tj ET",
         "q BI /W 1 /H 1 /BPC 8 /CS /G ID X EI Q",
     ]);
-    assert!(convert(&bytes, false).is_err());
+    // A malformed page is reported instead of discarding the other pages.
+    let full = convert(&bytes, false).unwrap();
+    assert_eq!(full.sections.len(), 3);
+    assert!(full.sections[0].properties.contains_key("page_error"));
+    assert!(
+        full.warnings
+            .iter()
+            .any(|w| w.contains("could not be read completely"))
+    );
     let d = convert_range(&bytes, false, Some("3,2,2")).unwrap();
     assert_eq!(d.sections.len(), 2);
     assert_eq!(
@@ -866,4 +908,90 @@ fn xlsx_cached_formula_dates_sparse_cells_and_merge() {
     let html = render(&d, "html", "hybrid", &Properties::new()).unwrap();
     assert!(html.contains("background-color:#F0E0D0;border-right:2px dashed #123456;text-align:right;vertical-align:middle;"));
     assert!(html.contains("font-size:14pt;color:#001122;\"><strong>1900-03-01</strong>"));
+}
+
+#[test]
+fn pdf_outline_titles_become_markdown_headings() {
+    use lopdf::{Document as Pdf, Object, Stream, dictionary};
+
+    let mut pdf = Pdf::with_version("1.4");
+    let tree = pdf.new_object_id();
+    let font = pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
+    let resources = dictionary! {"Font"=>dictionary! {"F"=>font}};
+    let content = "BT /F 16 Tf 1 0 0 1 30 180 Tm (Chapter One) Tj ET\n\
+                   BT /F 10 Tf 1 0 0 1 30 150 Tm (First body paragraph.) Tj ET\n\
+                   BT /F 14 Tf 1 0 0 1 30 100 Tm (Section A) Tj ET\n\
+                   BT /F 10 Tf 1 0 0 1 30 70 Tm (Second body paragraph.) Tj ET";
+    let stream = pdf.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let page = pdf.add_object(dictionary! {"Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]});
+    pdf.objects.insert(tree, dictionary! {"Type"=>"Pages","Kids"=>vec![Object::Reference(page)],"Count"=>1,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]}.into());
+    // A two-level bookmark tree, which is what most PDF exporters write.
+    let child = pdf.new_object_id();
+    let parent = pdf.new_object_id();
+    pdf.objects.insert(child, dictionary! {"Title"=>Object::string_literal("Section A"),"Dest"=>vec![Object::Reference(page).into(),"XYZ".into(),0.into(),100.into(),0.into()]}.into());
+    pdf.objects.insert(parent, dictionary! {"Title"=>Object::string_literal("Chapter One"),"Dest"=>vec![Object::Reference(page).into(),"XYZ".into(),0.into(),180.into(),0.into()],"First"=>Object::Reference(child)}.into());
+    let outlines = pdf.add_object(dictionary! {"Type"=>"Outlines","First"=>Object::Reference(parent)});
+    let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree,"Outlines"=>outlines});
+    pdf.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    pdf.save_to(&mut bytes).unwrap();
+
+    let s = md(&convert(&bytes, false).unwrap());
+    assert!(s.contains("# Chapter One"), "{s}");
+    assert!(s.contains("## Section A"), "{s}");
+    assert!(s.contains("First body paragraph."), "{s}");
+}
+
+#[test]
+fn pdf_raster_images_are_exported_as_png() {
+    use lopdf::{Document as Pdf, Object, Stream, dictionary};
+
+    let mut pdf = Pdf::with_version("1.4");
+    let tree = pdf.new_object_id();
+    let font = pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    // 2x2 DeviceRGB samples: red, green, blue, white.
+    encoder
+        .write_all(&[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255])
+        .unwrap();
+    let data = encoder.finish().unwrap();
+    let image = pdf.add_object(Stream::new(dictionary! {"Type"=>"XObject","Subtype"=>"Image","Width"=>2,"Height"=>2,"ColorSpace"=>"DeviceRGB","BitsPerComponent"=>8,"Filter"=>"FlateDecode"}, data));
+    let resources = dictionary! {"Font"=>dictionary! {"F"=>font},"XObject"=>dictionary! {"Im"=>image}};
+    let stream = pdf.add_object(Stream::new(dictionary! {}, b"q 10 0 0 10 30 150 cm /Im Do Q".to_vec()));
+    let page = pdf.add_object(dictionary! {"Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]});
+    pdf.objects.insert(tree, dictionary! {"Type"=>"Pages","Kids"=>vec![Object::Reference(page)],"Count"=>1,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]}.into());
+    let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree});
+    pdf.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    pdf.save_to(&mut bytes).unwrap();
+
+    let d = convert(&bytes, true).unwrap();
+    let png = d.assets.values().next().expect("image asset");
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "not a PNG");
+    assert_eq!(&png[16..20], &[0, 0, 0, 2], "width");
+    assert_eq!(png[24], 8, "bit depth");
+    assert_eq!(png[25], 2, "colour type");
+}
+
+#[test]
+fn docx_comments_and_tracked_deletions_are_reported() {
+    let data = package(&[
+        ("[Content_Types].xml", "<Types><Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/></Types>"),
+        ("_rels/.rels", "<Relationships><Relationship Id='r1' Target='word/document.xml' Type='rel/officeDocument'/></Relationships>"),
+        ("word/_rels/document.xml.rels", "<Relationships><Relationship Id='C' Target='comments.xml' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'/></Relationships>"),
+        ("word/comments.xml", "<comments><comment id='1' author='Kim' date='2024-01-02T03:04:05Z'><p><r><t>Please revise this paragraph.</t></r></p></comment></comments>"),
+        ("word/document.xml", "<document><body><p><r><t>Kept text</t></r><del><r><delText>Removed text</delText></r></del><commentRangeStart id='1'/><r><t>Reviewed text</t></r><commentRangeEnd id='1'/></p><sectPr/></body></document>"),
+    ]);
+    let d = convert(&data, false).unwrap();
+    let s = md(&d);
+    assert!(s.contains("Kept text") && s.contains("Reviewed text"), "{s}");
+    assert!(!s.contains("Removed text"), "{s}");
+    assert!(d.sections.iter().any(|s| s.kind == "comments"), "comments section");
+    assert!(s.contains("Please revise this paragraph."), "{s}");
+    assert!(s.contains("Kim"), "{s}");
+    assert!(
+        d.warnings.iter().any(|w| w.contains("tracked deletions")),
+        "{:?}",
+        d.warnings
+    );
 }

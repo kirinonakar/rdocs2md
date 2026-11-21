@@ -1,6 +1,6 @@
 use crate::{model::*, visibility::TINY_POINTS};
 use lopdf::{Document as Pdf, LoadOptions, Object, content::Content};
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Write};
 #[derive(Clone, Copy)]
 struct Matrix([f32; 6]);
 impl Matrix {
@@ -497,67 +497,273 @@ impl<'a> FontMetrics<'a> {
         range.widths.get(offset)?.as_float().ok()
     }
 }
-fn raster(stream: &lopdf::Stream) -> Result<Option<Vec<u8>>> {
+#[derive(Clone, Copy, PartialEq)]
+enum ColorModel {
+    Gray,
+    Rgb,
+    Cmyk,
+}
+
+struct ColorSpace {
+    model: ColorModel,
+    /// Indexed spaces resolve to one RGB triple per palette index.
+    palette: Option<Vec<[u8; 3]>>,
+    channels: usize,
+}
+
+fn model_space(model: ColorModel) -> ColorSpace {
+    ColorSpace {
+        model,
+        palette: None,
+        channels: match model {
+            ColorModel::Gray => 1,
+            ColorModel::Rgb => 3,
+            ColorModel::Cmyk => 4,
+        },
+    }
+}
+
+fn color_model(name: &[u8]) -> Option<ColorModel> {
+    match name {
+        b"DeviceGray" | b"G" | b"CalGray" => Some(ColorModel::Gray),
+        b"DeviceRGB" | b"RGB" | b"CalRGB" => Some(ColorModel::Rgb),
+        b"DeviceCMYK" | b"CMYK" => Some(ColorModel::Cmyk),
+        _ => None,
+    }
+}
+
+fn color_space(pdf: &Pdf, obj: &Object) -> Option<ColorSpace> {
+    match resolve_object(pdf, obj)? {
+        Object::Name(name) => color_model(name).map(model_space),
+        Object::Array(items) => {
+            let family = resolve_object(pdf, items.first()?)?.as_name().ok()?;
+            match family {
+                // ICCBased profiles declare their own component count, and the
+                // raw samples can be read without interpreting the profile.
+                b"ICCBased" => {
+                    let dict = resolve_object(pdf, items.get(1)?)?.as_dict().ok()?;
+                    let model = match dict.get(b"N").and_then(Object::as_i64).ok()? {
+                        1 => ColorModel::Gray,
+                        3 => ColorModel::Rgb,
+                        4 => ColorModel::Cmyk,
+                        _ => return None,
+                    };
+                    Some(model_space(model))
+                }
+                b"CalRGB" => Some(model_space(ColorModel::Rgb)),
+                b"CalGray" => Some(model_space(ColorModel::Gray)),
+                b"Indexed" => {
+                    let base = color_space(pdf, items.get(1)?)?;
+                    if base.palette.is_some() {
+                        return None;
+                    }
+                    let high = usize::try_from(items.get(2)?.as_i64().ok()?).ok()?;
+                    let count = high.checked_add(1)?;
+                    let lookup = resolve_object(pdf, items.get(3)?)?;
+                    let bytes = match lookup {
+                        Object::String(bytes, _) => bytes.clone(),
+                        _ => lookup
+                            .as_stream()
+                            .ok()?
+                            .get_plain_content_with_limit(PART_LIMIT)
+                            .ok()?,
+                    };
+                    if count > 4096 || bytes.len() < count.checked_mul(base.channels)? {
+                        return None;
+                    }
+                    let palette = bytes
+                        .chunks_exact(base.channels)
+                        .take(count)
+                        .map(|entry| to_rgb(base.model, entry))
+                        .collect();
+                    Some(ColorSpace {
+                        model: ColorModel::Rgb,
+                        palette: Some(palette),
+                        channels: 1,
+                    })
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Ink-to-light conversion that keeps scanned CMYK art readable without
+/// applying an ICC profile.
+fn to_rgb(model: ColorModel, s: &[u8]) -> [u8; 3] {
+    match model {
+        ColorModel::Gray => [s[0]; 3],
+        ColorModel::Rgb => [s[0], s[1], s[2]],
+        ColorModel::Cmyk => {
+            let k = u16::from(s[3]);
+            let f = |v: u8| ((255 - u16::from(v)) * (255 - k) / 255) as u8;
+            [f(s[0]), f(s[1]), f(s[2])]
+        }
+    }
+}
+
+/// Expands 1, 2, 4, 8 or 16 bit samples into one byte per component.
+fn unpack(
+    raw: &[u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    bpc: i64,
+) -> Option<Vec<u8>> {
+    let count = width.checked_mul(height)?.checked_mul(channels)?;
+    match bpc {
+        8 => (raw.len() >= count).then(|| raw[..count].to_vec()),
+        16 => (raw.len() >= count.checked_mul(2)?)
+            .then(|| raw.chunks_exact(2).take(count).map(|p| p[0]).collect()),
+        1 | 2 | 4 => {
+            let bpc = usize::try_from(bpc).ok()?;
+            let row = width.checked_mul(bpc * channels)?.checked_add(7)? / 8;
+            if raw.len() < row.checked_mul(height)? {
+                return None;
+            }
+            let max = (1u16 << bpc) - 1;
+            let mut out = Vec::with_capacity(count);
+            for line in raw.chunks_exact(row).take(height) {
+                let mut bit = 0;
+                for _ in 0..width * channels {
+                    let byte = line[bit / 8];
+                    let shift = 8 - bpc - bit % 8;
+                    let value = u16::from((byte >> shift) & (max as u8));
+                    out.push((value * 255 / max) as u8);
+                    bit += bpc;
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Applies a `/Decode` array, which is how inverted bilevel scans stay legible.
+fn apply_decode(samples: &mut [u8], channels: usize, decode: Option<&[Object]>) {
+    let Some(decode) = decode.filter(|d| d.len() == channels * 2) else {
+        return;
+    };
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let channel = index % channels;
+        let (Ok(min), Ok(max)) = (
+            decode[channel * 2].as_float(),
+            decode[channel * 2 + 1].as_float(),
+        ) else {
+            continue;
+        };
+        if (min, max) == (0., 1.) {
+            continue;
+        }
+        let value = min + f32::from(*sample) / 255. * (max - min);
+        *sample = (value.clamp(0., 1.) * 255.) as u8;
+    }
+}
+
+fn png(width: usize, height: usize, channels: usize, pixels: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(pixels.len() / 2 + 1024);
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&(width as u32).to_be_bytes());
+    header.extend_from_slice(&(height as u32).to_be_bytes());
+    header.extend_from_slice(&[8, if channels == 1 { 0 } else { 2 }, 0, 0, 0]);
+    png_chunk(&mut out, b"IHDR", &header);
+    let stride = width * channels;
+    let mut rows = Vec::with_capacity((stride + 1) * height);
+    for line in pixels.chunks_exact(stride) {
+        rows.push(0);
+        rows.extend_from_slice(line);
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&rows)?;
+    let data = encoder.finish()?;
+    png_chunk(&mut out, b"IDAT", &data);
+    png_chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let mut crc = flate2::Crc::new();
+    crc.update(kind);
+    crc.update(data);
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&crc.sum().to_be_bytes());
+}
+
+fn raster(pdf: &Pdf, stream: &lopdf::Stream) -> Result<Option<Vec<u8>>> {
+    // Already encoded images (JPEG, PNG) pass through unchanged.
     if image_ext(&stream.content).is_some() {
         return Ok(Some(stream.content.clone()));
     }
     let d = &stream.dict;
-    if d.has(b"Decode")
-        || d.has(b"SMask")
-        || d.get(b"BitsPerComponent").and_then(Object::as_i64).ok() != Some(8)
-    {
+    let (Ok(width), Ok(height)) = (
+        d.get(b"Width").and_then(Object::as_i64),
+        d.get(b"Height").and_then(Object::as_i64),
+    ) else {
+        return Ok(None);
+    };
+    let (Ok(width), Ok(height)) = (usize::try_from(width), usize::try_from(height)) else {
+        return Ok(None);
+    };
+    if width == 0 || height == 0 {
         return Ok(None);
     }
-    let channels = match d.get(b"ColorSpace").and_then(Object::as_name) {
-        Ok(b"DeviceRGB") => 3,
-        Ok(b"DeviceGray") => 1,
-        _ => return Ok(None),
+    let mask = matches!(d.get(b"ImageMask"), Ok(Object::Boolean(true)));
+    let space = if mask {
+        Some(model_space(ColorModel::Gray))
+    } else {
+        d.get(b"ColorSpace").ok().and_then(|o| color_space(pdf, o))
     };
-    let width = usize::try_from(d.get(b"Width")?.as_i64()?)?;
-    let height = usize::try_from(d.get(b"Height")?.as_i64()?)?;
-    let stride = width
-        .checked_mul(3)
-        .and_then(|n| n.checked_add(3))
-        .ok_or("invalid PDF image dimensions")?
-        & !3;
-    let size = stride
+    let Some(space) = space else {
+        return Ok(None);
+    };
+    let bpc = if mask {
+        1
+    } else {
+        d.get(b"BitsPerComponent")
+            .and_then(Object::as_i64)
+            .unwrap_or(8)
+    };
+    let channels = space.channels;
+    let Some(pixels) = width
         .checked_mul(height)
-        .ok_or("PDF image size overflow")?;
-    if width == 0 || height == 0 || size > PART_LIMIT {
-        return Err("PDF raster dimensions exceed limit".into());
+        .and_then(|n| n.checked_mul(channels))
+    else {
+        return Ok(None);
+    };
+    if pixels > PART_LIMIT {
+        return Ok(None);
     }
     let Ok(raw) = stream.get_plain_content_with_limit(PART_LIMIT) else {
         return Ok(None);
     };
-    if raw.len() != width * height * channels {
+    let Some(mut samples) = unpack(&raw, width, height, channels, bpc) else {
         return Ok(None);
-    }
-    let mut bmp = vec![0u8; 54 + size];
-    bmp[..2].copy_from_slice(b"BM");
-    for (pos, n) in [
-        (2, 54 + size),
-        (10, 54),
-        (14, 40),
-        (18, width),
-        (22, height),
-        (34, size),
-    ] {
-        bmp[pos..pos + 4].copy_from_slice(&(n as u32).to_le_bytes())
-    }
-    bmp[26] = 1;
-    bmp[28] = 24;
-    for (y, row) in raw.chunks_exact(width * channels).enumerate() {
-        let start = 54 + (height - 1 - y) * stride;
-        for (i, p) in row.chunks_exact(channels).enumerate() {
-            let bgr = if channels == 3 {
-                [p[2], p[1], p[0]]
-            } else {
-                [p[0]; 3]
-            };
-            bmp[start + 3 * i..start + 3 * i + 3].copy_from_slice(&bgr)
+    };
+    let decode = d.get(b"Decode").ok().and_then(|o| o.as_array().ok());
+    apply_decode(&mut samples, channels, decode.map(Vec::as_slice));
+    let (out_channels, colors) = match (&space.palette, space.model) {
+        (Some(palette), _) => {
+            let mut colors = Vec::with_capacity(pixels * 3);
+            for &index in &samples {
+                colors.extend_from_slice(&palette.get(index as usize).copied().unwrap_or_default());
+            }
+            (3, colors)
         }
-    }
-    Ok(Some(bmp))
+        (None, ColorModel::Gray) => (1, samples),
+        (None, ColorModel::Rgb) => (3, samples),
+        (None, ColorModel::Cmyk) => {
+            let mut colors = Vec::with_capacity(pixels / 4 * 3);
+            for entry in samples.chunks_exact(4) {
+                colors.extend_from_slice(&to_rgb(ColorModel::Cmyk, entry));
+            }
+            (3, colors)
+        }
+    };
+    png(width, height, out_channels, &colors).map(Some)
 }
 fn annotations(pdf: &Pdf, id: lopdf::ObjectId, fragments: &mut [Fragment]) -> Result<()> {
     let list = pdf.get_page_annotations(id)?;
@@ -704,6 +910,9 @@ impl PageReader<'_> {
         mut stroke: Stroke,
         mut paint: TextPaint,
     ) -> Result<()> {
+        if crate::limits::expired() {
+            return Err("time limit exceeded".into());
+        }
         *self.total += bytes.len() + 64;
         if *self.total > 512 * MIB {
             return Err("PDF content expansion limit exceeded".into());
@@ -1018,7 +1227,13 @@ impl PageReader<'_> {
                                 if hyhwp_eq {
                                     decode_hyhwp_eq(e, b)
                                 } else {
-                                    Pdf::decode_text(e, b)?
+                                    match Pdf::decode_text(e, b) {
+                                        Ok(text) => text,
+                                        Err(_) => {
+                                            self.doc.warn("Text with an unreadable PDF font encoding was kept as replacement characters.");
+                                            "\u{fffd}".repeat(b.len())
+                                        }
+                                    }
                                 }
                             } else {
                                 let mapping = &math_pi[&font];
@@ -1202,14 +1417,14 @@ impl PageReader<'_> {
                                 self.has_images = true;
                                 let name = format!("pdf/{}-{}", id.0, id.1);
                                 if self.images && !self.doc.assets.contains_key(&name) {
-                                    if let Some(bytes) = raster(stream)? {
+                                    if let Some(bytes) = raster(self.pdf, stream)? {
                                         *self.total += bytes.len();
                                         if *self.total > 512 * MIB {
                                             return Err("PDF asset budget exceeded".into());
                                         }
                                         self.doc.assets.insert(name.clone(), bytes);
                                     } else {
-                                        self.doc.warn("PDF image filters without a standalone raster encoding were skipped.");
+                                        self.doc.warn("PDF images that could not be decoded as a standalone raster (for example JPX or JBIG2) were skipped.");
                                     }
                                 }
                                 let (x, y) = ctm.point(0., 0.);
@@ -1239,9 +1454,12 @@ impl PageReader<'_> {
     }
 }
 pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<Document> {
-    let pdf =
+    let mut pdf =
         Pdf::load_mem_with_options(data, LoadOptions::with_max_decompressed_size(PART_LIMIT))?;
-    if pdf.is_encrypted() || pdf.encryption_state.is_some() {
+    // An encrypted PDF that opens with the empty password only carries permission
+    // restrictions (an owner password with no user password), so decrypt it and
+    // convert its content. A document that demands a real user password stays refused.
+    if pdf.is_encrypted() && pdf.decrypt("").is_err() {
         return Err("encrypted PDF is unsupported".into());
     }
     let mut doc = Document::new("pdf");
@@ -1258,66 +1476,285 @@ pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<
             }
         }
     }
-    let mut total = 0usize;
     let pages: Vec<_> = pdf.page_iter().take(32769).collect();
     if pages.len() > 32768 {
         return Err("PDF page limit exceeded".into());
     }
+    let outlines = page_outlines(&pdf, &pages);
+    let mut total = 0usize;
     for idx in section_indices(range, pages.len())? {
+        if crate::limits::expired() {
+            doc.warn("The time limit was reached, so the remaining PDF pages were skipped. Raise or remove the timeout to convert them.");
+            break;
+        }
         let id = pages[idx];
         let mut sec = Section::new("page", format!("{} {} R", id.0, id.1)).indexed(idx);
         // The source string is a PDF object identifier; keep the human page
         // number so that citations do not need to resolve object numbers.
         sec.properties.insert("page".into(), (idx + 1).to_string());
-        let bytes = pdf.get_page_content_with_limit(id, PART_LIMIT)?;
-        let (direct, ids) = pdf.get_page_resources(id)?;
-        let resources = direct.or_else(|| ids.first().and_then(|id| pdf.get_dictionary(*id).ok()));
-        let mut reader = PageReader {
-            pdf: &pdf,
-            doc: &mut doc,
-            images,
-            total: &mut total,
-            fragments: Vec::new(),
-            rules: Vec::new(),
-            verticals: Vec::new(),
-            active: Vec::new(),
-            bounds: page_box(&pdf, id),
-            user_unit: pdf
-                .get_dictionary(id)
-                .ok()
-                .and_then(|d| resolve_object(&pdf, d.get(b"UserUnit").ok()?))
-                .and_then(|v| v.as_float().ok())
-                .filter(|v| v.is_finite() && *v > 0.)
-                .map_or(1., f64::from),
-            has_images: false,
-        };
-        reader.content(
+        // One malformed page or operator must not discard the whole document:
+        // keep whatever was extracted and report the failure as a warning.
+        if let Err(e) = read_page(&pdf, &mut doc, &mut total, id, images, &mut sec) {
+            doc.warn(&format!(
+                "PDF page {} could not be read completely, so its extracted text may be missing or partial.",
+                idx + 1
+            ));
+            sec.properties.insert("page_error".into(), e.to_string());
+        }
+        if let Some(entries) = outlines.get(&idx) {
+            apply_outlines(&mut sec, entries);
+        }
+        doc.sections.push(sec)
+    }
+    Ok(doc)
+}
+
+/// Reads one page into `sec`. Failures are returned to the caller so that the
+/// page loop can keep the other pages; anything already extracted stays.
+fn read_page(
+    pdf: &Pdf,
+    doc: &mut Document,
+    total: &mut usize,
+    id: lopdf::ObjectId,
+    images: bool,
+    sec: &mut Section,
+) -> Result<()> {
+    let bytes = pdf.get_page_content_with_limit(id, PART_LIMIT)?;
+    let (direct, ids) = pdf.get_page_resources(id)?;
+    let resources = direct.or_else(|| ids.first().and_then(|id| pdf.get_dictionary(*id).ok()));
+    let mut reader = PageReader {
+        pdf,
+        doc,
+        images,
+        total,
+        fragments: Vec::new(),
+        rules: Vec::new(),
+        verticals: Vec::new(),
+        active: Vec::new(),
+        bounds: page_box(pdf, id),
+        user_unit: pdf
+            .get_dictionary(id)
+            .ok()
+            .and_then(|d| resolve_object(pdf, d.get(b"UserUnit").ok()?))
+            .and_then(|v| v.as_float().ok())
+            .filter(|v| v.is_finite() && *v > 0.)
+            .map_or(1., f64::from),
+        has_images: false,
+    };
+    let mut error = reader
+        .content(
             &bytes,
             resources,
             Matrix::ID,
             Stroke::default(),
             TextPaint::default(),
-        )?;
-        annotations(&pdf, id, &mut reader.fragments)?;
-        if !reader
-            .fragments
-            .iter()
-            .flat_map(|f| &f.runs)
-            .any(|r| !r.text.trim().is_empty())
-        {
-            let status = if reader.has_images {
-                reader.doc.warn("No text was extracted from a PDF page containing images. Text visible in the images requires OCR, which rdocs2md does not perform.");
-                "ocr_needed_for_image_text"
-            } else {
-                reader.doc.warn("No text was extracted from a PDF page. Text drawn as outlines or other graphics may still be visible.");
-                "no_text_extracted"
-            };
-            sec.properties
-                .insert("text_extraction".into(), status.into());
-        }
-        layout(reader.fragments, reader.rules, reader.verticals, &mut sec);
-
-        doc.sections.push(sec)
+        )
+        .err();
+    if error.is_none()
+        && let Err(e) = annotations(pdf, id, &mut reader.fragments)
+    {
+        error = Some(e);
     }
-    Ok(doc)
+    if !reader
+        .fragments
+        .iter()
+        .flat_map(|f| &f.runs)
+        .any(|r| !r.text.trim().is_empty())
+    {
+        let status = if reader.has_images {
+            reader.doc.warn("No text was extracted from a PDF page containing images. Text visible in the images requires OCR, which rdocs2md does not perform.");
+            "ocr_needed_for_image_text"
+        } else {
+            reader.doc.warn("No text was extracted from a PDF page. Text drawn as outlines or other graphics may still be visible.");
+            "no_text_extracted"
+        };
+        sec.properties
+            .insert("text_extraction".into(), status.into());
+    }
+    layout(reader.fragments, reader.rules, reader.verticals, sec);
+    match error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// One outline (bookmark) entry: the page it targets and its nesting depth.
+struct Outline {
+    page: lopdf::ObjectId,
+    level: u8,
+    title: String,
+}
+
+fn outlines(pdf: &Pdf) -> Vec<Outline> {
+    let mut out = Vec::new();
+    let Some(root) = pdf
+        .catalog()
+        .ok()
+        .and_then(|c| c.get(b"Outlines").ok())
+        .and_then(|o| dictionary(pdf, o))
+    else {
+        return out;
+    };
+    walk_outlines(pdf, root, 1, &mut out, 0);
+    out
+}
+
+fn walk_outlines(
+    pdf: &Pdf,
+    node: &lopdf::Dictionary,
+    level: u8,
+    out: &mut Vec<Outline>,
+    depth: u8,
+) {
+    if depth > 12 || out.len() >= 8192 {
+        return;
+    }
+    let mut item = node.get(b"First").ok().and_then(|o| dictionary(pdf, o));
+    let mut seen = 0usize;
+    while let Some(entry) = item {
+        seen += 1;
+        if seen > 8192 || out.len() >= 8192 {
+            break;
+        }
+        let title = entry
+            .get(b"Title")
+            .ok()
+            .and_then(|o| lopdf::decode_text_string(o).ok())
+            .unwrap_or_default();
+        let target = entry.get(b"Dest").ok().or_else(|| {
+            entry
+                .get(b"A")
+                .ok()
+                .and_then(|o| dictionary(pdf, o))
+                .and_then(|a| a.get(b"D").ok())
+        });
+        let title = title.trim();
+        if level <= 6
+            && !title.is_empty()
+            && let Some(page) = target.and_then(|t| destination_page(pdf, t))
+        {
+            out.push(Outline {
+                page,
+                level,
+                title: title.to_string(),
+            });
+        }
+        walk_outlines(pdf, entry, level + 1, out, depth + 1);
+        item = entry.get(b"Next").ok().and_then(|o| dictionary(pdf, o));
+    }
+}
+
+fn destination_page(pdf: &Pdf, dest: &Object) -> Option<lopdf::ObjectId> {
+    let mut object = dest;
+    for _ in 0..8 {
+        object = match object {
+            Object::Reference(id) => pdf.get_object(*id).ok()?,
+            Object::Name(_) | Object::String(..) => named_destination(pdf, object)?,
+            _ => break,
+        };
+    }
+    match object.as_array().ok()?.first()? {
+        Object::Reference(id) => Some(*id),
+        _ => None,
+    }
+}
+
+/// Resolves a named destination through the `/Dests` dictionary or the
+/// `/Names` name tree. Only flat name trees are read; nested kids are rare in
+/// practice and a missed bookmark only costs one heading level.
+fn named_destination<'a>(pdf: &'a Pdf, name: &Object) -> Option<&'a Object> {
+    let key = match name {
+        Object::Name(name) => name.as_slice(),
+        Object::String(name, _) => name.as_slice(),
+        _ => return None,
+    };
+    let catalog = pdf.catalog().ok()?;
+    if let Some(value) = catalog
+        .get(b"Dests")
+        .ok()
+        .and_then(|o| dictionary(pdf, o))
+        .and_then(|d| d.get(key).ok())
+    {
+        return Some(value);
+    }
+    let names = catalog
+        .get(b"Names")
+        .ok()
+        .and_then(|o| dictionary(pdf, o))
+        .and_then(|d| d.get(b"Dests").ok())
+        .and_then(|o| dictionary(pdf, o))
+        .and_then(|d| d.get(b"Names").ok())
+        .and_then(|o| o.as_array().ok())?;
+    names.chunks_exact(2).find_map(|pair| {
+        let found = match &pair[0] {
+            Object::Name(n) => n.as_slice() == key,
+            Object::String(n, _) => n.as_slice() == key,
+            _ => false,
+        };
+        found.then(|| &pair[1])
+    })
+}
+
+fn page_outlines(pdf: &Pdf, pages: &[lopdf::ObjectId]) -> HashMap<usize, Vec<(u8, String)>> {
+    let mut map: HashMap<usize, Vec<(u8, String)>> = HashMap::new();
+    let index: HashMap<lopdf::ObjectId, usize> =
+        pages.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    for entry in outlines(pdf) {
+        if let Some(&page) = index.get(&entry.page) {
+            map.entry(page).or_default().push((entry.level, entry.title));
+        }
+    }
+    map
+}
+
+/// Promotes paragraphs that match a bookmark title so that the PDF output
+/// carries the same `#` hierarchy as the source document.
+fn apply_outlines(sec: &mut Section, entries: &[(u8, String)]) {
+    let mut cursor = 0;
+    for (level, title) in entries {
+        let key = outline_key(title);
+        if key.is_empty() {
+            continue;
+        }
+        let mut found = None;
+        let mut partial = None;
+        for (index, block) in sec.blocks.iter().enumerate().skip(cursor) {
+            let Block::Paragraph {
+                heading: 0,
+                runs,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+            let text = outline_key(&text);
+            if text.is_empty() {
+                continue;
+            }
+            if text == key {
+                found = Some(index);
+                break;
+            }
+            if partial.is_none()
+                && (text.starts_with(&key) || key.starts_with(&text))
+                && text.len().min(key.len()) >= 4
+            {
+                partial = Some(index);
+            }
+        }
+        if let Some(index) = found.or(partial) {
+            if let Block::Paragraph { heading, .. } = &mut sec.blocks[index] {
+                *heading = (*level).clamp(1, 6);
+            }
+            cursor = index + 1;
+        }
+    }
+}
+
+fn outline_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
