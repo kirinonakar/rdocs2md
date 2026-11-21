@@ -604,12 +604,17 @@ fn to_rgb(model: ColorModel, s: &[u8]) -> [u8; 3] {
 }
 
 /// Expands 1, 2, 4, 8 or 16 bit samples into one byte per component.
+///
+/// `scale` is false for an Indexed image, whose samples are palette indices:
+/// stretching them to 0-255 would point past the palette and turn the image
+/// black.
 fn unpack(
     raw: &[u8],
     width: usize,
     height: usize,
     channels: usize,
     bpc: i64,
+    scale: bool,
 ) -> Option<Vec<u8>> {
     let count = width.checked_mul(height)?.checked_mul(channels)?;
     match bpc {
@@ -630,7 +635,7 @@ fn unpack(
                     let byte = line[bit / 8];
                     let shift = 8 - bpc - bit % 8;
                     let value = u16::from((byte >> shift) & (max as u8));
-                    out.push((value * 255 / max) as u8);
+                    out.push(if scale { (value * 255 / max) as u8 } else { value as u8 });
                     bit += bpc;
                 }
             }
@@ -641,23 +646,37 @@ fn unpack(
 }
 
 /// Applies a `/Decode` array, which is how inverted bilevel scans stay legible.
-fn apply_decode(samples: &mut [u8], channels: usize, decode: Option<&[Object]>) {
+///
+/// `max` is the largest value that [`unpack`] produced. `palette` is the highest
+/// index of an Indexed image: its samples are indices, so a decoded value stays
+/// an index instead of becoming a 0-255 color component.
+fn apply_decode(
+    samples: &mut [u8],
+    channels: usize,
+    decode: Option<&[Object]>,
+    max: u8,
+    palette: Option<usize>,
+) {
     let Some(decode) = decode.filter(|d| d.len() == channels * 2) else {
         return;
     };
+    let full = f32::from(max);
     for (index, sample) in samples.iter_mut().enumerate() {
         let channel = index % channels;
-        let (Ok(min), Ok(max)) = (
+        let (Ok(min), Ok(top)) = (
             decode[channel * 2].as_float(),
             decode[channel * 2 + 1].as_float(),
         ) else {
             continue;
         };
-        if (min, max) == (0., 1.) {
+        if palette.is_none() && (min, top) == (0., 1.) {
             continue;
         }
-        let value = min + f32::from(*sample) / 255. * (max - min);
-        *sample = (value.clamp(0., 1.) * 255.) as u8;
+        let value = min + f32::from(*sample) / full * (top - min);
+        *sample = match palette {
+            Some(high) => value.round().clamp(0., high.min(255) as f32) as u8,
+            None => (value.clamp(0., 1.) * 255.) as u8,
+        };
     }
 }
 
@@ -740,11 +759,25 @@ fn raster(pdf: &Pdf, stream: &lopdf::Stream) -> Result<Option<Vec<u8>>> {
     let Ok(raw) = stream.get_plain_content_with_limit(PART_LIMIT) else {
         return Ok(None);
     };
-    let Some(mut samples) = unpack(&raw, width, height, channels, bpc) else {
+    // An Indexed image already holds palette indices, so only the bit packing is
+    // undone here; scaling them to 0-255 would index past the palette.
+    let palette = space.palette.as_deref();
+    let Some(mut samples) = unpack(&raw, width, height, channels, bpc, palette.is_none()) else {
         return Ok(None);
     };
+    // Unscaled indices are at most 2^bpc-1, which is what `/Decode` maps from.
+    let max = match (palette.is_some(), bpc) {
+        (true, 1..=4) => ((1u16 << bpc) - 1) as u8,
+        _ => 255,
+    };
     let decode = d.get(b"Decode").ok().and_then(|o| o.as_array().ok());
-    apply_decode(&mut samples, channels, decode.map(Vec::as_slice));
+    apply_decode(
+        &mut samples,
+        channels,
+        decode.map(Vec::as_slice),
+        max,
+        palette.map(|p| p.len().saturating_sub(1)),
+    );
     let (out_channels, colors) = match (&space.palette, space.model) {
         (Some(palette), _) => {
             let mut colors = Vec::with_capacity(pixels * 3);
@@ -1485,6 +1518,12 @@ pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<
     for idx in section_indices(range, pages.len())? {
         if crate::limits::expired() {
             doc.warn("The time limit was reached, so the remaining PDF pages were skipped. Raise or remove the timeout to convert them.");
+            // Leave a marker where extraction stopped: warnings travel outside the
+            // body, so a reader of the body alone would not see the gap.
+            let mut skipped = Section::new("page", String::new()).indexed(idx);
+            skipped.properties.insert("page".into(), (idx + 1).to_string());
+            skipped.properties.insert("skipped".into(), "time_limit".into());
+            doc.sections.push(skipped);
             break;
         }
         let id = pages[idx];

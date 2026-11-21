@@ -218,6 +218,12 @@ impl DocumentCache {
             return Ok(document);
         }
         let document = Rc::new(load_range(path, false, range)?);
+        // A parse that ran out of time returns fewer pages, so it must not be
+        // reused: the next request may allow more time and would otherwise get
+        // the truncated copy back immediately.
+        if crate::limits::expired() {
+            return Ok(document);
+        }
         let bytes = document_bytes(&document);
         // A document that fills the cache on its own would evict everything else.
         if bytes <= CACHE_BYTES / 2 {
@@ -800,6 +806,30 @@ mod tests {
         assert_eq!(cache.entries.len(), 1);
         assert!(Rc::ptr_eq(&cache.entries[0].document, &changed));
         cache.clear();
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cache_keeps_no_document_that_ran_out_of_time() {
+        let path = std::env::temp_dir().join(format!(
+            "rdocs2md-cache-timeout-{}-{}.rtf",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::write(&path, br"{\rtf1 first\page second}").unwrap();
+        let mut cache = DocumentCache::default();
+        // Without a budget this document caches normally.
+        let _budget = crate::limits::start(None);
+        let complete = cache.load(&path, None).unwrap();
+        cache.clear();
+        assert_eq!(complete.sections.len(), 2);
+        crate::limits::expire();
+        let truncated = cache.load(&path, None).unwrap();
+        assert!(!Rc::ptr_eq(&complete, &truncated));
         assert!(cache.entries.is_empty());
         assert_eq!(cache.bytes, 0);
         let _ = fs::remove_file(&path);

@@ -1007,6 +1007,84 @@ fn pdf_raster_images_are_exported_as_png() {
     assert_eq!(png[25], 2, "colour type");
 }
 
+/// Pixels of the filter-0, 8-bit RGB PNG files the converter writes.
+fn png_pixels(png: &[u8]) -> (usize, usize, Vec<u8>) {
+    use std::io::Read;
+
+    let (mut width, mut height) = (0, 0);
+    let mut data = Vec::new();
+    let mut pos = 8;
+    while pos + 8 <= png.len() {
+        let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+        let kind = &png[pos + 4..pos + 8];
+        let body = &png[pos + 8..pos + 8 + len];
+        if kind == b"IHDR".as_slice() {
+            width = u32::from_be_bytes(body[0..4].try_into().unwrap()) as usize;
+            height = u32::from_be_bytes(body[4..8].try_into().unwrap()) as usize;
+        } else if kind == b"IDAT".as_slice() {
+            data.extend_from_slice(body);
+        }
+        pos += len + 12;
+    }
+    let mut raw = Vec::new();
+    flate2::read::ZlibDecoder::new(&data[..])
+        .read_to_end(&mut raw)
+        .unwrap();
+    let stride = width * 3 + 1;
+    assert_eq!(raw.len(), stride * height, "unexpected PNG payload");
+    let pixels = raw
+        .chunks_exact(stride)
+        .flat_map(|row| &row[1..])
+        .copied()
+        .collect();
+    (width, height, pixels)
+}
+
+#[test]
+fn pdf_indexed_images_keep_their_palette_indices() {
+    use lopdf::{Document as Pdf, Object, Stream, dictionary};
+
+    // A 1 bit Indexed image whose eight pixels alternate between index 0 (red)
+    // and index 1 (blue). Scaling the indices to 0-255 would push index 1 out
+    // of the two entry palette, so those pixels would come out black.
+    let mut pdf = Pdf::with_version("1.4");
+    let tree = pdf.new_object_id();
+    let lookup = pdf.add_object(Stream::new(dictionary! {}, vec![255, 0, 0, 0, 0, 255]));
+    let image = pdf.add_object(Stream::new(
+        dictionary! {
+            "Type"=>"XObject","Subtype"=>"Image","Width"=>8,"Height"=>1,
+            "BitsPerComponent"=>1,
+            "ColorSpace"=>vec![
+                "Indexed".into(),
+                "DeviceRGB".into(),
+                1.into(),
+                Object::Reference(lookup),
+            ],
+        },
+        vec![0b0101_0101],
+    ));
+    let resources = dictionary! {"XObject"=>dictionary! {"Im"=>image}};
+    let stream = pdf.add_object(Stream::new(
+        dictionary! {},
+        b"q 80 0 0 10 30 150 cm /Im Do Q".to_vec(),
+    ));
+    let page = pdf.add_object(dictionary! {"Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]});
+    pdf.objects.insert(tree, dictionary! {"Type"=>"Pages","Kids"=>vec![Object::Reference(page)],"Count"=>1,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]}.into());
+    let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree});
+    pdf.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    pdf.save_to(&mut bytes).unwrap();
+
+    let d = convert(&bytes, true).unwrap();
+    let png = d.assets.values().next().expect("image asset");
+    let (width, height, pixels) = png_pixels(png);
+    assert_eq!((width, height), (8, 1));
+    for (i, pixel) in pixels.chunks_exact(3).enumerate() {
+        let expected = if i % 2 == 0 { [255, 0, 0] } else { [0, 0, 255] };
+        assert_eq!(pixel, &expected[..], "pixel {i}");
+    }
+}
+
 #[test]
 fn docx_comments_and_tracked_deletions_are_reported() {
     let data = package(&[

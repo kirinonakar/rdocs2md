@@ -45,3 +45,9 @@ pub fn check() -> Result<()> {
         Ok(())
     }
 }
+
+/// Test-only: moves this thread's budget into the past without waiting.
+#[cfg(test)]
+pub(crate) fn expire() {
+    DEADLINE.with(|d| d.set(Some(Instant::now() - Duration::from_secs(1))));
+}

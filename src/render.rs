@@ -411,6 +411,18 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                 out.push_str("---\n\n");
             }
         }
+        // Warnings travel as a separate block, so a page that stopped early or
+        // failed leaves a marker in the body: a reader of `--stdout` output alone
+        // would otherwise not notice what is missing.
+        if let Some(page) = s.properties.get("skipped").and(s.properties.get("page")) {
+            writeln!(out, "<!-- page {page} skipped -->\n")?;
+            continue;
+        }
+        if s.properties.contains_key("page_error")
+            && let Some(page) = s.properties.get("page")
+        {
+            writeln!(out, "<!-- page {page} incomplete -->\n")?;
+        }
         if let Some(anchor) = s.properties.get("anchor") {
             writeln!(out, "<a id=\"{}\"></a>\n", escape(anchor))?;
         }
@@ -611,7 +623,27 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::markdown;
+    use super::{markdown, render};
+    use crate::model::*;
+
+    #[test]
+    fn missing_pages_leave_a_marker_in_the_body() {
+        let mut doc = Document::new("pdf");
+        let mut failed = Section::new("page", "1 0 R").indexed(0);
+        failed.properties.insert("page".into(), "1".into());
+        failed.properties.insert("page_error".into(), "boom".into());
+        failed.paragraph("Partial page");
+        let mut skipped = Section::new("page", "").indexed(1);
+        skipped.properties.insert("page".into(), "2".into());
+        skipped.properties.insert("skipped".into(), "time_limit".into());
+        doc.sections.push(failed);
+        doc.sections.push(skipped);
+        let out = render(&doc, "md", "hybrid", &Properties::new()).unwrap();
+        assert!(out.contains("<!-- page 1 incomplete -->"), "{out}");
+        assert!(out.contains("<!-- page 2 skipped -->"), "{out}");
+        assert!(out.contains("Partial page"), "{out}");
+        assert!(out.find("page 1 incomplete").unwrap() < out.find("Partial page").unwrap());
+    }
 
     #[test]
     fn annotations_keep_literal_brackets() {
