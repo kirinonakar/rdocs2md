@@ -127,7 +127,9 @@ impl Document {
 pub struct Section {
     pub kind: String,
     pub source: String,
-    #[serde(skip)]
+    /// 1-based position among the source sections, kept when a range selects a
+    /// subset so that citations retain the original numbering.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
     #[serde(skip)]
     pub slide_number: Option<usize>,

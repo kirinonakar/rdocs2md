@@ -5,14 +5,20 @@ use crate::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
+    cell::RefCell,
     collections::HashSet,
     fs,
     io::{self, BufRead, Write},
     panic::AssertUnwindSafe,
     path::{Component, Path, PathBuf},
+    rc::Rc,
+    time::SystemTime,
 };
 const INLINE: usize = 512 * 1024;
 const FRAME: u64 = 1024 * 1024;
+/// Parsed documents kept for repeated read-only MCP requests.
+const CACHE_ENTRIES: usize = 8;
+const CACHE_BYTES: usize = 128 * MIB;
 fn definitions(allow_outside_root: bool) -> Vec<Value> {
     let scope = if allow_outside_root {
         "Local paths may be outside the root. Relative paths start at the root."
@@ -53,6 +59,7 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
             props["recursive"] = json!({"type":"boolean","description":"Scan subdirectories for directory and wildcard inputs."});
             props["output_dir"] = json!({"type":"string","description":format!("Output directory. Its parent must exist if the directory is new. {scope}")});
             props["jobs"] = json!({"type":"integer","minimum":1,"maximum":parallel::MAX_JOBS,"description":"Parallel conversion workers. Defaults to the available CPU count."});
+            props["max_inflight_bytes"] = json!({"type":"integer","minimum":0,"description":"Input bytes converted at the same time. Defaults to 1 GiB; 0 removes the cap."});
             required.extend(["paths", "output_dir"]);
         } else if name != "list_supported_formats" {
             props["path"] =
@@ -95,6 +102,7 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
 struct Access {
     root: PathBuf,
     allow_outside_root: bool,
+    cache: RefCell<DocumentCache>,
 }
 impl Access {
     fn input_path(&self, path: &str) -> Result<PathBuf> {
@@ -169,6 +177,114 @@ impl Access {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct CacheKey {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    range: Option<String>,
+}
+
+struct CachedDocument {
+    key: CacheKey,
+    document: Rc<Document>,
+    bytes: usize,
+}
+
+/// Recently parsed documents for the read-only MCP tools. Requests are handled
+/// one at a time, so an ordinary `RefCell` is enough, and the CLI never caches.
+#[derive(Default)]
+struct DocumentCache {
+    entries: Vec<CachedDocument>,
+    bytes: usize,
+}
+
+impl DocumentCache {
+    fn load(&mut self, path: &Path, range: Option<&str>) -> Result<Rc<Document>> {
+        let key = Self::key(path, range)?;
+        if let Some(position) = self.entries.iter().position(|entry| entry.key == key) {
+            // Move the hit to the back so that the first entry is the oldest.
+            let entry = self.entries.remove(position);
+            let document = Rc::clone(&entry.document);
+            self.entries.push(entry);
+            return Ok(document);
+        }
+        let document = Rc::new(load_range(path, false, range)?);
+        let bytes = document_bytes(&document);
+        // A document that fills the cache on its own would evict everything else.
+        if bytes <= CACHE_BYTES / 2 {
+            while !self.entries.is_empty()
+                && (self.entries.len() >= CACHE_ENTRIES || self.bytes + bytes > CACHE_BYTES)
+            {
+                let evicted = self.entries.remove(0);
+                self.bytes -= evicted.bytes;
+            }
+            self.bytes += bytes;
+            self.entries.push(CachedDocument {
+                key,
+                document: Rc::clone(&document),
+                bytes,
+            });
+        }
+        Ok(document)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    /// Size and modification time invalidate a cached document in place.
+    fn key(path: &Path, range: Option<&str>) -> Result<CacheKey> {
+        let metadata = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(CacheKey {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            range: range.map(str::to_owned),
+        })
+    }
+}
+
+/// Rough retained size of a parsed document, used only to bound the cache.
+fn document_bytes(d: &Document) -> usize {
+    fn runs(list: &[Run]) -> usize {
+        list.iter()
+            .map(|run| {
+                run.text.len()
+                    + run.mathml.as_ref().map_or(0, String::len)
+                    + run.latex.as_ref().map_or(0, String::len)
+                    + 64
+            })
+            .sum()
+    }
+    fn blocks(list: &[Block]) -> usize {
+        list
+            .iter()
+            .map(|block| match block {
+                Block::Paragraph {
+                    runs: text,
+                    properties,
+                    ..
+                } => runs(text) + properties.len() * 32,
+                Block::Table { rows } => rows
+                    .iter()
+                    .flatten()
+                    .map(|cell| runs(&cell.runs) + blocks(&cell.blocks) + 64)
+                    .sum(),
+            })
+            .sum()
+    }
+    d.sections
+        .iter()
+        .map(|section| {
+            blocks(&section.blocks) + section.properties.len() * 32 + section.title.len() + 128
+        })
+        .sum::<usize>()
+        + d.metadata.len() * 32
+        + d.assets.values().map(Vec::len).sum::<usize>()
+}
+
 struct Conversion<'a> {
     format: &'a str,
     mode: &'a str,
@@ -235,10 +351,47 @@ impl BatchReport {
     }
 }
 
-fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> Result<String> {
+/// A tool reply. Structured replies keep the plain text result so that clients
+/// without structured content still see the document and its warnings.
+enum Reply {
+    Text(String),
+    Structured {
+        text: String,
+        warnings: Vec<String>,
+        value: Value,
+    },
+}
+
+impl Reply {
+    fn json(value: &impl Serialize) -> Result<Self> {
+        let text = serde_json::to_string(value)?;
+        Ok(Self::Structured {
+            // Reparse so that the text and the structured form stay identical.
+            value: serde_json::from_str(&text)?,
+            text,
+            warnings: Vec::new(),
+        })
+    }
+
+    fn into_parts(self) -> (String, Vec<String>, Option<Value>) {
+        match self {
+            Self::Text(text) => (text, Vec::new(), None),
+            Self::Structured {
+                text,
+                warnings,
+                value,
+            } => (text, warnings, Some(value)),
+        }
+    }
+}
+
+fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> Result<Reply> {
     let paths = args["paths"].as_array().ok_or("missing paths")?;
     let recursive = args["recursive"].as_bool().unwrap_or(false);
-    let jobs = parallel::jobs(args["jobs"].as_u64().map(|n| n as usize));
+    let jobs = args["jobs"].as_u64().map(|n| n as usize);
+    let budget = args["max_inflight_bytes"]
+        .as_u64()
+        .unwrap_or(parallel::DEFAULT_INFLIGHT_BYTES);
     let mut inputs = Vec::new();
     let mut seen = HashSet::new();
     let mut report = BatchReport::default();
@@ -259,6 +412,12 @@ fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> 
         }
     }
     if !inputs.is_empty() {
+        // Size the pool before parsing starts so that a batch of large inputs
+        // does not run on every core at once.
+        let sizes: Vec<u64> = inputs
+            .iter()
+            .map(|path| fs::metadata(path).map_or(0, |m| m.len()))
+            .collect();
         let out_dir = access.directory(args["output_dir"].as_str().ok_or("missing output_dir")?)?;
         let image_parent = if let Some(dir) = args["image_dir"].as_str() {
             Some(access.directory(dir)?)
@@ -291,13 +450,16 @@ fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> 
                 .transpose()?;
             tasks.push((input, out, dir));
         }
+        // Borrow only the root: the cache is not `Sync`, so workers must not
+        // capture the whole `Access`.
+        let root = access.root.as_path();
         parallel::ordered(
             &tasks,
-            jobs,
+            parallel::jobs_within(jobs, &sizes, budget),
             |(input, out, dir)| {
                 // Errors cross the worker boundary as text; the report shape stays the same.
                 let result = recover_document(AssertUnwindSafe(|| {
-                    conversion.save(input, out, dir.as_deref(), &access.root)
+                    conversion.save(input, out, dir.as_deref(), root)
                 }))
                 .map_err(|e| e.to_string());
                 (input.clone(), result)
@@ -311,12 +473,12 @@ fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> 
             },
         );
     }
-    Ok(serde_json::to_string(&report)?)
+    Reply::json(&report)
 }
 
-fn call(access: &Access, name: &str, args: &Value) -> Result<String> {
+fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
     if name == "list_supported_formats" {
-        return Ok(serde_json::to_string(&support())?);
+        return Ok(Reply::Text(serde_json::to_string(&support())?));
     }
     let text = |k: &str| args.get(k).and_then(Value::as_str);
     let conversion = Conversion {
@@ -336,15 +498,33 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<String> {
                 .as_u64()
                 .map_or(search::DEFAULT_LIMIT, |n| n as usize),
         )?;
-        let d = load_range(&input, false, conversion.range)?;
-        return Ok(serde_json::to_string(&query.find(&d))?);
+        let document = access.cache.borrow_mut().load(&input, conversion.range)?;
+        return Reply::json(&query.find(&document));
     }
     if name == "inspect_document" {
-        let d = load_range(&input, false, None)?;
-        let sections:Vec<_>=d.sections.iter().enumerate().map(|(i,s)|json!({"index":i+1,"kind":s.kind,"title":s.title,"source":s.source,"blocks":s.blocks.len(),"properties":s.properties})).collect();
-        return Ok(serde_json::to_string(
-            &json!({"format":d.format,"metadata":d.metadata,"sections":sections,"warnings":d.warnings}),
-        )?);
+        let document = access.cache.borrow_mut().load(&input, None)?;
+        let document = &*document;
+        let sections: Vec<_> = document
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                json!({
+                    "index": s.index.unwrap_or(i + 1),
+                    "kind": s.kind,
+                    "title": s.title,
+                    "source": s.source,
+                    "blocks": s.blocks.len(),
+                    "properties": s.properties,
+                })
+            })
+            .collect();
+        return Reply::json(&json!({
+            "format": document.format,
+            "metadata": document.metadata,
+            "sections": sections,
+            "warnings": document.warnings,
+        }));
     }
     let out = text("output_path")
         .map(|p| access.local(p, true))
@@ -360,11 +540,41 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<String> {
     }
     if let Some(out) = out {
         let summary = conversion.save(&input, &out, dir.as_deref(), &access.root)?;
-        Ok(serde_json::to_string(&summary)?)
-    } else {
-        let (text, _) = conversion.render(&input, None, dir.as_deref(), &access.root)?;
-        Ok(text)
+        return Reply::json(&summary);
     }
+    // Without images the parsed document can be reused by later read-only
+    // requests; image extraction changes the returned links, so it is not cached.
+    let document = if dir.is_none() {
+        access.cache.borrow_mut().load(&input, conversion.range)?
+    } else {
+        Rc::new(load_range(&input, true, conversion.range)?)
+    };
+    let document = &*document;
+    let links = match dir.as_deref() {
+        Some(dir) => output::extract(document, dir, &access.root)?,
+        None => Properties::new(),
+    };
+    let content = render(document, conversion.format, conversion.mode, &links)?;
+    let sections: Vec<_> = document
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(i, s)| s.index.unwrap_or(i + 1))
+        .collect();
+    let warnings = document.warnings.clone();
+    let value = json!({
+        "format": document.format,
+        "source": text("path").unwrap_or_default(),
+        "sections": sections,
+        "content": &content,
+        "warnings": &warnings,
+        "truncated": false,
+    });
+    Ok(Reply::Structured {
+        text: content,
+        warnings,
+        value,
+    })
 }
 fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
@@ -440,21 +650,47 @@ fn dispatch(access: &Access, req: Value, phase: &mut u8, defs: &[Value]) -> Opti
                     "Arguments do not match the tool input schema",
                 ));
             }
-            let response = recover_document(|| call(access, name, args));
-            let (s, bad) = match response {
-                Ok(s) if s.len() <= INLINE => (s, false),
-                Ok(_) => (
-                    if name == "search_document" {
-                        "Result exceeds 512 KiB. Use a smaller range or search limit."
-                    } else {
-                        "Result exceeds 512 KiB. Use a smaller range or save with output_path."
+            // The cache uses a `RefCell`, which is not `UnwindSafe`; it is only
+            // mutated after parsing succeeds, so a caught panic leaves it intact.
+            let response = recover_document(AssertUnwindSafe(|| call(access, name, args)));
+            let (text, warnings, structured, bad): (String, Vec<String>, Option<Value>, bool) =
+                match response {
+                    Ok(reply) => {
+                        let (text, warnings, structured) = reply.into_parts();
+                        if text.len() <= INLINE {
+                            (text, warnings, structured, false)
+                        } else {
+                            (
+                                if name == "search_document" {
+                                    "Result exceeds 512 KiB. Use a smaller range or search limit."
+                                } else {
+                                    "Result exceeds 512 KiB. Use a smaller range or save with output_path."
+                                }
+                                .into(),
+                                Vec::new(),
+                                None,
+                                true,
+                            )
+                        }
                     }
-                    .into(),
-                    true,
-                ),
-                Err(e) => (e.to_string(), true),
-            };
-            json!({"content":[{"type":"text","text":s}],"isError":bad})
+                    Err(e) => (e.to_string(), Vec::new(), None, true),
+                };
+            let mut content = vec![json!({"type":"text","text":text})];
+            if !warnings.is_empty() {
+                // Clients that ignore structured content still see the warnings.
+                content.push(json!({
+                    "type":"text",
+                    "text":format!(
+                        "Conversion warnings (the result may be incomplete):\n- {}",
+                        warnings.join("\n- ")
+                    ),
+                }));
+            }
+            let mut result = json!({"content":content,"isError":bad});
+            if let Some(value) = structured {
+                result["structuredContent"] = value;
+            }
+            result
         }
         _ => return Some(rpc_error(id, -32601, "Method not found")),
     };
@@ -475,17 +711,21 @@ pub fn serve_with_access(path: &Path, allow_outside_root: bool) -> Result<()> {
     let access = Access {
         root,
         allow_outside_root,
+        cache: RefCell::default(),
     };
     let defs = definitions(allow_outside_root);
     loop {
         line.clear();
-        let n = std::io::Read::take(&mut stdin, FRAME + 1).read_until(b'\n', &mut line)?;
+        // A closed or broken input stream means the client disconnected.
+        let Ok(n) = std::io::Read::take(&mut stdin, FRAME + 1).read_until(b'\n', &mut line) else {
+            break;
+        };
         if n == 0 {
             break;
         }
         let reply = if n as u64 > FRAME {
-            if line.last() != Some(&b'\n') {
-                stdin.skip_until(b'\n')?;
+            if line.last() != Some(&b'\n') && stdin.skip_until(b'\n').is_err() {
+                break;
             }
             Some(rpc_error(
                 &Value::Null,
@@ -499,10 +739,49 @@ pub fn serve_with_access(path: &Path, allow_outside_root: bool) -> Result<()> {
             }
         };
         if let Some(r) = reply {
-            serde_json::to_writer(&mut out, &r)?;
-            out.write_all(b"\n")?;
-            out.flush()?
+            // A failed write means the client is gone; nothing is left to serve.
+            if serde_json::to_writer(&mut out, &r).is_err()
+                || out.write_all(b"\n").is_err()
+                || out.flush().is_err()
+            {
+                break;
+            }
         }
     }
+    // Release cached documents before returning so that the memory is reclaimed
+    // even when this server runs inside a longer-lived process.
+    access.cache.borrow_mut().clear();
+    drop(defs);
+    line.clear();
+    let _ = out.flush();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_reloads_changed_documents_and_clears() {
+        let path = std::env::temp_dir().join(format!(
+            "rdocs2md-cache-{}-{}.rtf",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::write(&path, br"{\rtf1 first}").unwrap();
+        let mut cache = DocumentCache::default();
+        let first = cache.load(&path, None).unwrap();
+        assert_eq!(first.sections.len(), 1);
+        assert!(Rc::ptr_eq(&first, &cache.load(&path, None).unwrap()));
+        fs::write(&path, br"{\rtf1 second\page third}").unwrap();
+        let changed = cache.load(&path, None).unwrap();
+        assert_eq!(changed.sections.len(), 2);
+        assert!(!Rc::ptr_eq(&first, &changed));
+        cache.clear();
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+        let _ = fs::remove_file(&path);
+    }
 }

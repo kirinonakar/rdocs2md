@@ -16,6 +16,35 @@ pub fn jobs(requested: Option<usize>) -> usize {
         .clamp(1, MAX_JOBS)
 }
 
+/// Default cap on the input bytes converted at the same time.
+pub const DEFAULT_INFLIGHT_BYTES: u64 = 1 << 30;
+
+/// Lower a worker count so that the largest worker-sized set of inputs fits
+/// `max_bytes`.
+///
+/// `sizes` are input lengths, so the result bounds the bytes read at once, not
+/// the whole working set: parsing and rendering need more memory per input. A
+/// zero budget disables the cap.
+pub fn jobs_within(requested: Option<usize>, sizes: &[u64], max_bytes: u64) -> usize {
+    let jobs = jobs(requested);
+    if max_bytes == 0 {
+        return jobs;
+    }
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    let mut total = 0u64;
+    let mut fitting = 0usize;
+    for size in sorted {
+        total = total.saturating_add(size);
+        if total > max_bytes {
+            break;
+        }
+        fitting += 1;
+    }
+    // A single input that exceeds the budget still has to run.
+    jobs.min(fitting.max(1))
+}
+
 /// Run `work` for each item and hand results to `sink` in input order.
 ///
 /// At most one task per worker stays in flight, so completed results held back
@@ -147,5 +176,19 @@ mod tests {
         assert_eq!(jobs(Some(0)), 1);
         assert_eq!(jobs(Some(usize::MAX)), MAX_JOBS);
         assert!((1..=MAX_JOBS).contains(&jobs(None)));
+    }
+
+    #[test]
+    fn caps_workers_by_inflight_bytes() {
+        let mib = 1 << 20;
+        let sizes = [mib; 8];
+        // A zero budget means no cap.
+        assert_eq!(jobs_within(Some(8), &sizes, 0), 8);
+        assert_eq!(jobs_within(Some(8), &sizes, 2 * mib), 2);
+        // One input that exceeds the budget still needs a worker.
+        assert_eq!(jobs_within(Some(8), &sizes, 1), 1);
+        assert_eq!(jobs_within(Some(8), &[], 1), 1);
+        // Never more workers than inputs, even when everything fits.
+        assert_eq!(jobs_within(Some(4), &[1, 1, 1], mib), 3);
     }
 }

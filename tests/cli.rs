@@ -194,6 +194,29 @@ fn parallel_batch_keeps_input_order() {
         String::from_utf8_lossy(&one.stderr)
     );
     assert!(work.path("out/a.md").is_file() && work.path("out/b.md").is_file());
+    assert_eq!(
+        work.run(&["a.rtf", "--max-inflight-bytes", "bogus"])
+            .status
+            .code(),
+        Some(2)
+    );
+    // A tiny budget still converts every input, just with fewer workers.
+    let limited = work.run(&[
+        "a.rtf",
+        "b.rtf",
+        "-o",
+        "limited",
+        "--jobs",
+        "8",
+        "--max-inflight-bytes",
+        "1",
+    ]);
+    assert!(
+        limited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&limited.stderr)
+    );
+    assert!(work.path("limited/a.md").is_file() && work.path("limited/b.md").is_file());
 }
 
 #[test]
@@ -341,6 +364,15 @@ fn mcp_advertises_and_renders_output_formats() {
     }
     assert_eq!(result(3)["isError"], false);
     assert!(content(3).starts_with("First page"));
+    // Structured content keeps the plain text result and adds warnings and
+    // section numbers for clients that can use them.
+    let structured = &result(3)["structuredContent"];
+    assert_eq!(structured["format"], "rtf");
+    assert_eq!(structured["source"], "sample.rtf");
+    assert_eq!(structured["sections"], json!([1, 2]));
+    assert_eq!(structured["warnings"], json!([]));
+    assert_eq!(structured["content"], content(3));
+    assert_eq!(structured["truncated"], false);
     assert_eq!(result(4)["isError"], false);
     let html = fs::read_to_string(work.path("sample.html")).unwrap();
     assert!(html.starts_with("<!doctype html>"));
@@ -350,6 +382,13 @@ fn mcp_advertises_and_renders_output_formats() {
     assert_eq!(document["sections"].as_array().unwrap().len(), 1);
     assert!(content(5).contains("Second page"));
     assert!(!content(5).contains("First page"));
+    // Section indexes survive range extraction in the JSON IR.
+    assert_eq!(document["sections"][0]["index"], 2);
+    // Structured content uses one envelope for every format, so a JSON result
+    // keeps the document JSON in `content`.
+    assert_eq!(result(5)["structuredContent"]["content"], content(5));
+    assert_eq!(result(5)["structuredContent"]["sections"], json!([2]));
+    assert_eq!(result(5)["structuredContent"]["format"], "rtf");
     assert_eq!(replies[5]["error"]["code"], -32602);
     assert_eq!(result(7)["isError"], true);
     assert!(content(7).contains("new .json file"));
@@ -359,11 +398,16 @@ fn mcp_advertises_and_renders_output_formats() {
     let search: Value = serde_json::from_str(content(9)).unwrap();
     assert_eq!(search["matches"][0]["section_index"], 2);
     assert_eq!(search["matches"][0]["text"], "Second");
+    // Citations carry the source section, a stable block id and the page.
+    assert_eq!(search["matches"][0]["source_section_index"], 2);
+    assert_eq!(search["matches"][0]["block_id"], "s2-b1");
+    assert_eq!(result(9)["structuredContent"], search);
     assert_eq!(replies[9]["error"]["code"], -32602);
     assert_eq!(result(11)["isError"], false);
     let batch: Value = serde_json::from_str(content(11)).unwrap();
     assert_eq!(batch["succeeded"], 2, "{batch}");
     assert_eq!(batch["failed"], 2, "{batch}");
+    assert_eq!(result(11)["structuredContent"], batch);
     assert!(content(11).contains("outside the MCP root"));
     assert!(work.path("batch/copy.json").is_file());
     assert!(work.path("batch/sample.json").is_file());

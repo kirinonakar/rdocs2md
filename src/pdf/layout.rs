@@ -2050,6 +2050,8 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                     {
                         join_runs(para, runs, gap > size * 0.12);
                         properties.insert("last_y_pt".into(), y.to_string());
+                        properties.insert("w_pt".into(), (end - x).max(0.).to_string());
+                        properties.insert("h_pt".into(), row_size.to_string());
                     }
                     previous = Some(LineInfo {
                         x,
@@ -2079,9 +2081,19 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                 {
                     join_wrapped_line(para, runs, prev.discretionary_hyphen);
                     properties.insert("last_y_pt".into(), y.to_string());
+                    properties.insert(
+                        "w_pt".into(),
+                        (prev.end.max(info.end) - prev.x).max(0.).to_string(),
+                    );
+                    properties.insert(
+                        "h_pt".into(),
+                        (prev.y - info.y + info.size).max(0.).to_string(),
+                    );
                 } else {
                     let mut properties = coordinates(x, y);
                     properties.insert("last_y_pt".into(), y.to_string());
+                    properties.insert("w_pt".into(), (info.end - x).max(0.).to_string());
+                    properties.insert("h_pt".into(), size.to_string());
                     out.push(Block::Paragraph {
                         heading: 0,
                         list: None,

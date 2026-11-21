@@ -29,6 +29,7 @@ Example: rdocs2md "report.pdf" -o "report.md"
   --image-dir DIRECTORY    Select image destination (implies extraction)
   -r, --recursive          Scan subfolders for directory and wildcard inputs
   -j, --jobs NUMBER        Parallel workers for batch conversion (1-64, default: CPU count)
+  --max-inflight-bytes SIZE  Cap concurrent batch input bytes (default: 1 GiB, 0: none)
   --search QUERY           Search extracted document text and return JSON matches
   --case-sensitive         Perform case-sensitive search
   --limit NUMBER           Maximum search matches per input (default: 50)
@@ -49,12 +50,14 @@ struct Args {
     range: Option<String>,
     recursive: bool,
     jobs: Option<usize>,
+    inflight: u64,
     query: Option<search::Query>,
 }
 fn parse(args: Vec<String>) -> Result<Args> {
     let mut a = Args {
         format: "md".into(),
         mode: "hybrid".into(),
+        inflight: parallel::DEFAULT_INFLIGHT_BYTES,
         ..Args::default()
     };
     let mut query = None;
@@ -82,6 +85,7 @@ fn parse(args: Vec<String>) -> Result<Args> {
                 a.jobs = Some(jobs)
             }
             "--search" => query = Some(val()?),
+            "--max-inflight-bytes" => a.inflight = parse_size(&val()?)?,
             "--case-sensitive" => case_sensitive = true,
             "--limit" => limit = Some(val()?.parse()?),
             "--format" => a.format = val()?,
@@ -124,6 +128,28 @@ fn parse(args: Vec<String>) -> Result<Args> {
         return Err("--case-sensitive and --limit require --search".into());
     }
     Ok(a)
+}
+
+/// Parse a byte count such as `512`, `4MiB` or `1.5GiB`. Zero removes a cap.
+fn parse_size(text: &str) -> Result<u64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let (number, suffix) = text.split_at(split);
+    let value: f64 = number.parse()?;
+    let scale = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.,
+        "k" | "kb" | "kib" => 1024.,
+        "m" | "mb" | "mib" => 1024. * 1024.,
+        "g" | "gb" | "gib" => 1024. * 1024. * 1024.,
+        _ => return Err(format!("invalid size {text}").into()),
+    };
+    let bytes = value * scale;
+    if !bytes.is_finite() || !(0. ..=u64::MAX as f64).contains(&bytes) {
+        return Err(format!("invalid size {text}").into());
+    }
+    Ok(bytes as u64)
 }
 
 fn dest(a: &Args, input: &Path, stem: &OsStr, multi: bool) -> PathBuf {
@@ -313,10 +339,16 @@ fn process(a: &Args) -> Result<i32> {
             error,
         });
     }
+    // Bound the bytes handed to workers so that a large batch does not parse on
+    // every core at once.
+    let sizes: Vec<u64> = plans
+        .iter()
+        .map(|plan| fs::metadata(&plan.input).map_or(0, |m| m.len()))
+        .collect();
     let mut write_error = None;
     parallel::ordered(
         &plans,
-        a.jobs.unwrap_or_else(|| parallel::jobs(None)),
+        parallel::jobs_within(a.jobs, &sizes, a.inflight),
         |plan| match &plan.error {
             Some(error) => Completed {
                 ok: false,

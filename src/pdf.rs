@@ -1266,6 +1266,9 @@ pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<
     for idx in section_indices(range, pages.len())? {
         let id = pages[idx];
         let mut sec = Section::new("page", format!("{} {} R", id.0, id.1)).indexed(idx);
+        // The source string is a PDF object identifier; keep the human page
+        // number so that citations do not need to resolve object numbers.
+        sec.properties.insert("page".into(), (idx + 1).to_string());
         let bytes = pdf.get_page_content_with_limit(id, PART_LIMIT)?;
         let (direct, ids) = pdf.get_page_resources(id)?;
         let resources = direct.or_else(|| ids.first().and_then(|id| pdf.get_dictionary(*id).ok()));
