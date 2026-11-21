@@ -1748,6 +1748,10 @@ fn page_outlines(pdf: &Pdf, pages: &[lopdf::ObjectId]) -> HashMap<usize, Vec<(u8
 
 /// Promotes paragraphs that match a bookmark title so that the PDF output
 /// carries the same `#` hierarchy as the source document.
+///
+/// A bookmark whose title the page never prints (exporters often keep
+/// "Chapter 1." in the outline only) is inserted as a heading of its own
+/// instead of being dropped from the structure.
 fn apply_outlines(sec: &mut Section, entries: &[(u8, String)]) {
     let mut cursor = 0;
     for (level, title) in entries {
@@ -1787,6 +1791,17 @@ fn apply_outlines(sec: &mut Section, entries: &[(u8, String)]) {
                 *heading = (*level).clamp(1, 6);
             }
             cursor = index + 1;
+        } else {
+            sec.blocks.insert(
+                cursor,
+                Block::Paragraph {
+                    heading: (*level).clamp(1, 6),
+                    list: None,
+                    runs: vec![Run::text(title.as_str())],
+                    properties: Properties::new(),
+                },
+            );
+            cursor += 1;
         }
     }
 }
