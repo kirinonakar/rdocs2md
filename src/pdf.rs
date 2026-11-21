@@ -1712,13 +1712,13 @@ fn page_outlines(pdf: &Pdf, pages: &[lopdf::ObjectId]) -> HashMap<usize, Vec<(u8
 fn apply_outlines(sec: &mut Section, entries: &[(u8, String)]) {
     let mut cursor = 0;
     for (level, title) in entries {
-        let key = outline_key(title);
-        if key.is_empty() {
+        let keys = outline_keys(title);
+        if keys.is_empty() {
             continue;
         }
         let mut found = None;
         let mut partial = None;
-        for (index, block) in sec.blocks.iter().enumerate().skip(cursor) {
+        'blocks: for (index, block) in sec.blocks.iter().enumerate().skip(cursor) {
             let Block::Paragraph {
                 heading: 0,
                 runs,
@@ -1732,15 +1732,17 @@ fn apply_outlines(sec: &mut Section, entries: &[(u8, String)]) {
             if text.is_empty() {
                 continue;
             }
-            if text == key {
-                found = Some(index);
-                break;
-            }
-            if partial.is_none()
-                && (text.starts_with(&key) || key.starts_with(&text))
-                && text.len().min(key.len()) >= 4
-            {
-                partial = Some(index);
+            for key in &keys {
+                if text == *key {
+                    found = Some(index);
+                    break 'blocks;
+                }
+                if partial.is_none()
+                    && (text.starts_with(key.as_str()) || key.starts_with(text.as_str()))
+                    && text.len().min(key.len()) >= 4
+                {
+                    partial = Some(index);
+                }
             }
         }
         if let Some(index) = found.or(partial) {
@@ -1750,6 +1752,30 @@ fn apply_outlines(sec: &mut Section, entries: &[(u8, String)]) {
             cursor = index + 1;
         }
     }
+}
+
+/// Bookmark titles often carry numbering that the page never repeats
+/// ("Chapter 12. Chiari 1"), so the title is matched without it as well.
+/// The unnumbered title is tried after the full one so that an exact match
+/// against the printed text still wins.
+fn outline_keys(title: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some((head, rest)) = title.split_once('.') {
+        let numbered = outline_key(head)
+            .strip_prefix("chapter")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if numbered {
+            let rest = outline_key(rest);
+            if !rest.is_empty() {
+                keys.push(rest);
+            }
+        }
+    }
+    let full = outline_key(title);
+    if !full.is_empty() {
+        keys.insert(0, full);
+    }
+    keys
 }
 
 fn outline_key(text: &str) -> String {
