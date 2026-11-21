@@ -1,5 +1,6 @@
 use crate::{
-    batch, load_range, model::*, output, recover_document, render::render, search, support,
+    batch, load_range, model::*, output, parallel, recover_document, render::render, search,
+    support,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -7,6 +8,7 @@ use std::{
     collections::HashSet,
     fs,
     io::{self, BufRead, Write},
+    panic::AssertUnwindSafe,
     path::{Component, Path, PathBuf},
 };
 const INLINE: usize = 512 * 1024;
@@ -50,6 +52,7 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
             props["paths"] = json!({"type":"array","items":{"type":"string"},"minItems":1,"description":format!("Files, directories or wildcard patterns supporting *, ?, [], and **. {scope}")});
             props["recursive"] = json!({"type":"boolean","description":"Scan subdirectories for directory and wildcard inputs."});
             props["output_dir"] = json!({"type":"string","description":format!("Output directory. Its parent must exist if the directory is new. {scope}")});
+            props["jobs"] = json!({"type":"integer","minimum":1,"maximum":parallel::MAX_JOBS,"description":"Parallel conversion workers. Defaults to the available CPU count."});
             required.extend(["paths", "output_dir"]);
         } else if name != "list_supported_formats" {
             props["path"] =
@@ -235,6 +238,7 @@ impl BatchReport {
 fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> Result<String> {
     let paths = args["paths"].as_array().ok_or("missing paths")?;
     let recursive = args["recursive"].as_bool().unwrap_or(false);
+    let jobs = parallel::jobs(args["jobs"].as_u64().map(|n| n as usize));
     let mut inputs = Vec::new();
     let mut seen = HashSet::new();
     let mut report = BatchReport::default();
@@ -263,35 +267,49 @@ fn convert_batch(access: &Access, args: &Value, conversion: &Conversion<'_>) -> 
         } else {
             None
         };
+        // Name results and image folders first so that workers write distinct
+        // files and the report keeps the input order.
         let mut stems = batch::OutputNames::default();
-        for input in &inputs {
-            let stem = stems.next(input);
+        let mut tasks = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let stem = stems.next(&input);
             let out = out_dir.join(batch::output_name(&stem, conversion.format));
-            let result = recover_document(|| {
-                let dir = image_parent
-                    .as_ref()
-                    .map(|parent| {
-                        let mut name = stem.clone();
-                        if args["image_dir"].is_null() {
-                            name.push("_images");
-                        }
-                        let path = parent.join(name);
-                        if path.exists() {
-                            access.scoped(path.canonicalize()?)
-                        } else {
-                            Ok(path)
-                        }
-                    })
-                    .transpose()?;
-                let mut result = conversion.save(input, &out, dir.as_deref(), &access.root)?;
-                result["input"] = json!(input);
-                Ok(result)
-            });
-            match result {
-                Ok(result) => report.push(result),
-                Err(e) => report.push(json!({"input":input,"error":e.to_string()})),
-            }
+            let dir = image_parent
+                .as_ref()
+                .map(|parent| {
+                    let mut name = stem.clone();
+                    if args["image_dir"].is_null() {
+                        name.push("_images");
+                    }
+                    let path = parent.join(name);
+                    if path.exists() {
+                        access.scoped(path.canonicalize()?)
+                    } else {
+                        Ok(path)
+                    }
+                })
+                .transpose()?;
+            tasks.push((input, out, dir));
         }
+        parallel::ordered(
+            &tasks,
+            jobs,
+            |(input, out, dir)| {
+                // Errors cross the worker boundary as text; the report shape stays the same.
+                let result = recover_document(AssertUnwindSafe(|| {
+                    conversion.save(input, out, dir.as_deref(), &access.root)
+                }))
+                .map_err(|e| e.to_string());
+                (input.clone(), result)
+            },
+            |(input, result)| match result {
+                Ok(mut summary) => {
+                    summary["input"] = json!(input);
+                    report.push(summary)
+                }
+                Err(e) => report.push(json!({"input":input,"error":e})),
+            },
+        );
     }
     Ok(serde_json::to_string(&report)?)
 }

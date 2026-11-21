@@ -155,6 +155,48 @@ fn recursive_batch_with_destinations_and_stdout() {
 }
 
 #[test]
+fn parallel_batch_keeps_input_order() {
+    let work = Scratch::new();
+    let names = ["a.rtf", "b.rtf", "c.rtf", "d.rtf"];
+    for (i, name) in names.iter().enumerate() {
+        fs::write(work.path(name), format!("{{\\rtf1 document {i}}}")).unwrap();
+    }
+    let result = work.run(&[
+        "a.rtf", "b.rtf", "c.rtf", "d.rtf", "--stdout", "--jobs", "4",
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let lines: Vec<Value> = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), names.len());
+    for (i, line) in lines.iter().enumerate() {
+        assert!(line["input"].as_str().unwrap().ends_with(names[i]), "{line}");
+        assert!(
+            line["content"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("document {i}")),
+            "{line}"
+        );
+    }
+    assert_eq!(work.run(&["a.rtf", "--jobs", "0"]).status.code(), Some(2));
+    assert_eq!(work.run(&["a.rtf", "--jobs", "65"]).status.code(), Some(2));
+    let one = work.run(&["a.rtf", "b.rtf", "-o", "out", "--jobs", "1"]);
+    assert!(
+        one.status.success(),
+        "{}",
+        String::from_utf8_lossy(&one.stderr)
+    );
+    assert!(work.path("out/a.md").is_file() && work.path("out/b.md").is_file());
+}
+
+#[test]
 fn cli_search_reports_original_page_and_context() {
     let work = Scratch::new();
     fs::write(
@@ -256,7 +298,7 @@ fn mcp_advertises_and_renders_output_formats() {
             11,
             "tools/call",
             json!({"name":"convert_documents","arguments":{
-                "paths":["docs/*.rtf","sample.rtf","../*.rtf"],"recursive":true,"output_dir":"batch","format":"json"
+                "paths":["docs/*.rtf","sample.rtf","../*.rtf"],"recursive":true,"output_dir":"batch","format":"json","jobs":2
             }}),
         ),
     ] {
@@ -289,6 +331,12 @@ fn mcp_advertises_and_renders_output_formats() {
                 );
             }
             _ => assert!(format.is_null()),
+        }
+        if tool["name"] == "convert_documents" {
+            let jobs = &schema["properties"]["jobs"];
+            assert_eq!(jobs["type"], "integer");
+            let bounds = (jobs["minimum"].as_u64(), jobs["maximum"].as_u64());
+            assert_eq!(bounds, (Some(1), Some(64)));
         }
     }
     assert_eq!(result(3)["isError"], false);

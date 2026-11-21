@@ -11,6 +11,7 @@ pub mod model;
 mod office;
 pub mod output;
 mod package;
+pub mod parallel;
 mod pdf;
 pub mod render;
 mod rtf;

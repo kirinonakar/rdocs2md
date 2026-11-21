@@ -48,6 +48,7 @@ Default output is a `.md` file with the same name beside the input. Outputs are 
 | `--out-dir DIRECTORY` | Destination directory, created if missing |
 | `--stdout` | Write one document or JSON Lines (`input` and `content` per successful file). Diagnostics go to stderr |
 | `-r`, `--recursive` | Include subdirectories when scanning directories or wildcard inputs |
+| `-j`, `--jobs N` | Parallel workers for a batch, 1 to 64, default the detected CPU count |
 | `--format md\|html\|json` | Output format, default `md` (`markdown` is accepted) |
 | `--mode semantic\|hybrid\|layout` | Rendering mode, default `hybrid` |
 | `--pages RANGE` | 1-based inclusive range, e.g. `1-3,5` |
@@ -60,7 +61,7 @@ Default output is a `.md` file with the same name beside the input. Outputs are 
 
 Exit codes: `0` success, `1` conversion or batch failure (each failed input is reported and the rest still run), `2` invalid option.
 
-A batch accepts files, directories and quoted glob patterns such as `"reports/**/*.pdf"`. Directory scans include supported extensions, files from one input run in sorted order, duplicates run once, and repeated base names get suffixes such as `report-2`. `--` disables option and wildcard parsing for the remaining input paths.
+A batch accepts files, directories and quoted glob patterns such as `"reports/**/*.pdf"`. Directory scans include supported extensions, files from one input run in sorted order, duplicates run once, and repeated base names get suffixes such as `report-2`. `--` disables option and wildcard parsing for the remaining input paths. Batches run on several workers when more than one file is found, `--jobs 1` forces sequential processing, and per-file results keep the expanded input order.
 
 ## Search
 

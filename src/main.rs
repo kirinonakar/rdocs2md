@@ -1,10 +1,13 @@
-use rdocs2md::{batch, load_range, model::*, output, recover_document, render::render, search};
+use rdocs2md::{
+    batch, load_range, model::*, output, parallel, recover_document, render::render, search,
+};
 use serde::Serialize;
 use std::{
     collections::HashSet,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Write},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
 };
 const HELP: &str = r#"rdocs2md — offline document conversion
@@ -25,6 +28,7 @@ Example: rdocs2md "report.pdf" -o "report.md"
   --extract-images         Extract supported embedded raster images
   --image-dir DIRECTORY    Select image destination (implies extraction)
   -r, --recursive          Scan subfolders for directory and wildcard inputs
+  -j, --jobs NUMBER        Parallel workers for batch conversion (1-64, default: CPU count)
   --search QUERY           Search extracted document text and return JSON matches
   --case-sensitive         Perform case-sensitive search
   --limit NUMBER           Maximum search matches per input (default: 50)
@@ -44,6 +48,7 @@ struct Args {
     mode: String,
     range: Option<String>,
     recursive: bool,
+    jobs: Option<usize>,
     query: Option<search::Query>,
 }
 fn parse(args: Vec<String>) -> Result<Args> {
@@ -69,6 +74,13 @@ fn parse(args: Vec<String>) -> Result<Args> {
             }
             "--stdout" => a.stdout = true,
             "-r" | "--recursive" => a.recursive = true,
+            "-j" | "--jobs" => {
+                let jobs = val()?.parse()?;
+                if !(1..=parallel::MAX_JOBS).contains(&jobs) {
+                    return Err(format!("--jobs must be 1-{}", parallel::MAX_JOBS).into());
+                }
+                a.jobs = Some(jobs)
+            }
             "--search" => query = Some(val()?),
             "--case-sensitive" => case_sensitive = true,
             "--limit" => limit = Some(val()?.parse()?),
@@ -126,13 +138,6 @@ fn dest(a: &Args, input: &Path, stem: &OsStr, multi: bool) -> PathBuf {
     dir.join(batch::output_name(stem, &a.format))
 }
 
-fn print_json(value: impl Serialize) -> Result<()> {
-    let mut stdout = io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &value)?;
-    writeln!(stdout)?;
-    Ok(())
-}
-
 #[derive(Serialize)]
 struct BatchContent<'a> {
     input: &'a Path,
@@ -145,6 +150,15 @@ struct BatchSearch<'a, 'doc> {
     result: search::SearchResult<'doc>,
 }
 
+/// One converted input. `emit` is returned instead of printed so that workers
+/// never interleave their stdout.
+#[derive(Default)]
+struct Completed {
+    ok: bool,
+    emit: Option<String>,
+    notes: Vec<String>,
+}
+
 fn convert(
     a: &Args,
     input: &Path,
@@ -152,15 +166,21 @@ fn convert(
     path: &Path,
     meta: Option<&Path>,
     multi: bool,
-) -> Result<()> {
+) -> Result<Completed> {
     let d = load_range(input, a.images, a.range.as_deref())?;
     if let Some(query) = &a.query {
         let result = query.find(&d);
-        return if multi {
-            print_json(BatchSearch { input, result })
+        let mut emit = if multi {
+            serde_json::to_string(&BatchSearch { input, result })?
         } else {
-            print_json(result)
+            serde_json::to_string(&result)?
         };
+        emit.push('\n');
+        return Ok(Completed {
+            ok: true,
+            emit: Some(emit),
+            notes: Vec::new(),
+        });
     }
     let base = if a.stdout {
         Path::new(".")
@@ -184,35 +204,52 @@ fn convert(
     if let Some(p) = meta {
         output::save(p, serde_json::to_string_pretty(&d)?.as_bytes(), false)?
     }
-    if a.stdout {
+    let mut notes = Vec::new();
+    let emit = if a.stdout {
         if multi {
-            print_json(BatchContent {
+            let mut line = serde_json::to_string(&BatchContent {
                 input,
                 content: &text,
             })?;
+            line.push('\n');
+            Some(line)
         } else {
-            io::stdout().lock().write_all(text.as_bytes())?;
+            Some(text)
         }
     } else {
         output::save(path, text.as_bytes(), false)?;
-        eprintln!("{} -> {}", input.display(), path.display())
-    }
+        notes.push(format!("{} -> {}", input.display(), path.display()));
+        None
+    };
     for w in &d.warnings {
-        eprintln!("{}: {w}", input.display())
+        notes.push(format!("{}: {w}", input.display()))
     }
-    Ok(())
+    Ok(Completed {
+        ok: true,
+        emit,
+        notes,
+    })
+}
+
+struct Plan {
+    input: PathBuf,
+    stem: OsString,
+    path: PathBuf,
+    meta: Option<PathBuf>,
+    /// Problem detected up front so that no worker writes a colliding file.
+    error: Option<String>,
 }
 
 fn process(a: &Args) -> Result<i32> {
     let mut failed = false;
     let mut inputs = Vec::new();
-    let mut names = HashSet::new();
+    let mut taken = HashSet::new();
     let mut scanned = false;
     for (spec, literal) in &a.inputs {
         match batch::expand(spec, a.recursive, *literal, |p| Ok(p.canonicalize()?)) {
             Ok(found) => {
                 scanned |= found.scanned;
-                inputs.extend(found.files.into_iter().filter(|p| names.insert(p.clone())));
+                inputs.extend(found.files.into_iter().filter(|p| taken.insert(p.clone())));
                 for (path, error) in found.errors {
                     eprintln!("{}: {error}", path.display());
                     failed = true;
@@ -236,7 +273,10 @@ fn process(a: &Args) -> Result<i32> {
     {
         fs::create_dir_all(dir)?;
     }
+    // Assign names and destinations before conversion: workers then own distinct
+    // files and the reported results keep the input order.
     let mut stems = batch::OutputNames::default();
+    let mut plans = Vec::with_capacity(inputs.len());
     for input in inputs {
         let stem = stems.next(&input);
         let path = dest(a, &input, &stem, multi);
@@ -247,29 +287,72 @@ fn process(a: &Args) -> Result<i32> {
                 p.clone()
             }
         });
-        let result = recover_document(|| {
-            let mut targets = Vec::new();
-            for p in (a.query.is_none() && !a.stdout)
-                .then_some(&path)
-                .into_iter()
-                .chain(&meta)
-            {
-                let absolute = output::absolute(p)?;
-                if names.contains(&absolute) || targets.contains(&absolute) {
-                    return Err(format!("input/output path collision: {}", p.display()).into());
+        let mut error = None;
+        for target in (a.query.is_none() && !a.stdout)
+            .then_some(&path)
+            .into_iter()
+            .chain(&meta)
+        {
+            match output::absolute(target) {
+                Ok(absolute) if taken.contains(&absolute) => {
+                    error = Some(format!("input/output path collision: {}", target.display()));
+                    break;
                 }
-                targets.push(absolute);
-            }
-            convert(a, &input, &stem, &path, meta.as_deref(), multi)?;
-            Ok(targets)
-        });
-        match result {
-            Ok(targets) => names.extend(targets),
-            Err(e) => {
-                eprintln!("{}: {e}", input.display());
-                failed = true;
+                Ok(_) => {}
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
             }
         }
+        plans.push(Plan {
+            input,
+            stem,
+            path,
+            meta,
+            error,
+        });
+    }
+    let mut write_error = None;
+    parallel::ordered(
+        &plans,
+        a.jobs.unwrap_or_else(|| parallel::jobs(None)),
+        |plan| match &plan.error {
+            Some(error) => Completed {
+                ok: false,
+                emit: None,
+                notes: vec![format!("{}: {error}", plan.input.display())],
+            },
+            None => recover_document(AssertUnwindSafe(|| {
+                convert(
+                    a,
+                    &plan.input,
+                    &plan.stem,
+                    &plan.path,
+                    plan.meta.as_deref(),
+                    multi,
+                )
+            }))
+            .unwrap_or_else(|e| Completed {
+                ok: false,
+                emit: None,
+                notes: vec![format!("{}: {e}", plan.input.display())],
+            }),
+        },
+        |done| {
+            failed |= !done.ok;
+            if let Some(text) = done.emit
+                && let Err(e) = io::stdout().lock().write_all(text.as_bytes())
+            {
+                write_error.get_or_insert(e);
+            }
+            for note in done.notes {
+                eprintln!("{note}")
+            }
+        },
+    );
+    if let Some(e) = write_error {
+        return Err(e.into());
     }
     Ok(i32::from(failed))
 }
