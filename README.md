@@ -15,36 +15,15 @@ Open the folder that contains the executable in PowerShell and run it.
 ```powershell
 .\rdocs2md.exe "meeting-notes.hwpx" -o "meeting-notes.md"
 .\rdocs2md.exe "report.pdf" --pages 2-4,7 --stdout
-.\rdocs2md.exe "presentation.pptx" --slides 2-3 --mode layout --json "layout.json"
-.\rdocs2md.exe "book.epub" --extract-images --image-dir "book images" -o "book.md"
-.\rdocs2md.exe "statistics.xlsx" --sheets 2 --format html -o "sheet.html"
-.\rdocs2md.exe "document.doc" "data.ods" "presentation.odp" --out-dir "converted"
-.\rdocs2md.exe "reports" --recursive -o "converted" --json "ir" --image-dir "images"
-.\rdocs2md.exe "reports/**/*.pdf" --stdout
+.\rdocs2md.exe "data.epub" --format html --extract-images -o "data.html"
+.\rdocs2md.exe "document.doc" "data.ods" "reports/**/*.pdf" --recursive --out-dir "converted"
 .\rdocs2md.exe "report.pdf" --search "revenue" --pages 2-5 --limit 10
 .\rdocs2md.exe --help
 ```
 
-The default output is a `.md` file with the same name next to the input file. The CLI may replace an existing result file. A destination that resolves to an input file is rejected. With a single explicit file, `--stdout` writes its rendered content. With multiple inputs or a directory or wildcard scan, `--stdout` writes one JSON line per successful file with `input` and `content` fields. `content` holds the rendered text, including serialized JSON when `--format json` is selected. Diagnostics go to stderr. Batch mode continues when a file fails or its parser panics and returns exit code 1 if any input failed. Invalid command-line options return exit code 2.
+The default output is a `.md` file with the same name next to the input. The CLI may replace an existing result file, and a destination that resolves to an input file is rejected. `--stdout` writes one document, or one JSON line per successful file for a batch, while diagnostics go to stderr. Exit codes are `0` for success, `1` when a conversion or batch fails (each failed input is reported and the rest still run), and `2` for an invalid option.
 
-Pass files, directories and quoted patterns together. A directory scan discovers files with supported document extensions. A pattern matches filenames using `*`, `?`, or bracket sets such as `[ab]`. `**` matches across directory levels. `--recursive` scans subdirectories for a directory or a filename pattern such as `"reports/*.pdf"`. Discovered files are handled in sorted order within each input and duplicates are processed once. For batch output, repeated base names receive suffixes such as `report-2`. When a batch has more than one file, conversion runs on several workers by default; `--jobs 1` forces sequential processing, and stdout, stderr, JSON lines and the per-file report still follow the expanded input order.
-
-| Option | Behavior |
-|---|---|
-| `--mode semantic` | Markdown built around headings, lists, paragraphs, and tables |
-| `--mode hybrid` | Default mode. Keeps logical structure while using HTML for vertical text, RTL paragraphs, and similar cases |
-| `--mode layout` | HTML paragraphs that preserve line breaks and whitespace, supported character attributes, alignment, indentation, and HTML tables |
-| `--format md\|html\|json` | Renders the same document model in the specified format |
-| `-o PATH`, `--out-dir DIR` | `-o` takes a filename for one explicit file and a directory for multiple inputs or a scan. `--out-dir` always takes a directory |
-| `-j N`, `--jobs N` | Parallel conversion workers for batches, from 1 to 64. The default is the detected CPU count. stdout, stderr, JSON lines and the per-file report keep the expanded input order |
-| `--max-inflight-bytes SIZE` | Caps the input bytes converted at once so that a large batch does not parse on every core. Accepts `512`, `4MiB`, or `1.5GiB`. The default is 1 GiB, and `0` removes the cap |
-| `--json PATH` | Saves a separate JSON IR file for one explicit file or one JSON IR file per input in the given directory for a batch |
-| `--pages`, `--slides`, `--sheets`, `--chapters`, `--range` | Aliases of the same range option. Comma-separated 1-based ranges, inclusive at both ends |
-| `--extract-images`, `--image-dir DIR` | Extracts supported raster images and writes result links relative to the output location. Batch mode creates a separate image directory for each document |
-| `--search QUERY`, `--case-sensitive`, `--limit N` | Searches extracted text and writes JSON. Matching is case-insensitive by default, with 50 results per file unless a limit from 1 to 200 is specified |
-| `--list-formats`, `--version`, `--licenses` | Per-format support information (JSON), version, and built-in license notices |
-
-Ranges follow the order of the document model. PDF uses pages, presentations use slides, workbooks use sheets, and EPUB uses spine items. Flow-based documents use stored sections or explicit page breaks. In some Word documents, footnote and endnote groups are separate items as well. You can check the selectable units with MCP `inspect_document` or with `sections` in the JSON. The converter reads shared metadata and indexes and skips content outside the requested range for PDF, PPT/PPTX, XLS/XLSX, ODS/ODP, EPUB, and HWP 5. DOC, RTF and HWPX walk forward to find section boundaries and stop at the last requested section. DOCX and ODT resolve explicit breaks from the parsed body before selecting sections.
+`rdocs2md --help` lists every option. The [agent skill](skills/rdocs2md/SKILL.md) is the CLI reference: option defaults, batch and wildcard rules, range units, mode selection, image extraction, and search result fields.
 
 ## MCP setup
 
@@ -76,11 +55,11 @@ To process local documents outside the root as well, set `args` in the MCP confi
 | `search_document` | `{"path":"report.pdf","query":"revenue","range":"2-5","limit":10}` |
 | `convert_documents` | `{"paths":["reports/*.pdf","data"],"recursive":true,"output_dir":"converted","format":"json"}` |
 
-All conversion tools accept `format` (`md`, `html`, or `json`, default `md`). `convert_document` and `extract_document_range` accept an optional `output_path` for a new file with the matching extension. `convert_documents` requires `output_dir` and preserves existing result files. The result reports the `succeeded` and `failed` counts and lists each processed file with its `output_path` or `error`. If the response reaches the inline size limit, `omitted_results` reports the number of entries left out. With `extract_images: true`, the tool writes per-document image folders next to the converted files, or under `image_dir` if supplied. The parent of a new directory must already exist. `convert_documents` accepts `jobs` (1 to 64, default the detected CPU count), converts independent files on several workers, and still lists results in the expanded input order. `max_inflight_bytes` caps the input bytes converted at the same time (default 1 GiB, `0` removes the cap).
+All conversion tools accept `format` (`md`, `html`, or `json`, default `md`), `mode`, `range`, `extract_images`, and `image_dir`. `convert_document` and `extract_document_range` accept an optional `output_path` with an extension that matches `format`. `convert_documents` requires `output_dir`, keeps existing result files, and reports `succeeded` and `failed` counts with each `output_path` or `error`; `jobs` and `max_inflight_bytes` behave as in the CLI. The parent of a new output or image directory must already exist, and extracted images go to a per-document folder next to the converted file or under `image_dir`.
 
-`search_document` and `--search` match literal text within a paragraph or table cell, including text divided across formatting runs. Each hit gives up to 60 characters on each side, the original 1-based section index, the source part and a 1-based path through blocks and table cells. Search also returns an Excel cell address or PDF block coordinates when available. Each hit also carries `source_section_index`, `source_page` (the PDF page or slide number), a stable `block_id` such as `s2-b1`, and a `bounding_box` in points when the parser recorded a size. `start_char` and `end_char` are zero-based character offsets within the paragraph or cell, with an exclusive end. `truncated` indicates additional matches beyond the limit. For CLI batch searches each line has `input` and `result` fields.
+`search_document` and `--search` match literal text within a paragraph or table cell, including text divided across formatting runs, and return snippets with up to 60 characters of context per side plus the source section, page, block id, and an Excel cell address or PDF coordinates for citation. The [skill](skills/rdocs2md/SKILL.md#search) documents every field.
 
-The server handles line-delimited JSON-RPC 2.0, `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`. The negotiable versions are 2024-11-05, 2025-03-26, 2025-06-18, and 2025-11-25. The inline result limit for MCP tools is 512 KiB for the whole reply, including metadata and JSON escaping. Large conversion results can be saved with `output_path` or retrieved in pieces with `range`. No tool returns `structuredContent`: every result is the text block, so a `convert_documents` report, the `search_document` hits and the `inspect_document` summary are delivered there once. Conversion warnings are added as a second text block, so clients that read only text still see them. The server caches the most recently parsed documents for `inspect_document`, `search_document`, and conversions without images, and drops the previous version of a file as soon as its size or modification time changes, so one path never keeps two versions. Closing the input stream ends the session: cached documents are released and the process exits. [MCP lifecycle specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+The server handles line-delimited JSON-RPC 2.0: `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`, negotiating 2024-11-05, 2025-03-26, 2025-06-18, or 2025-11-25. The inline result limit is 512 KiB for the whole reply, including metadata and JSON escaping, so large conversions should use `output_path` or `range`; `omitted_results` counts batch entries dropped from a report. No tool returns `structuredContent`: reports, search hits, and summaries arrive once in the text block, and warnings are added as a second text block for clients that read only text. The server caches the most recently parsed documents for `inspect_document`, `search_document`, and conversions without images (8 entries, 128 MiB), dropping a cached version as soon as its size or modification time changes. Closing the input stream ends the session. [MCP lifecycle specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 
 ## Visibility and PDF image warnings
 
@@ -90,9 +69,7 @@ A PDF page with pictures and no extracted text is marked `ocr_needed_for_image_t
 
 ## Agent skill
 
-[`skills/rdocs2md/SKILL.md`](skills/rdocs2md/SKILL.md) is an agent skill that teaches a coding agent how to drive the CLI: supported formats, options, mode selection, range units, image extraction, and exit codes. It assumes `rdocs2md` is on `PATH`.
-
-Copy the `skills/rdocs2md` folder into your agent's skill directory and restart the agent. The skill stays CLI-only and does not duplicate the MCP tool schemas; connect the MCP server as described above when structured tool calls are preferred.
+[`skills/rdocs2md/SKILL.md`](skills/rdocs2md/SKILL.md) is the CLI reference written for coding agents and assumes `rdocs2md` is on `PATH`. Copy the `skills/rdocs2md` folder into your agent's skill directory and restart the agent. The skill stays CLI-only and does not duplicate the MCP tool schemas; connect the MCP server as described above when structured tool calls are preferred.
 
 ## Per-format implementation status
 

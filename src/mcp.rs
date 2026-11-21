@@ -58,8 +58,8 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
             props["paths"] = json!({"type":"array","items":{"type":"string"},"minItems":1,"description":format!("Files, directories or wildcard patterns supporting *, ?, [], and **. {scope}")});
             props["recursive"] = json!({"type":"boolean","description":"Scan subdirectories for directory and wildcard inputs."});
             props["output_dir"] = json!({"type":"string","description":format!("Output directory. Its parent must exist if the directory is new. {scope}")});
-            props["jobs"] = json!({"type":"integer","minimum":1,"maximum":parallel::MAX_JOBS,"description":"Parallel conversion workers. Defaults to the available CPU count."});
-            props["max_inflight_bytes"] = json!({"type":"integer","minimum":0,"description":"Input bytes converted at the same time. Defaults to 1 GiB; 0 removes the cap."});
+            props["jobs"] = json!({"type":"integer","minimum":1,"maximum":parallel::MAX_JOBS,"description":"Defaults to the CPU count."});
+            props["max_inflight_bytes"] = json!({"type":"integer","minimum":0,"description":"Defaults to 1 GiB; 0 removes the cap."});
             required.extend(["paths", "output_dir"]);
         } else if name != "list_supported_formats" {
             props["path"] =
@@ -73,16 +73,15 @@ fn definitions(allow_outside_root: bool) -> Vec<Value> {
             props["format"] = json!({
                 "type":"string",
                 "enum":["md","html","json"],
-                "default":"md",
-                "description":"Output format: Markdown, HTML, or JSON."
+                "default":"md"
             });
             props["mode"] = json!({"type":"string","enum":["semantic","hybrid","layout"]});
             props["extract_images"] = json!({"type":"boolean"});
-            props["image_dir"] = json!({"type":"string","description":format!("Image directory. Its parent must exist. {scope}")});
+            props["image_dir"] = json!({"type":"string","description":"Image directory. Its parent must exist."});
             props["range"] =
                 json!({"type":"string","description":"1-based inclusive ranges, e.g. 1-3,5."});
             if name != "convert_documents" {
-                props["output_path"] = json!({"type":"string","description":format!("New filename with an extension that matches format. {scope}")});
+                props["output_path"] = json!({"type":"string","description":"New filename with an extension that matches format."});
             }
         }
         if name == "search_document" {
