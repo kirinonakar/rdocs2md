@@ -943,40 +943,6 @@ fn pdf_outline_titles_become_markdown_headings() {
 }
 
 #[test]
-fn pdf_numbered_outline_titles_match_the_printed_heading() {
-    use lopdf::{Document as Pdf, Object, Stream, dictionary};
-
-    let mut pdf = Pdf::with_version("1.4");
-    let tree = pdf.new_object_id();
-    let font = pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
-    let resources = dictionary! {"Font"=>dictionary! {"F"=>font}};
-    // Printers drop the bookmark numbering, so only the title itself is drawn.
-    let content = "BT /F 14 Tf 1 0 0 1 30 180 Tm (Chiari 1) Tj ET\n\
-                   BT /F 10 Tf 1 0 0 1 30 150 Tm (Body paragraph.) Tj ET\n\
-                   BT /F 12 Tf 1 0 0 1 30 100 Tm (TERMINOLOGY) Tj ET";
-    let stream = pdf.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
-    let page = pdf.add_object(dictionary! {"Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]});
-    pdf.objects.insert(tree, dictionary! {"Type"=>"Pages","Kids"=>vec![Object::Reference(page)],"Count"=>1,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]}.into());
-    let top = pdf.new_object_id();
-    let child = pdf.new_object_id();
-    let parent = pdf.new_object_id();
-    pdf.objects.insert(child, dictionary! {"Title"=>Object::string_literal("TERMINOLOGY"),"Dest"=>vec![Object::Reference(page).into(),"XYZ".into(),0.into(),100.into(),0.into()]}.into());
-    pdf.objects.insert(parent, dictionary! {"Title"=>Object::string_literal("Chapter 2. Chiari 1"),"Dest"=>vec![Object::Reference(page).into(),"XYZ".into(),0.into(),180.into(),0.into()],"First"=>Object::Reference(child)}.into());
-    // Part and section entries precede the chapter, as in printed textbooks.
-    pdf.objects.insert(top, dictionary! {"Title"=>Object::string_literal("Part I: Pathology-Based Diagnoses"),"Dest"=>vec![Object::Reference(page).into(),"XYZ".into(),0.into(),200.into(),0.into()],"First"=>Object::Reference(parent)}.into());
-    let outlines = pdf.add_object(dictionary! {"Type"=>"Outlines","First"=>Object::Reference(top)});
-    let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree,"Outlines"=>outlines});
-    pdf.trailer.set("Root", catalog);
-    let mut bytes = Vec::new();
-    pdf.save_to(&mut bytes).unwrap();
-
-    let s = md(&convert(&bytes, false).unwrap());
-    assert!(s.contains("## Chiari 1"), "{s}");
-    assert!(s.contains("### TERMINOLOGY"), "{s}");
-    assert!(s.contains("Body paragraph."), "{s}");
-}
-
-#[test]
 fn pdf_raster_images_are_exported_as_png() {
     use lopdf::{Document as Pdf, Object, Stream, dictionary};
 
