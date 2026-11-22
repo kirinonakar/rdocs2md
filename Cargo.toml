@@ -1,9 +1,9 @@
 [package]
 name = "rdocs2md"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 license = "MIT"
-description = "Offline structured document conversion and stdio MCP server"
+description = "Structured document conversion and stdio MCP server"
 
 [dependencies]
 cfb = "0.16"
