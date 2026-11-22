@@ -126,8 +126,8 @@ pub const FORMATS: &[(&str, &str, &str)] = &[
     ),
     (
         "doc",
-        "Word 97–2003 FIB, CLX pieces, main story, field results and explicit breaks",
-        "Table structure, style runs, floating objects and ancillary stories are partial",
+        "Word 97–2003 FIB, CLX pieces, main story, field results, explicit breaks and table rows with merged cells, column widths and borders",
+        "Character and paragraph formatting, floating objects and ancillary stories are partial",
     ),
     (
         "docx",

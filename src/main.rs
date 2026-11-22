@@ -29,6 +29,7 @@ Example: rdocs2md "report.pdf" -o "report.md"
   --json PATH              Also save JSON IR to a file, or a directory for multiple inputs
   --extract-images         Extract supported embedded raster images
   --image-dir DIRECTORY    Select image destination (implies extraction)
+  --include-images         Inline images into HTML results (implies extraction)
   -r, --recursive          Scan subfolders for directory and wildcard inputs
   -j, --jobs NUMBER        Parallel workers for batch conversion (1-64, default: CPU count)
   --max-inflight-bytes SIZE  Cap concurrent batch input bytes (default: 1 GiB, 0: none)
@@ -46,6 +47,7 @@ struct Args {
     dir: Option<PathBuf>,
     meta: Option<PathBuf>,
     images: bool,
+    include_images: bool,
     image_dir: Option<PathBuf>,
     stdout: bool,
     format: String,
@@ -76,6 +78,10 @@ fn parse(args: Vec<String>) -> Result<Args> {
             "--out-dir" => a.dir = Some(val()?.into()),
             "--json" => a.meta = Some(val()?.into()),
             "--extract-images" => a.images = true,
+            "--include-images" => {
+                a.images = true;
+                a.include_images = true
+            }
             "--image-dir" => {
                 a.image_dir = Some(val()?.into());
                 a.images = true
@@ -234,6 +240,9 @@ fn convert(
             }
         };
         links = output::extract(&d, &dir, base)?;
+        if a.include_images && a.format == "html" {
+            links = output::inline(&d, &links);
+        }
     }
     let text = render(&d, &a.format, &a.mode, &links)?;
     if let Some(p) = meta {

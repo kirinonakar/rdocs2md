@@ -101,6 +101,32 @@ fn extract_raster_and_reuse_existing_result() {
 }
 
 #[test]
+fn include_images_inlines_html_pictures_with_paths() {
+    let d = Scratch::new();
+    fs::write(d.path("pic.rtf"),br"{\rtf1{\pict 47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b}}").unwrap();
+    let result = d.run(&[
+        "pic.rtf",
+        "--format",
+        "html",
+        "--include-images",
+        "-o",
+        "pic.html",
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let html = fs::read_to_string(d.path("pic.html")).unwrap();
+    assert!(html.contains("src=\"data:image/gif;base64,R0lGOD"), "{html}");
+    assert!(
+        html.contains("data-path=\"pic_images/image-1.gif\""),
+        "{html}"
+    );
+    assert!(d.path("pic_images/image-1.gif").is_file());
+}
+
+#[test]
 fn csv_and_sheet_options_require_a_workbook() {
     let work = Scratch::new();
     fs::write(work.path("note.rtf"), br"{\rtf1 text}").unwrap();

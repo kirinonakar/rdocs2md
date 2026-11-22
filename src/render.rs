@@ -1,4 +1,4 @@
-use crate::{formatting, model::*};
+use crate::{formatting, model::*, output};
 use std::fmt::Write;
 pub fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -153,23 +153,32 @@ fn runs(items: &[Run], html: bool, links: &Properties) -> String {
         if let Some(img) = &r.image
             && let Some(link) = links.get(img)
         {
+            // An inlined image keeps the extracted file path as `data-path`, so
+            // the result still shows where the file itself was written.
+            let inlined = links.get(&output::inline_key(img));
+            let src = inlined.unwrap_or(link);
+            let path = if inlined.is_some() {
+                format!(" data-path=\"{}\"", escape(&uri(link)))
+            } else {
+                String::new()
+            };
             t = if let Some(layout) = &r.image_layout {
                 format!(
-                    "<img alt=\"{}\" src=\"{}\" style=\"width:{}pt;height:{}pt;transform:rotate({}deg)\">",
+                    "<img alt=\"{}\" src=\"{}\"{path} style=\"width:{}pt;height:{}pt;transform:rotate({}deg)\">",
                     escape(&r.text),
-                    escape(&uri(link)),
+                    escape(&uri(src)),
                     f64::from(layout.width) / 100.,
                     f64::from(layout.height) / 100.,
                     layout.rotation_deg
                 )
             } else if html {
                 format!(
-                    "<img alt=\"{}\" src=\"{}\">",
+                    "<img alt=\"{}\" src=\"{}\"{path}>",
                     escape(&r.text),
-                    escape(&uri(link))
+                    escape(&uri(src))
                 )
             } else {
-                format!("![{}](<{}>)", t, uri(link))
+                format!("![{}](<{}>)", t, uri(src))
             };
         }
         for (enabled, tag, md) in [

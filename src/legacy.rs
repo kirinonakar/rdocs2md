@@ -695,10 +695,14 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     p += 2;
     let main = u32le(&data, p + 12)? as usize;
     p += longs * 4;
-    if u16le(&data, p)? < 34 {
+    let pairs = u16le(&data, p)? as usize;
+    if pairs < 34 {
         return Err("missing Word piece table".into());
     }
     let clx = p + 2 + 33 * 8;
+    // Table structure lives in paragraph properties, outside the text stream.
+    let paps = word_paps(&data, &table, p + 2, pairs);
+    let ttp = paps.iter().any(|p| p.ttp || p.inner_ttp);
     let off = u32le(&data, clx)? as usize;
     let len = u32le(&data, clx + 4)? as usize;
     let clx = table.get(off..off + len).ok_or("invalid Word CLX range")?;
@@ -722,6 +726,10 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     let mut index = 1;
     let mut selected = range.is_none_or(|r| r.contains(index));
     let mut text_bytes = 0;
+    let mut tables = WordTables {
+        ttp,
+        ..WordTables::default()
+    };
     for n in 0..pieces {
         let cp = u32le(plc, n * 4)? as usize;
         let end = (u32le(plc, (n + 1) * 4)? as usize).min(main);
@@ -747,7 +755,12 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
         if text_bytes > PART_LIMIT {
             return Err("Word text exceeds limit".into());
         }
+        // Paragraph properties are keyed by file offset, so the offset has to
+        // follow every character of the piece.
+        let mut offset = pos;
         for c in text.chars() {
+            let pap = word_pap_at(&paps, offset);
+            offset += if compressed { 1 } else { c.len_utf16() * 2 };
             match c {
                 '\u{13}' => {
                     if fields.len() > 64 {
@@ -765,6 +778,9 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
                 }
                 _ if fields.contains(&false) => {}
                 '\u{c}' => {
+                    for block in tables.finish() {
+                        sec.blocks.push(block);
+                    }
                     if selected {
                         sec.paragraph(std::mem::take(&mut line));
                         doc.sections.push(sec.indexed(index - 1));
@@ -777,11 +793,22 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
                     selected = range.is_none_or(|r| r.contains(index));
                 }
                 _ if !selected => {}
-                '\r' | '\u{7}' => sec.paragraph(std::mem::take(&mut line)),
-                '\u{b}' => line.push('\n'),
-                '\t' => line.push('\t'),
-                _ if !c.is_control() => line.push(c),
-                _ => {}
+                _ if tables.enter_table(pap) => {
+                    sec.paragraph(std::mem::take(&mut line));
+                    tables.push(c, pap);
+                }
+                _ => {
+                    for block in tables.finish() {
+                        sec.blocks.push(block);
+                    }
+                    match c {
+                        '\r' | '\u{7}' => sec.paragraph(std::mem::take(&mut line)),
+                        '\u{b}' => line.push('\n'),
+                        '\t' => line.push('\t'),
+                        _ if !c.is_control() => line.push(c),
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -789,10 +816,664 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
         range.validate(index)?;
     }
     if selected {
+        for block in tables.finish() {
+            sec.blocks.push(block);
+        }
         sec.paragraph(line);
         doc.sections.push(sec.indexed(index - 1));
     }
     Ok(doc)
+}
+
+/// Paragraph properties that Word 97–2003 keeps out of the text stream, in
+/// 512-byte property pages. Only the properties that describe table structure
+/// are read.
+#[derive(Default)]
+struct WordPap {
+    /// File offset where the paragraph described by this entry ends.
+    fc_end: usize,
+    in_table: bool,
+    ttp: bool,
+    inner_ttp: bool,
+    itap: usize,
+    tap: Option<WordTap>,
+    edges: Option<[Option<String>; 6]>,
+}
+
+/// Cell definitions of one table row: the `rgdxaCenter` column boundaries in
+/// points followed by one descriptor per grid column.
+#[derive(Clone, Default)]
+struct WordTap {
+    bounds: Vec<f32>,
+    cells: Vec<WordTc>,
+}
+
+#[derive(Clone, Default)]
+struct WordTc {
+    /// The cell continues the horizontally merged cell before it.
+    merged: bool,
+    vert_merge: bool,
+    vert_restart: bool,
+    borders: [Option<String>; 4],
+}
+
+impl WordTap {
+    /// Grid column of every text cell, as `(start, span)`. A merged cell keeps
+    /// its own descriptor and the columns it swallowed follow as descriptors
+    /// that only set the merge flag, so they belong to the cell before them.
+    fn groups(&self, cells: usize) -> Option<Vec<(usize, usize)>> {
+        let mut starts = vec![0usize];
+        for (i, tc) in self.cells.iter().enumerate().skip(1) {
+            if !tc.merged {
+                starts.push(i);
+            }
+        }
+        (starts.len() == cells).then(|| {
+            starts
+                .iter()
+                .enumerate()
+                .map(|(k, &start)| {
+                    let end = starts.get(k + 1).copied().unwrap_or(self.cells.len());
+                    (start, end - start)
+                })
+                .collect()
+        })
+    }
+}
+
+fn word_pap_at(paps: &[WordPap], fc: usize) -> Option<&WordPap> {
+    paps.get(paps.partition_point(|p| p.fc_end <= fc))
+}
+
+fn word_paps(data: &[u8], table: &[u8], base: usize, pairs: usize) -> Vec<WordPap> {
+    let mut paps = Vec::new();
+    if pairs >= 14 {
+        word_papx(data, table, base, &mut paps);
+    }
+    paps.sort_unstable_by_key(|p| p.fc_end);
+    paps
+}
+
+/// Read every property page named by the `PlcfBtePapx` bin table. Property data
+/// for a page's paragraphs sits behind their forward links, at the page offset
+/// recorded for each of them.
+fn word_papx(data: &[u8], table: &[u8], base: usize, paps: &mut Vec<WordPap>) {
+    let Ok(off) = u32le(table, base + 13 * 8) else {
+        return;
+    };
+    let Ok(len) = u32le(table, base + 13 * 8 + 4) else {
+        return;
+    };
+    let (off, len) = (off as usize, len as usize);
+    let Some(plc) = table
+        .get(off..off + len)
+        .filter(|_| len >= 4 && (len - 4).is_multiple_of(8))
+    else {
+        return;
+    };
+    let pages = (len - 4) / 8;
+    for n in 0..pages {
+        let Ok(page) = u32le(plc, (pages + 1) * 4 + n * 4) else {
+            return;
+        };
+        let start = (page & 0x003f_ffff) as usize * 512;
+        let Some(page) = data.get(start..start + 512) else {
+            return;
+        };
+        let count = page[511] as usize;
+        let rgbx = 4 * (count + 1);
+        if count > 0x1d || rgbx + 13 * count > 511 {
+            return;
+        }
+        for k in 0..count {
+            let Ok(end) = u32le(page, (k + 1) * 4) else {
+                return;
+            };
+            let mut pap = WordPap {
+                fc_end: end as usize,
+                ..WordPap::default()
+            };
+            let offset = page[rgbx + 13 * k] as usize;
+            if offset != 0 && 2 * offset < 511 {
+                word_pap(&page[2 * offset..], table, &mut pap);
+            }
+            paps.push(pap);
+        }
+    }
+}
+
+/// Apply one `PapxInFkp` record. The record holds the style index of the
+/// paragraph followed by the property modifiers that override it.
+fn word_pap(record: &[u8], table: &[u8], pap: &mut WordPap) {
+    let Some(&cb) = record.first() else {
+        return;
+    };
+    let (start, len) = if cb == 0 {
+        (2, 2 * record.get(1).copied().unwrap_or(0) as usize)
+    } else {
+        (1, 2 * cb as usize - 1)
+    };
+    let grpprl = record
+        .get(start..)
+        .map(|b| &b[..len.min(b.len())])
+        .unwrap_or_default();
+    // The style index precedes the modifiers.
+    word_sprms(grpprl.get(2..).unwrap_or_default(), table, pap, 0);
+}
+
+/// Read property modifiers. `depth` bounds the `sprmPHugePapx` indirection that
+/// moves an oversized modifier list out of its page and into the table stream.
+fn word_sprms(mut b: &[u8], table: &[u8], pap: &mut WordPap, depth: usize) {
+    while b.len() > 2 {
+        let sprm = u16::from_le_bytes([b[0], b[1]]);
+        b = &b[2..];
+        if matches!(sprm, 0xd606 | 0xd608) {
+            let Some((tap, used)) = word_tap(b) else {
+                return;
+            };
+            pap.tap = Some(tap);
+            b = &b[used..];
+            continue;
+        }
+        let (size, skip) = match sprm >> 13 {
+            0 | 1 => (1, 0),
+            2 | 4 | 5 => (2, 0),
+            3 => (4, 0),
+            7 => (3, 0),
+            // A variable modifier records its size in the first byte, or in the
+            // two bytes behind a 0xFF marker.
+            _ => match b.first().copied().unwrap_or(0) {
+                0xff => (
+                    b.get(1..3)
+                        .map_or(0, |v| usize::from(u16::from_le_bytes([v[0], v[1]]))),
+                    2,
+                ),
+                n => (usize::from(n), 1),
+            },
+        };
+        let total = size.saturating_add(skip);
+        if total == 0 || b.len() < total {
+            return;
+        }
+        let data = &b[skip..total];
+        match sprm {
+            0x2416 => pap.in_table = data.first().is_some_and(|v| *v != 0),
+            0x2417 => pap.ttp = data.first().is_some_and(|v| *v != 0),
+            0x244c => pap.inner_ttp = data.first().is_some_and(|v| *v != 0),
+            0x6646 => word_huge_papx(data, table, pap, depth),
+            0x6649 => {
+                if let Some(v) = data.get(..4) {
+                    pap.itap = u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize;
+                }
+            }
+            0xd605 => pap.edges = word_table_borders(data),
+            _ => {}
+        }
+        b = &b[total..];
+    }
+}
+
+fn word_huge_papx(data: &[u8], table: &[u8], pap: &mut WordPap, depth: usize) {
+    if depth >= 4 {
+        return;
+    }
+    let Some(v) = data.get(..4) else {
+        return;
+    };
+    let offset = u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize;
+    let Some(size) = table.get(offset..offset + 2) else {
+        return;
+    };
+    let size = u16::from_le_bytes([size[0], size[1]]) as usize;
+    let Some(grpprl) = table.get(offset + 2..offset + 2 + size) else {
+        return;
+    };
+    word_sprms(grpprl, table, pap, depth + 1);
+}
+
+/// Cell definitions of a row: the column boundaries followed by one descriptor
+/// per grid column. Word records the operand size in two bytes and counts the
+/// column byte in it, so the neighbouring spellings are tried as well.
+fn word_tap(b: &[u8]) -> Option<(WordTap, usize)> {
+    for (field, extra) in [(2usize, 1usize), (2, 0), (1, 0)] {
+        let Some(head) = b.get(..field + 1) else {
+            continue;
+        };
+        let size = match field {
+            1 => usize::from(head[0]),
+            _ => usize::from(u16::from_le_bytes([head[0], head[1]])),
+        };
+        let Some(size) = size.checked_sub(extra) else {
+            continue;
+        };
+        let columns = usize::from(head[field]);
+        if columns == 0 || columns > 63 || size != 1 + 2 * (columns + 1) + 20 * columns {
+            continue;
+        }
+        let Some(operand) = b.get(field..field + size) else {
+            continue;
+        };
+        let mut bounds = Vec::with_capacity(columns + 1);
+        for i in 0..=columns {
+            let at = 1 + 2 * i;
+            bounds.push(f32::from(i16::from_le_bytes([operand[at], operand[at + 1]])) / 20.);
+        }
+        if bounds.windows(2).any(|w| w[1] < w[0]) {
+            continue;
+        }
+        let mut cells = Vec::with_capacity(columns);
+        for i in 0..columns {
+            let at = 1 + 2 * (columns + 1) + 20 * i;
+            let flags = u16::from_le_bytes([operand[at], operand[at + 1]]);
+            let mut borders = [None, None, None, None];
+            for (side, border) in borders.iter_mut().enumerate() {
+                *border = word_brc(&operand[at + 4 + 4 * side..at + 8 + 4 * side]);
+            }
+            cells.push(WordTc {
+                // 1 continues a merged set; 2 and 3 start one.
+                merged: flags & 3 == 1,
+                vert_merge: flags & 0x20 != 0,
+                vert_restart: flags & 0x40 != 0,
+                borders,
+            });
+        }
+        return Some((WordTap { bounds, cells }, field + size));
+    }
+    None
+}
+
+/// One cell side. Word stores the width in eighths of a point, the line style
+/// and an index into a fixed palette.
+fn word_brc(b: &[u8]) -> Option<String> {
+    const PALETTE: [&str; 17] = [
+        "currentColor",
+        "#000000",
+        "#0000ff",
+        "#00ffff",
+        "#00ff00",
+        "#ff00ff",
+        "#ff0000",
+        "#ffff00",
+        "#ffffff",
+        "#000080",
+        "#008080",
+        "#008000",
+        "#800080",
+        "#800000",
+        "#808000",
+        "#808080",
+        "#c0c0c0",
+    ];
+    let style = match *b.get(1)? {
+        0 => return None,
+        3 | 9..=18 => "double",
+        4 => "dotted",
+        5 | 7 | 8 | 21 | 22 => "dashed",
+        6 => "solid",
+        _ => "solid",
+    };
+    let width = f32::from(*b.first()?) / 8.;
+    let width = if width < 0.25 {
+        "0.5pt".to_string()
+    } else {
+        format!("{width}pt")
+    };
+    let shade = PALETTE
+        .get(*b.get(2).unwrap_or(&0) as usize)
+        .copied()
+        .unwrap_or("#000000");
+    Some(format!("{width} {style} {shade}"))
+}
+
+/// The borders of a whole table: top, left, bottom, right, then the borders
+/// between rows and between columns.
+fn word_table_borders(b: &[u8]) -> Option<[Option<String>; 6]> {
+    if b.len() < 24 {
+        return None;
+    }
+    let mut edges: [Option<String>; 6] = Default::default();
+    for (slot, edge) in edges.iter_mut().zip(b.as_chunks::<4>().0) {
+        *slot = word_brc(edge);
+    }
+    Some(edges)
+}
+
+/// Build the cell for a run of text collected from the text stream. Cell marks
+/// also end the paragraph around them, so a trailing break is dropped.
+fn table_cell(text: String) -> Cell {
+    let text = text.trim_end_matches('\n');
+    if text.is_empty() {
+        Cell::default()
+    } else {
+        Cell::text(text)
+    }
+}
+
+/// Rebuild the tables of the Word text stream. A row mark carries the cell
+/// definitions of its row, so text is collected per cell and folded into the
+/// model once the row ends.
+#[derive(Default)]
+struct WordTables {
+    open: Vec<WordTable>,
+    text: String,
+    /// Whether the document records row marks as paragraph properties.
+    ttp: bool,
+    /// The previous character closed a cell.
+    mark: bool,
+    cells: usize,
+    disabled: bool,
+}
+
+#[derive(Default)]
+struct WordTable {
+    rows: Vec<Vec<Cell>>,
+    row: Vec<Cell>,
+    tap: Option<WordTap>,
+    edges: Option<[Option<String>; 6]>,
+    merges: HashMap<usize, (usize, usize)>,
+    /// A nested table was placed in the cell that is currently open.
+    nested: bool,
+}
+
+impl WordTables {
+    fn enter_table(&mut self, pap: Option<&WordPap>) -> bool {
+        match pap {
+            Some(p) if p.in_table => self.enter(p),
+            _ => false,
+        }
+    }
+
+    /// Follow the table depth of the paragraph that is about to be read. A
+    /// deeper paragraph starts a table inside the cell that is open.
+    fn enter(&mut self, pap: &WordPap) -> bool {
+        if self.disabled {
+            return false;
+        }
+        if self.cells > CELL_LIMIT {
+            self.disabled = true;
+            self.open.clear();
+            self.text.clear();
+            return false;
+        }
+        let depth = pap.itap.clamp(1, 8);
+        while self.open.len() > depth {
+            self.close_level();
+        }
+        while self.open.len() < depth {
+            self.reserve_cell();
+            if let Some(parent) = self.open.last_mut() {
+                parent.nested = true;
+            }
+            self.open.push(WordTable::default());
+        }
+        true
+    }
+
+    /// Reserve the cell that a nested table is placed in.
+    fn reserve_cell(&mut self) {
+        if let Some(t) = self.open.last_mut()
+            && !t.nested
+        {
+            let text = std::mem::take(&mut self.text);
+            t.row.push(table_cell(text));
+        }
+    }
+
+    fn push(&mut self, c: char, pap: Option<&WordPap>) {
+        if self.open.is_empty() {
+            return;
+        }
+        let cell_mark = c == '\u{7}';
+        // A row ends at its row mark: a cell mark that also carries the table
+        // properties on depth one, or a paragraph mark inside a nested table.
+        // Text without any row mark falls back to two cell marks in a row.
+        let row = if cell_mark {
+            pap.is_some_and(|p| p.ttp) || (!self.ttp && self.mark && self.text.is_empty())
+        } else {
+            pap.is_some_and(|p| p.inner_ttp)
+        };
+        if row {
+            if !self.text.is_empty() {
+                self.cell_mark();
+            }
+            if let Some(p) = pap
+                && let Some(t) = self.open.last_mut()
+            {
+                t.tap = p.tap.clone();
+                if t.edges.is_none() {
+                    t.edges = p.edges.clone();
+                }
+            }
+            self.end_row();
+            return;
+        }
+        match c {
+            '\u{7}' => {
+                self.mark = true;
+                self.cell_mark();
+            }
+            '\r' | '\u{c}' | '\u{b}' => {
+                self.mark = false;
+                self.text.push('\n');
+            }
+            '\t' => {
+                self.mark = false;
+                self.text.push('\t');
+            }
+            c if !c.is_control() => {
+                self.mark = false;
+                self.text.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// The cell that is collecting text ends at a cell mark.
+    fn cell_mark(&mut self) {
+        if self.open.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.text);
+        if let Some(t) = self.open.last_mut() {
+            if t.nested {
+                t.nested = false;
+                if !text.is_empty()
+                    && let Some(cell) = t.row.last_mut()
+                {
+                    push_run(&mut cell.runs, Run::text(text));
+                }
+                return;
+            }
+            t.row.push(table_cell(text));
+        }
+        self.cells += 1;
+    }
+
+    fn flush_cell(&mut self) {
+        if !self.text.is_empty() {
+            self.cell_mark();
+        }
+    }
+
+    fn end_row(&mut self) {
+        self.mark = false;
+        let Some(t) = self.open.last_mut() else {
+            return;
+        };
+        if t.row.is_empty() {
+            t.tap = None;
+            return;
+        }
+        let row = std::mem::take(&mut t.row);
+        t.row_done(row);
+    }
+
+    /// Finish the innermost table and hand it to the cell around it.
+    fn close_level(&mut self) {
+        if self.open.is_empty() {
+            return;
+        }
+        self.flush_cell();
+        self.end_row();
+        let Some(table) = self.open.pop() else {
+            return;
+        };
+        if self.open.is_empty() {
+            return;
+        }
+        if let Some(block) = table.finish()
+            && let Some(cell) = self.open.last_mut().and_then(|t| t.row.last_mut())
+        {
+            cell.blocks.push(block);
+        }
+    }
+
+    /// Finish every open table, outermost last.
+    fn finish(&mut self) -> Vec<Block> {
+        let mut blocks = Vec::new();
+        while !self.open.is_empty() {
+            if self.open.len() > 1 {
+                self.close_level();
+                continue;
+            }
+            self.flush_cell();
+            self.end_row();
+            if let Some(table) = self.open.pop()
+                && let Some(block) = table.finish()
+            {
+                blocks.push(block);
+            }
+        }
+        self.text.clear();
+        self.mark = false;
+        blocks
+    }
+}
+
+impl WordTable {
+    /// Fold the collected cells into the row, applying the cell definitions
+    /// recorded on the row mark: column widths, spans and borders.
+    fn row_done(&mut self, row: Vec<Cell>) {
+        let tap = self.tap.take();
+        let groups = tap.as_ref().and_then(|t| t.groups(row.len()));
+        let y = self.rows.len();
+        let mut out: Vec<Cell> = Vec::with_capacity(row.len());
+        for (index, cell) in row.into_iter().enumerate() {
+            let (column, span) = groups.as_ref().map_or((index, 1), |g| g[index]);
+            let Some(tc) = tap.as_ref().and_then(|t| t.cells.get(column)) else {
+                out.push(cell);
+                continue;
+            };
+            let mut cell = cell;
+            if let Some(tap) = tap.as_ref() {
+                let left = tap.bounds.get(column).copied().unwrap_or(0.);
+                let right = tap.bounds.get(column + span).copied().unwrap_or(left);
+                formatting::points(
+                    &mut cell.properties,
+                    "width",
+                    Some(f64::from(right - left)).filter(|w| *w > 0.),
+                );
+            }
+            if span > 1 {
+                cell.colspan = Some(span);
+            }
+            for (key, border) in formatting::BORDERS.iter().zip(tc.borders.iter()) {
+                if let Some(border) = border {
+                    cell.properties.insert((*key).into(), border.clone());
+                }
+            }
+            if tc.vert_restart {
+                self.merges.insert(column, (y, out.len()));
+            } else if tc.vert_merge {
+                if let Some(&(first, at)) = self.merges.get(&column)
+                    && let Some(origin) = self.rows.get_mut(first).and_then(|r| r.get_mut(at))
+                {
+                    origin.rowspan = Some(origin.rowspan.unwrap_or(1) + 1);
+                    if let Some(bottom) = cell.properties.remove("border-bottom") {
+                        origin.properties.insert("border-bottom".into(), bottom);
+                    }
+                    continue;
+                }
+            } else {
+                self.merges.remove(&column);
+            }
+            out.push(cell);
+        }
+        // A row whose cells were all folded into the row above leaves nothing.
+        if !out.is_empty() {
+            self.rows.push(out);
+        }
+    }
+
+    /// Close the table, filling in the sides its borders do not name.
+    fn finish(mut self) -> Option<Block> {
+        self.apply_edges();
+        let bordered = self.rows.iter().flatten().any(|c| {
+            formatting::BORDERS
+                .iter()
+                .any(|key| c.properties.contains_key(*key))
+        });
+        if bordered {
+            for cell in self.rows.iter_mut().flatten() {
+                for key in formatting::BORDERS {
+                    cell.properties
+                        .entry(key.into())
+                        .or_insert_with(|| "none".into());
+                }
+            }
+        }
+        (!self.rows.is_empty()).then_some(Block::Table { rows: self.rows })
+    }
+
+    /// Apply the table-wide borders to the sides the cells do not set
+    /// themselves: the outer edges of the table, otherwise the borders between
+    /// its rows and columns.
+    fn apply_edges(&mut self) {
+        let Some(edges) = self.edges.take() else {
+            return;
+        };
+        let height = self.rows.len();
+        let columns = self
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|c| c.colspan.unwrap_or(1)).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        for (y, row) in self.rows.iter_mut().enumerate() {
+            let mut x = 0;
+            for cell in row.iter_mut() {
+                let span = cell.colspan.unwrap_or(1);
+                let outer = [
+                    x == 0,
+                    x + span >= columns,
+                    y == 0,
+                    y + cell.rowspan.unwrap_or(1) >= height,
+                ];
+                for ((key, edge), inside) in formatting::BORDERS
+                    .into_iter()
+                    .zip(outer)
+                    .zip([5usize, 5, 4, 4])
+                {
+                    let index = if edge {
+                        match key {
+                            "border-top" => 0,
+                            "border-left" => 1,
+                            "border-bottom" => 2,
+                            _ => 3,
+                        }
+                    } else {
+                        inside
+                    };
+                    if let Some(value) = &edges[index] {
+                        cell.properties
+                            .entry(key.into())
+                            .or_insert_with(|| value.clone());
+                    }
+                }
+                x += span;
+            }
+        }
+    }
 }
 struct Record<'a> {
     kind: u16,
@@ -945,4 +1626,253 @@ fn ppt(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
         doc.sections.push(sec)
     }
     Ok(doc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One property record with a style index and the given modifiers, as a
+    /// property page stores it.
+    fn record(grpprl: &[u8]) -> Vec<u8> {
+        assert!(grpprl.len() % 2 == 1, "records hold 2×cb-1 bytes");
+        let mut out = vec![grpprl.len().div_ceil(2) as u8];
+        out.extend_from_slice(grpprl);
+        out
+    }
+
+    /// `sprmTDefTable` with the column boundaries and the merge flags of a row.
+    fn tdef(bounds: &[i16], flags: &[u16]) -> Vec<u8> {
+        let mut operand = vec![flags.len() as u8];
+        for b in bounds {
+            operand.extend_from_slice(&b.to_le_bytes());
+        }
+        for f in flags {
+            operand.extend_from_slice(&f.to_le_bytes());
+            operand.extend_from_slice(&[0; 18]);
+        }
+        let mut sprm = vec![0x08, 0xd6];
+        sprm.extend_from_slice(&((operand.len() + 1) as u16).to_le_bytes());
+        sprm.extend_from_slice(&operand);
+        sprm
+    }
+
+    fn table_row(bounds: &[i16], flags: &[u16]) -> Vec<u8> {
+        let mut grpprl = vec![0, 0]; // style index
+        grpprl.extend_from_slice(&[0x16, 0x24, 1]); // sprmPFInTable
+        grpprl.extend_from_slice(&[0x17, 0x24, 1]); // sprmPFTtp
+        grpprl.extend_from_slice(&[0x49, 0x66, 1, 0, 0, 0]); // sprmPItap
+        grpprl.extend_from_slice(&tdef(bounds, flags));
+        record(&grpprl)
+    }
+
+    #[test]
+    fn word_papx_reads_the_cell_definition_of_a_row() {
+        let mut pap = WordPap::default();
+        word_pap(&table_row(&[0, 1000, 3000], &[0, 2]), &[], &mut pap);
+        assert!(pap.in_table && pap.ttp);
+        assert_eq!(pap.itap, 1);
+        let tap = pap.tap.expect("row definition");
+        assert_eq!(tap.bounds, vec![0., 50., 150.]);
+        assert_eq!(tap.cells.len(), 2);
+        assert!(tap.cells.iter().all(|c| !c.merged));
+    }
+
+    #[test]
+    fn word_papx_reads_merged_cells_and_widths() {
+        // The third column carries no cell of its own: it belongs to the cell
+        // before it, so the row has two cells over three grid columns.
+        let mut pap = WordPap::default();
+        word_pap(
+            &table_row(&[0, 1000, 2000, 4000], &[0, 3, 1]),
+            &[],
+            &mut pap,
+        );
+        let tap = pap.tap.expect("row definition");
+        assert_eq!(tap.groups(2), Some(vec![(0, 1), (1, 2)]));
+        assert_eq!(tap.groups(3), None);
+    }
+
+    #[test]
+    fn word_tables_keep_merged_cells_and_column_widths() {
+        let mut tables = WordTables {
+            ttp: true,
+            ..WordTables::default()
+        };
+        let cell = WordPap {
+            in_table: true,
+            itap: 1,
+            ..WordPap::default()
+        };
+        let mut mark = WordPap {
+            in_table: true,
+            itap: 1,
+            ttp: true,
+            ..WordPap::default()
+        };
+        mark.tap = Some(WordTap {
+            bounds: vec![0., 50., 100., 200.],
+            cells: vec![
+                WordTc::default(),
+                WordTc::default(),
+                WordTc {
+                    merged: true,
+                    ..WordTc::default()
+                },
+            ],
+        });
+        for c in "가\u{7}나\u{7}".chars() {
+            assert!(tables.enter(&cell));
+            tables.push(c, Some(&cell));
+        }
+        assert!(tables.enter(&mark));
+        tables.push('\u{7}', Some(&mark));
+        let blocks = tables.finish();
+        let [Block::Table { rows }] = blocks.as_slice() else {
+            panic!("expected one table: {blocks:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(rows[0][0].runs[0].text, "가");
+        assert_eq!(rows[0][1].runs[0].text, "나");
+        assert_eq!(rows[0][0].properties.get("width").unwrap(), "50pt");
+        assert_eq!(rows[0][1].colspan, Some(2));
+        // The merged cell covers the two columns after the first boundary.
+        assert_eq!(rows[0][1].properties.get("width").unwrap(), "150pt");
+    }
+
+    #[test]
+    fn word_tables_fold_vertically_merged_cells() {
+        let mut tables = WordTables {
+            ttp: true,
+            ..WordTables::default()
+        };
+        let cell = WordPap {
+            in_table: true,
+            itap: 1,
+            ..WordPap::default()
+        };
+        let row = |flags: u16| {
+            let mut pap = WordPap {
+                in_table: true,
+                itap: 1,
+                ttp: true,
+                ..WordPap::default()
+            };
+            pap.tap = Some(WordTap {
+                bounds: vec![0., 100.],
+                cells: vec![WordTc {
+                    vert_merge: flags & 1 != 0,
+                    vert_restart: flags & 2 != 0,
+                    ..WordTc::default()
+                }],
+            });
+            pap
+        };
+        let (first, second) = (row(2), row(1));
+        for c in "위\u{7}".chars() {
+            tables.enter(&cell);
+            tables.push(c, Some(&cell));
+        }
+        tables.enter(&first);
+        tables.push('\u{7}', Some(&first));
+        for c in "아래\u{7}".chars() {
+            tables.enter(&cell);
+            tables.push(c, Some(&cell));
+        }
+        tables.enter(&second);
+        tables.push('\u{7}', Some(&second));
+        let blocks = tables.finish();
+        let [Block::Table { rows }] = blocks.as_slice() else {
+            panic!("expected one table: {blocks:?}");
+        };
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(rows[0][0].runs[0].text, "위");
+        assert_eq!(rows[0][0].rowspan, Some(2));
+    }
+
+    #[test]
+    fn word_tables_place_a_nested_table_in_its_cell() {
+        let mut tables = WordTables {
+            ttp: true,
+            ..WordTables::default()
+        };
+        let outer = WordPap {
+            in_table: true,
+            itap: 1,
+            ..WordPap::default()
+        };
+        let inner = WordPap {
+            in_table: true,
+            itap: 2,
+            ..WordPap::default()
+        };
+        let mut end = WordPap {
+            in_table: true,
+            itap: 2,
+            inner_ttp: true,
+            ..WordPap::default()
+        };
+        end.tap = Some(WordTap {
+            bounds: vec![0., 100.],
+            cells: vec![WordTc::default()],
+        });
+        let mut mark = WordPap {
+            in_table: true,
+            itap: 1,
+            ttp: true,
+            ..WordPap::default()
+        };
+        mark.tap = Some(WordTap {
+            bounds: vec![0., 100.],
+            cells: vec![WordTc::default()],
+        });
+        for c in "바깥".chars() {
+            tables.enter(&outer);
+            tables.push(c, Some(&outer));
+        }
+        for c in "안\u{7}".chars() {
+            tables.enter(&inner);
+            tables.push(c, Some(&inner));
+        }
+        tables.enter(&end);
+        tables.push('\r', Some(&end));
+        tables.enter(&outer);
+        tables.push('\u{7}', Some(&outer));
+        tables.enter(&mark);
+        tables.push('\u{7}', Some(&mark));
+        let blocks = tables.finish();
+        let [Block::Table { rows }] = blocks.as_slice() else {
+            panic!("expected one table: {blocks:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(rows[0][0].runs[0].text, "바깥");
+        let [Block::Table { rows: nested }] = rows[0][0].blocks.as_slice() else {
+            panic!("expected a nested table: {:?}", rows[0][0].blocks);
+        };
+        assert_eq!(nested[0][0].runs[0].text, "안");
+    }
+
+    #[test]
+    fn word_without_row_marks_splits_at_a_repeated_cell_mark() {
+        let mut tables = WordTables::default();
+        let cell = WordPap {
+            in_table: true,
+            itap: 1,
+            ..WordPap::default()
+        };
+        for c in "하나\u{7}둘\u{7}\u{7}".chars() {
+            tables.enter(&cell);
+            tables.push(c, Some(&cell));
+        }
+        let blocks = tables.finish();
+        let [Block::Table { rows }] = blocks.as_slice() else {
+            panic!("expected one table: {blocks:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(rows[0][1].runs[0].text, "둘");
+    }
 }

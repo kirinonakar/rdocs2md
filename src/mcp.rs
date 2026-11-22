@@ -93,6 +93,7 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
             });
             props["mode"] = json!({"type":"string","enum":["semantic","hybrid","layout"]});
             props["extract_images"] = json!({"type":"boolean"});
+            props["include_images"] = json!({"type":"boolean","description":"HTML only: inline each extracted image as a base64 data URI and keep its path in data-path. Implies extract_images."});
             props["image_dir"] = json!({"type":"string","description":format!("Image directory; parent must exist. {scope}")});
             props["range"] =
                 json!({"type":"string","description":"1-based inclusive ranges, e.g. 1-3,5."});
@@ -337,6 +338,7 @@ struct Conversion<'a> {
     mode: &'a str,
     range: Option<&'a str>,
     sheet: Option<&'a str>,
+    inline_images: bool,
 }
 
 impl Conversion<'_> {
@@ -354,11 +356,14 @@ impl Conversion<'_> {
     ) -> Result<(String, Vec<String>)> {
         let sheets = self.sheets();
         let d = load_sheets(input, dir.is_some(), self.range, &sheets)?;
-        let links = if let Some(dir) = dir {
+        let mut links = if let Some(dir) = dir {
             output::extract(&d, dir, out.map(output::parent).unwrap_or(root))?
         } else {
             Properties::new()
         };
+        if self.inline_images && !links.is_empty() {
+            links = output::inline(&d, &links);
+        }
         let value = render(&d, self.format, self.mode, &links)?;
         Ok((value, d.warnings))
     }
@@ -470,7 +475,7 @@ fn convert_batch(
         let out_dir = access.directory(args["output_dir"].as_str().ok_or("missing output_dir")?)?;
         let image_parent = if let Some(dir) = args["image_dir"].as_str() {
             Some(access.directory(dir)?)
-        } else if args["extract_images"].as_bool().unwrap_or(false) {
+        } else if args["extract_images"].as_bool().unwrap_or(false) || conversion.inline_images {
             Some(out_dir.clone())
         } else {
             None
@@ -539,11 +544,14 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
     let timeout = (seconds > 0).then_some(seconds);
     let _budget = crate::limits::start(timeout);
     let text = |k: &str| args.get(k).and_then(Value::as_str);
+    let format = text("format").unwrap_or("md");
     let conversion = Conversion {
-        format: text("format").unwrap_or("md"),
+        format,
         mode: text("mode").unwrap_or("hybrid"),
         range: text("range"),
         sheet: text("sheet"),
+        // Inlining only applies to HTML; other formats keep plain file links.
+        inline_images: format == "html" && args["include_images"].as_bool().unwrap_or(false),
     };
     if name == "convert_documents" {
         return convert_batch(access, args, &conversion, timeout);
@@ -592,7 +600,9 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
     let out = text("output_path")
         .map(|p| access.local(p, true))
         .transpose()?;
-    let images = args["extract_images"].as_bool().unwrap_or(false) || text("image_dir").is_some();
+    let images = args["extract_images"].as_bool().unwrap_or(false)
+        || text("image_dir").is_some()
+        || conversion.inline_images;
     let mut dir = None;
     if images {
         let default_dir = format!(
@@ -619,10 +629,13 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
         Rc::new(load_sheets(&input, true, conversion.range, &sheets)?)
     };
     let document = &*document;
-    let links = match dir.as_deref() {
+    let mut links = match dir.as_deref() {
         Some(dir) => output::extract(document, dir, &access.root)?,
         None => Properties::new(),
     };
+    if conversion.inline_images {
+        links = output::inline(document, &links);
+    }
     let content = render(document, conversion.format, conversion.mode, &links)?;
     // Conversion tools keep the document in the text block only; warnings still
     // travel as a second text block, and no body is sent twice.

@@ -36,6 +36,7 @@ Default output is a UTF-8 `.md` file next to the input. Existing results may be 
 | `--sheet NAME\|NUMBER` | Only this workbook sheet, by title or 1-based number; repeatable |
 | `--json PATH` | Also write the JSON IR |
 | `--extract-images`, `--image-dir DIR` | Export embedded raster images |
+| `--include-images` | Inline images into HTML results as `data:` URIs (implies extraction) |
 | `--search QUERY`, `--case-sensitive`, `--limit N` | Search text, return JSON |
 | `-j`, `--jobs N` | Batch workers, 1-64, default CPU count |
 | `--max-inflight-bytes SIZE` | Cap on input bytes converted at once, default `1GiB`, `0` removes it |
@@ -71,6 +72,8 @@ Cite from a hit using `block_id` (`s2-b1`, plus `-r2c3` for a table cell), `sour
 ## Images
 
 `--extract-images` writes supported raster images next to the output, with converter-generated names and links relative to the output location; `--image-dir` sets the destination (a subdirectory per document in a batch).
+
+`--include-images` does the same for HTML results and also embeds each image as a base64 `data:` URI in `src`, so the single `.html` file renders like the source after it is moved. The extracted file path stays next to it as `data-path`. Other formats keep plain file links.
 
 ## Memory and limits
 

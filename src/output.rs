@@ -134,3 +134,69 @@ pub fn extract(d: &Document, dir: &Path, base: &Path) -> Result<Properties> {
     }
     Ok(links)
 }
+
+/// Key that carries an inlined `data:` URI for the image source named by `key`.
+/// The two entries never collide because an asset name cannot contain `\u{1}`.
+pub fn inline_key(key: &str) -> String {
+    format!("{key}\u{1}data")
+}
+
+fn mime(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tif" => "image/tiff",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Standard base64 with padding. A data URI takes no line breaks, so the
+/// characters are emitted in one run.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let tail = [*chunk.first().unwrap_or(&0), *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let bits = u32::from(tail[0]) << 16 | u32::from(tail[1]) << 8 | u32::from(tail[2]);
+        out.push(ALPHABET[(bits >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(bits >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(bits >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[bits as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Return `links` plus an inlined `data:` URI for every extracted image, so an
+/// HTML result renders in a browser without the extracted folder. Each file path
+/// stays in the map and is written as `data-path`, which keeps the result
+/// traceable to the extracted file.
+pub fn inline(d: &Document, links: &Properties) -> Properties {
+    let mut out = links.clone();
+    for key in image_sources(d) {
+        if !links.contains_key(&key) {
+            continue;
+        }
+        let Some(bytes) = d.assets.get(&key) else {
+            continue;
+        };
+        let Some(ext) = image_ext(bytes) else {
+            continue;
+        };
+        out.insert(
+            inline_key(&key),
+            format!("data:{};base64,{}", mime(ext), base64(bytes)),
+        );
+    }
+    out
+}
