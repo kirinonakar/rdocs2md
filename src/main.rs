@@ -29,7 +29,7 @@ Example: rdocs2md "report.pdf" -o "report.md"
   --json PATH              Also save JSON IR to a file, or a directory for multiple inputs
   --extract-images         Save embedded images as separate files (HTML embeds them by default)
   --image-dir DIRECTORY    Select image destination (implies extraction)
-  --include-images         Inline images into HTML results (implies extraction)
+  --include-images         Inline images into HTML results, including when extracting files
   -r, --recursive          Scan subfolders for directory and wildcard inputs
   -j, --jobs NUMBER        Parallel workers for batch conversion (1-64, default: CPU count)
   --max-inflight-bytes SIZE  Cap concurrent batch input bytes (default: 1 GiB, 0: none)
@@ -46,7 +46,7 @@ struct Args {
     out: Option<PathBuf>,
     dir: Option<PathBuf>,
     meta: Option<PathBuf>,
-    images: bool,
+    extract_images: bool,
     include_images: bool,
     image_dir: Option<PathBuf>,
     stdout: bool,
@@ -77,14 +77,11 @@ fn parse(args: Vec<String>) -> Result<Args> {
             "-o" | "--output" => a.out = Some(val()?.into()),
             "--out-dir" => a.dir = Some(val()?.into()),
             "--json" => a.meta = Some(val()?.into()),
-            "--extract-images" => a.images = true,
-            "--include-images" => {
-                a.images = true;
-                a.include_images = true
-            }
+            "--extract-images" => a.extract_images = true,
+            "--include-images" => a.include_images = true,
             "--image-dir" => {
                 a.image_dir = Some(val()?.into());
-                a.images = true
+                a.extract_images = true
             }
             "--stdout" => a.stdout = true,
             "-r" | "--recursive" => a.recursive = true,
@@ -129,8 +126,13 @@ fn parse(args: Vec<String>) -> Result<Args> {
         return Err("invalid format or mode (see --help)".into());
     }
     if let Some(query) = query {
-        if a.out.is_some() || a.dir.is_some() || a.meta.is_some() || a.images {
-            return Err("--search writes JSON to stdout and cannot be combined with conversion destinations or image extraction".into());
+        if a.out.is_some()
+            || a.dir.is_some()
+            || a.meta.is_some()
+            || a.extract_images
+            || a.include_images
+        {
+            return Err("--search writes JSON to stdout and cannot be combined with conversion destinations or image options".into());
         }
         a.query = Some(search::Query::new(
             &query,
@@ -208,7 +210,7 @@ fn convert(
 ) -> Result<Completed> {
     // Workers run this closure on their own thread, so the budget is per input.
     let _budget = rdocs2md::limits::start(a.timeout);
-    let images = a.images || (a.query.is_none() && a.format == "html");
+    let images = a.extract_images || (a.query.is_none() && a.format == "html");
     let d = load_sheets(input, images, a.range.as_deref(), &a.sheets)?;
     if let Some(query) = &a.query {
         let result = query.find(&d);
@@ -230,7 +232,7 @@ fn convert(
         output::parent(path)
     };
     let mut links = Properties::new();
-    if a.images {
+    if a.extract_images {
         let dir = match &a.image_dir {
             Some(dir) if multi => dir.join(stem),
             Some(dir) => dir.clone(),

@@ -101,7 +101,7 @@ fn extract_raster_and_reuse_existing_result() {
 }
 
 #[test]
-fn include_images_inlines_html_pictures_with_paths() {
+fn include_images_embeds_html_pictures_and_only_saves_explicit_extractions() {
     let d = Scratch::new();
     fs::write(d.path("pic.rtf"),br"{\rtf1{\pict 47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b}}").unwrap();
     let result = d.run(&[
@@ -118,6 +118,27 @@ fn include_images_inlines_html_pictures_with_paths() {
         String::from_utf8_lossy(&result.stderr)
     );
     let html = fs::read_to_string(d.path("pic.html")).unwrap();
+    assert!(
+        html.contains("src=\"data:image/gif;base64,R0lGOD"),
+        "{html}"
+    );
+    assert!(!html.contains("data-path="), "{html}");
+    assert!(!d.path("pic_images").exists());
+    let result = d.run(&[
+        "pic.rtf",
+        "--format",
+        "html",
+        "--include-images",
+        "--extract-images",
+        "-o",
+        "extracted.html",
+    ]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let html = fs::read_to_string(d.path("extracted.html")).unwrap();
     assert!(
         html.contains("src=\"data:image/gif;base64,R0lGOD"),
         "{html}"
@@ -322,6 +343,7 @@ fn mcp_advertises_and_renders_output_formats() {
     fs::create_dir_all(work.path("docs/sub")).unwrap();
     fs::copy(work.path("sample.rtf"), work.path("docs/sub/copy.rtf")).unwrap();
     fs::write(work.path("docs/broken.rtf"), "corrupt").unwrap();
+    fs::write(work.path("pic.rtf"), br"{\rtf1{\pict 47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b}}").unwrap();
     let mut server = Command::new(env!("CARGO_BIN_EXE_rdocs2md"))
         .current_dir(&work.0)
         .arg("mcp")
@@ -385,6 +407,25 @@ fn mcp_advertises_and_renders_output_formats() {
                 "paths":["docs/*.rtf","sample.rtf","../*.rtf"],"recursive":true,"output_dir":"batch","format":"json","jobs":2
             }}),
         ),
+        convert(
+            12,
+            json!({"path":"pic.rtf","format":"html","include_images":true}),
+        ),
+        convert(
+            13,
+            json!({"path":"pic.rtf","format":"html","include_images":true,"output_path":"pic.html"}),
+        ),
+        request(
+            14,
+            "tools/call",
+            json!({"name":"convert_documents","arguments":{
+                "paths":["pic.rtf"],"output_dir":"html-batch","format":"html","include_images":true
+            }}),
+        ),
+        convert(
+            15,
+            json!({"path":"pic.rtf","format":"html","include_images":true,"image_dir":"saved-images"}),
+        ),
     ] {
         writeln!(stdin, "{message}").unwrap();
     }
@@ -397,7 +438,7 @@ fn mcp_advertises_and_renders_output_formats() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 11);
+    assert_eq!(replies.len(), 15);
     let result = |id: usize| &replies[id - 1]["result"];
     let content = |id| result(id)["content"][0]["text"].as_str().unwrap();
     for tool in result(2)["tools"].as_array().unwrap() {
@@ -464,8 +505,25 @@ fn mcp_advertises_and_renders_output_formats() {
     assert!(work.path("batch/copy.json").is_file());
     assert!(work.path("batch/sample.json").is_file());
     assert!(!work.path("batch/broken.json").exists());
+    for id in 12..=15 {
+        assert_eq!(result(id)["isError"], false, "{}", content(id));
+    }
+    let saved = fs::read_to_string(work.path("pic.html")).unwrap();
+    let batch = fs::read_to_string(work.path("html-batch/pic.html")).unwrap();
+    for html in [content(12), &saved, &batch] {
+        assert!(
+            html.contains("src=\"data:image/gif;base64,R0lGOD"),
+            "{html}"
+        );
+        assert!(!html.contains("data-path="), "{html}");
+    }
+    assert!(!work.path("pic_images").exists());
+    assert!(!work.path("html-batch/pic_images").exists());
+    assert!(content(15).contains("src=\"data:image/gif;base64,R0lGOD"));
+    assert!(content(15).contains("data-path=\"saved-images/image-1.gif\""));
+    assert!(work.path("saved-images/image-1.gif").is_file());
     // No tool returns structuredContent, so no result is sent twice.
-    for id in 1..=11 {
+    for id in 1..=15 {
         assert!(result(id).get("structuredContent").is_none(), "id {id}");
     }
 }

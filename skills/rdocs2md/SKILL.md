@@ -36,7 +36,7 @@ Default output is a UTF-8 `.md` file next to the input. Existing results may be 
 | `--sheet NAME\|NUMBER` | Only this workbook sheet, by title or 1-based number; repeatable |
 | `--json PATH` | Also write the JSON IR |
 | `--extract-images`, `--image-dir DIR` | Export graphic assets as separate files |
-| `--include-images` | Inline images into HTML results as `data:` URIs (implies extraction) |
+| `--include-images` | Inline images into HTML results as `data:` URIs |
 | `--search QUERY`, `--case-sensitive`, `--limit N` | Search text, return JSON |
 | `-j`, `--jobs N` | Batch workers, 1-64, default CPU count |
 | `--max-inflight-bytes SIZE` | Cap on input bytes converted at once, default `1GiB`, `0` removes it |
@@ -73,7 +73,7 @@ Cite from a hit using `block_id` (`s2-b1`, plus `-r2c3` for a table cell), `sour
 
 HTML embeds supported images and HWP 3.x vector drawings by default. `--extract-images` writes those assets next to the output and links to them using converter-generated filenames. `--image-dir` sets the destination (a subdirectory per document in a batch).
 
-`--include-images` embeds the assets in the HTML and writes separate copies. The extracted file path stays next to each embed as `data-path`. Other formats keep plain file links.
+`--include-images` embeds assets in the HTML. Combine it with `--extract-images` or `--image-dir` to also save copies and record their paths in `data-path`. Other formats keep plain file links when extracting images.
 
 ## Memory and limits
 

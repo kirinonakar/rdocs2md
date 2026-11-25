@@ -93,7 +93,7 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
             });
             props["mode"] = json!({"type":"string","enum":["semantic","hybrid","layout"]});
             props["extract_images"] = json!({"type":"boolean"});
-            props["include_images"] = json!({"type":"boolean","description":"HTML only: inline each extracted image as a base64 data URI and keep its path in data-path. Implies extract_images."});
+            props["include_images"] = json!({"type":"boolean","description":"HTML only: embed images as base64 data URIs. When image extraction is enabled separately, keep the extracted path in data-path."});
             props["image_dir"] = json!({"type":"string","description":format!("Image directory; parent must exist. {scope}")});
             props["range"] =
                 json!({"type":"string","description":"1-based inclusive ranges, e.g. 1-3,5."});
@@ -476,7 +476,7 @@ fn convert_batch(
         let out_dir = access.directory(args["output_dir"].as_str().ok_or("missing output_dir")?)?;
         let image_parent = if let Some(dir) = args["image_dir"].as_str() {
             Some(access.directory(dir)?)
-        } else if args["extract_images"].as_bool().unwrap_or(false) || conversion.inline_images {
+        } else if args["extract_images"].as_bool().unwrap_or(false) {
             Some(out_dir.clone())
         } else {
             None
@@ -601,11 +601,10 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
     let out = text("output_path")
         .map(|p| access.local(p, true))
         .transpose()?;
-    let images = args["extract_images"].as_bool().unwrap_or(false)
-        || text("image_dir").is_some()
-        || conversion.inline_images;
+    let extract_images =
+        args["extract_images"].as_bool().unwrap_or(false) || text("image_dir").is_some();
     let mut dir = None;
-    if images {
+    if extract_images {
         let default_dir = format!(
             "{}_images",
             input.file_stem().unwrap_or_default().to_string_lossy()
@@ -618,8 +617,7 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
         // only repeat it.
         return Ok(Reply::Text(serde_json::to_string(&summary)?));
     }
-    // Without images the parsed document can be reused by later read-only
-    // requests; image extraction changes the returned links, so it is not cached.
+    // Cache conversions that can reuse a document parsed without image assets.
     let sheets = conversion.sheets();
     let document = if dir.is_none() && conversion.format != "html" {
         access
@@ -634,7 +632,7 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
         Some(dir) => output::extract(document, dir, &access.root)?,
         None => Properties::new(),
     };
-    if conversion.inline_images {
+    if conversion.inline_images && !links.is_empty() {
         links = output::inline(document, &links)?;
     }
     let content = render(document, conversion.format, conversion.mode, &links)?;
