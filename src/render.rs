@@ -1053,6 +1053,61 @@ fn markdown_blank_lines(out: &mut String, count: usize) {
     }
 }
 
+fn blank_paragraph(block: &Block) -> bool {
+    matches!(block, Block::Paragraph {
+        heading: 0, list: None, runs, properties
+    } if !properties.contains_key("anchor") && runs.iter().all(|run| {
+        run.text.trim().is_empty()
+            && run.image.is_none()
+            && run.latex.is_none()
+            && run.mathml.is_none()
+            && !run.page_break
+    }))
+}
+
+fn markdown_page_padding(
+    blocks: &[Block],
+    has_previous_section: bool,
+    has_next_section: bool,
+) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut start = 0;
+    blocks.split(Block::is_page_break).flat_map(move |page| {
+        let end = start + page.len();
+        let leading = if start > 0 || has_previous_section {
+            page.iter()
+                .take_while(|block| blank_paragraph(block))
+                .count()
+        } else {
+            0
+        };
+        let trailing = if end < blocks.len() || has_next_section {
+            page[leading..]
+                .iter()
+                .rev()
+                .take_while(|block| blank_paragraph(block))
+                .count()
+        } else {
+            0
+        };
+        let padding = [start..start + leading, end - trailing..end];
+        start = end + 1;
+        padding.into_iter().filter(|range| !range.is_empty())
+    })
+}
+
+fn page_divider(out: &mut String, html: bool) {
+    if html {
+        out.push_str("<hr class=\"page-break\">\n");
+    } else {
+        out.truncate(out.trim_end_matches([' ', '\t', '\r', '\n']).len());
+        if !out.is_empty() {
+            // A blank line separates a thematic break from a Setext heading.
+            out.push_str("\n\n");
+        }
+        out.push_str("---\n\n");
+    }
+}
+
 pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> Result<String> {
     if !matches!(mode, "semantic" | "layout" | "hybrid") {
         return Err("mode must be semantic, layout or hybrid".into());
@@ -1088,6 +1143,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         out.push_str(concat!(
             "<!doctype html>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<style>\n",
             "article { box-sizing: border-box; max-width: 76rem; margin-inline: auto; padding: 1.25rem; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 16px; line-height: 1.5; overflow-wrap: break-word; print-color-adjust: exact; -webkit-print-color-adjust: exact; }\n",
+            "article hr.page-break { border: 0; border-top: 1px dotted #777; margin-block: 1em; }\n",
             "article table { border-collapse: collapse; max-width: 100%; margin-block: 0.5em; font: inherit; }\n",
             "article td, article th { box-sizing: border-box; border: 1px solid #a0a0a0; padding: 0.3em 0.5em; vertical-align: top; white-space: pre-wrap; overflow-wrap: anywhere; }\n",
             "article .source-borders > tbody > tr > :is(td, th) { border: none; }\n",
@@ -1115,17 +1171,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             None
         };
         if i > 0 && !out.is_empty() {
-            if html {
-                out.push_str("\n<hr>\n")
-            } else {
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
-                if !out.ends_with("\n\n") {
-                    out.push('\n');
-                }
-                out.push_str("---\n\n");
-            }
+            page_divider(&mut out, html);
         }
         // Warnings travel as a separate block, so a page that stopped early or
         // failed leaves a marker in the body: a reader of `--stdout` output alone
@@ -1185,6 +1231,11 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         let mut html_list = None;
         let mut in_list = false;
         let mut list_indents = Vec::<usize>::new();
+        let mut padding = (!html)
+            .then(|| markdown_page_padding(&s.blocks, i > 0, i + 1 < doc.sections.len()))
+            .into_iter()
+            .flatten()
+            .peekable();
         let mut pages = s
             .hwp3_layout
             .as_ref()
@@ -1201,12 +1252,29 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             .flat_map(|page| &page.replaced_blocks)
             .peekable();
         for (index, block) in s.blocks.iter().enumerate() {
+            let page_break = block.is_page_break();
+            if page_break {
+                if let Some(old) = html_list.take() {
+                    writeln!(out, "</{old}>")?;
+                }
+                blank_lines = 0;
+                previous_pdf_line = None;
+                in_list = false;
+                list_indents.clear();
+                page_divider(&mut out, html);
+            }
             while pages
                 .peek()
                 .is_some_and(|(_, page)| page.first_block <= index)
             {
                 let (paper, page) = pages.next().unwrap();
                 hwp3_page(&mut out, paper, page, links)?;
+            }
+            while padding.peek().is_some_and(|range| range.end <= index) {
+                padding.next();
+            }
+            if page_break || padding.peek().is_some_and(|range| range.contains(&index)) {
+                continue;
             }
             while replaced.peek().is_some_and(|range| range.end <= index) {
                 replaced.next();
@@ -1237,15 +1305,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             {
                 continue;
             }
-            let source_blank = hwp3
-                && matches!(block, Block::Paragraph {
-                    heading: 0, list: None, runs, properties
-                } if !properties.contains_key("anchor") && runs.iter().all(|run| {
-                    run.text.trim().is_empty()
-                        && run.image.is_none()
-                        && run.latex.is_none()
-                        && run.mathml.is_none()
-                }));
+            let source_blank = hwp3 && blank_paragraph(block);
             if source_blank && !html && mode != "layout" {
                 blank_lines += 1;
                 in_list = false;

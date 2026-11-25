@@ -270,7 +270,8 @@ fn parse_paragraph<'a>(
     let char_count = usize::from(cursor.u16()?);
     let line_count = usize::from(cursor.u16()?);
     let has_char_shapes = cursor.u8()? != 0;
-    cursor.skip(1 + 4 + 1)?;
+    let flags = cursor.u8()?;
+    cursor.skip(4 + 1)?;
     let default_shape = cursor.take(31)?;
     if char_count == 0 {
         return Ok(None);
@@ -291,12 +292,26 @@ fn parse_paragraph<'a>(
             .checked_mul(14)
             .ok_or("HWP 3.0 line table overflow")?,
     )?;
+    let line_info = line_info.as_chunks::<14>().0;
     let starts: Vec<_> = line_info
-        .as_chunks::<14>()
-        .0
         .iter()
         .map(|line| usize::from(u16::from_le_bytes([line[0], line[1]])))
         .collect();
+    let mut page_breaks = Vec::new();
+    if depth == 0 {
+        if flags & 2 != 0 {
+            page_breaks.push(0);
+        }
+        page_breaks.extend(line_info.iter().zip(&starts).filter_map(|(line, &start)| {
+            let flags = u16::from_le_bytes([line[12], line[13]]);
+            (flags & 0x8001 == 0x8001 && start < char_count).then_some(start)
+        }));
+        page_breaks.sort_unstable();
+        page_breaks.dedup();
+    }
+    let paragraph_page = state.page + usize::from(page_breaks.first() == Some(&0));
+    state.page += page_breaks.len();
+    let mut page_breaks = page_breaks.into_iter().peekable();
     let mut changes = Vec::new();
     if has_char_shapes {
         for index in 0..char_count {
@@ -316,16 +331,9 @@ fn parse_paragraph<'a>(
         ..ParagraphText::default()
     };
     let mut lines = Vec::new();
-    let mut paragraph_page = state.page;
     if positioned {
         let paper = state.paper.as_ref().unwrap();
-        for (i, line) in line_info.as_chunks::<14>().0.iter().enumerate() {
-            if read_u16_at(line, 12)? & 0x8001 == 0x8001 {
-                state.page += 1;
-            }
-            if i == 0 {
-                paragraph_page = state.page;
-            }
+        for (i, line) in line_info.iter().enumerate() {
             lines.push(Hwp3Line {
                 x: paper.left + shape.left() + if i == 0 { shape.indent() } else { 0 },
                 y: paper.top + i32::from(read_u16_at(line, 6)?),
@@ -355,6 +363,12 @@ fn parse_paragraph<'a>(
     let mut spaces_end = 0;
     let mut wrap_padding_end = 0;
     while consumed < char_count {
+        while page_breaks.next_if(|&start| start <= consumed).is_some() {
+            paragraph.flush(&mut out);
+            if block_start != 0 || !out.is_empty() {
+                out.push(Block::page_break());
+            }
+        }
         let mut next_shape = None;
         while let Some((_, raw)) = changes.next_if(|(index, _)| *index <= consumed) {
             next_shape = Some(raw);
@@ -536,7 +550,9 @@ fn parse_paragraph<'a>(
                         .is_some_and(|&start| consumed < start && start + 2 <= spaces_end)
                     {
                         wrap_padding_end = spaces_end;
-                        paragraph.text.push('\n');
+                        if page_breaks.peek() != starts.get(line + 1) {
+                            paragraph.text.push('\n');
+                        }
                     }
                 }
                 if consumed > wrap_padding_end {
@@ -568,7 +584,11 @@ fn parse_paragraph<'a>(
         }
     }
     paragraph.flush(&mut out);
-    if depth == 0 && line_count > 0 && char_count == 1 && out.is_empty() {
+    if depth == 0
+        && line_count > 0
+        && char_count == 1
+        && out.last().is_none_or(Block::is_page_break)
+    {
         // A paragraph containing only its terminator can still occupy a source
         // line. An empty fragment after a table or picture does not.
         out.push(Block::Paragraph {

@@ -529,7 +529,7 @@ fn pdf_ruled_table_keeps_section_rows_and_wrapped_headings_beside_prose() {
 }
 
 #[test]
-fn hwp_tables_keep_merged_cells_and_nested_answers() {
+fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     fn record(out: &mut Vec<u8>, tag: u32, level: u32, data: &[u8]) {
         let header = (data.len() as u32) << 20 | level << 10 | tag;
         out.extend_from_slice(&header.to_le_bytes());
@@ -551,8 +551,10 @@ fn hwp_tables_keep_merged_cells_and_nested_answers() {
         record(out, 72, level, &data);
     }
     fn paragraph(out: &mut Vec<u8>, level: u32, text: &str) {
-        record(out, 66, level, &[0; 10]);
         let styled = text == "After";
+        let mut header = [0; 12];
+        header[11] = if styled { 4 } else { 0 };
+        record(out, 66, level, &header);
         let text: Vec<_> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
         record(out, 67, level + 1, &text);
         if styled {
@@ -645,8 +647,9 @@ fn hwp_tables_keep_merged_cells_and_nested_answers() {
     assert!(text.contains("<td>Question</td><td><p>Answer</p>\n<table>"));
     assert!(text.contains("<td>Nested answer</td>"));
     assert!(text.contains("</table>\n<p>Answer continued</p>\n</td>"));
-    assert_eq!(text.matches("\n\n").count(), 3);
+    assert_eq!(text.matches("\n\n").count(), 4);
     assert!(text.starts_with("Before\n\n<table>") && text.ends_with("After\n\n"));
+    assert!(text.contains("</table>\n\n---\n\nAfter"));
     assert!(doc.assets.is_empty());
 
     let doc = convert(&file, true).unwrap();
@@ -782,6 +785,19 @@ fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
     paragraph(&mut hwp, &units("Second line"), &[0], 225, 2, &[]);
     hwp.extend([0; 43 * 2]);
     hwp.extend(13u16.to_le_bytes());
+
+    let wrapped = hwp.len();
+    paragraph(&mut hwp, &units("left    right"), &[0, 6], 275, 0, &[]);
+    let second_line_flags = wrapped + 43 + 187 + 14 + 12;
+    hwp[second_line_flags..second_line_flags + 2].copy_from_slice(&0x8003u16.to_le_bytes());
+    paragraph(&mut hwp, &units("Page bottom"), &[0], 275, 0, &[]);
+    paragraph(&mut hwp, &units(" "), &[0], 275, 0, &[]);
+    paragraph(&mut hwp, &[], &[0], 275, 0, &[]);
+    let page_start = hwp.len();
+    paragraph(&mut hwp, &[], &[0], 275, 0, &[]);
+    hwp[page_start + 6] = 2;
+    paragraph(&mut hwp, &units(" "), &[0], 275, 0, &[]);
+    paragraph(&mut hwp, &units("Page top"), &[0], 275, 0, &[]);
     hwp.extend([0; 43]);
 
     let doc = convert(&hwp, false).unwrap();
@@ -800,13 +816,17 @@ fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
         assert!(html.contains(content), "missing {content} in {html}");
     }
     let blank = "<p style=\"white-space:pre-wrap;margin-top:0pt;margin-bottom:0pt;line-height:160%;font-size:11pt;\"><br></p>";
-    assert_eq!(html.matches(blank).count(), 3, "{html}");
+    assert_eq!(html.matches(blank).count(), 7, "{html}");
+    assert_eq!(html.matches("<hr class=\"page-break\">").count(), 2);
+    assert!(html.contains("border-top: 1px dotted"));
     let text = md(&doc);
     for content in [
         "# **Main heading**",
         "## **Smaller heading**",
         "Read **bold** and <u>underlined</u>",
         "pad  \nded\n\n\nList follows\n\n- **Item**",
+        "left\n\n---\n\nright",
+        "Page bottom\n\n---\n\nPage top",
         "- **Item**  \n  continuation\n- Item",
     ] {
         assert!(text.contains(content), "missing {content} in {text}");
@@ -815,6 +835,11 @@ fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
         let text = render(&doc, "md", mode, &Properties::new()).unwrap();
         assert!(
             text.contains("| First \\| line<br>**Second line** |\n| --- |"),
+            "{text}"
+        );
+        assert_eq!(text.matches("\n\n---\n\n").count(), 2, "{text}");
+        assert!(
+            !text.contains("\n\n\n---\n\n") && !text.contains("---\n\n\n"),
             "{text}"
         );
     }
@@ -1194,6 +1219,12 @@ fn odt_explicit_page_break_preserves_exact_sides() {
     ]);
     let mut d = convert(&data, false).unwrap();
     assert_eq!(d.sections.len(), 2);
+    assert_eq!(md(&d).trim(), "앞\n\n---\n\n뒤");
+    assert!(
+        render(&d, "html", "hybrid", &Properties::new())
+            .unwrap()
+            .contains("<hr class=\"page-break\">")
+    );
     d.select("2").unwrap();
     assert_eq!(md(&d).trim(), "뒤");
 }

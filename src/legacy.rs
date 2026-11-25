@@ -462,6 +462,13 @@ fn hwp_block<'a>(
 ) -> Result<()> {
     match record.tag {
         66 => {
+            if depth == 0
+                && record.level == 0
+                && record.data.get(11).is_some_and(|flags| flags & 4 != 0)
+                && !out.is_empty()
+            {
+                out.push(Block::page_break());
+            }
             if let Some(text) = records.next_if(|r| {
                 r.as_ref()
                     .is_ok_and(|p| p.tag == 67 && p.level == record.level + 1)

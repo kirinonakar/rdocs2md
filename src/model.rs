@@ -369,6 +369,18 @@ impl Block {
     pub fn text(t: impl Into<String>) -> Self {
         Self::flow(vec![Run::text(t)])
     }
+
+    pub(crate) fn page_break() -> Self {
+        Self::flow(vec![Run {
+            page_break: true,
+            ..Run::default()
+        }])
+    }
+
+    pub(crate) fn is_page_break(&self) -> bool {
+        matches!(self, Self::Paragraph { runs, .. }
+            if matches!(runs.as_slice(), [run] if run.page_break && run.text.is_empty()))
+    }
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct List {
