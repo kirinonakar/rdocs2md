@@ -20,6 +20,7 @@ struct State {
     link: Option<String>,
     align: Option<String>,
     indent: i32,
+    heading: u8,
     depth: usize,
     list: bool,
     star: bool,
@@ -35,6 +36,7 @@ impl Default for State {
             link: None,
             align: None,
             indent: 0,
+            heading: 0,
             depth: 0,
             list: false,
             star: false,
@@ -173,7 +175,7 @@ impl Parser<'_> {
             }
             self.section.blocks.push(Block::Paragraph {
                 runs: std::mem::take(&mut self.runs),
-                heading: 0,
+                heading: self.state.heading,
                 list: self.state.list.then_some(List {
                     ordered: false,
                     depth: self.state.depth,
@@ -319,8 +321,16 @@ impl Parser<'_> {
             "fs" => self.state.style.size = Some(format!("{}pt", n as f64 / 2.0)),
             "v" => self.state.style.hidden = Some(n != 0),
             "plain" => self.state.style = Style::default(),
-            "ls" | "pn" => self.state.list = true,
+            "ls" => self.state.list = n > 0,
+            "pn" => self.state.list = true,
             "ilvl" => self.state.depth = n.clamp(0, 32) as usize,
+            "outlinelevel" => {
+                self.state.heading = if (0..=8).contains(&n) {
+                    (n + 1).min(6) as u8
+                } else {
+                    0
+                };
+            }
             "cf" => {
                 self.state.style.color = usize::try_from(n)
                     .ok()
@@ -332,6 +342,7 @@ impl Parser<'_> {
             "pard" => {
                 self.state.indent = 0;
                 self.state.align = None;
+                self.state.heading = 0;
                 self.state.list = false;
                 self.state.depth = 0
             }

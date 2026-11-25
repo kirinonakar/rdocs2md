@@ -703,6 +703,193 @@ fn html_hwpx_keeps_referenced_cell_border_fill_and_alignment() {
 }
 
 #[test]
+fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
+    fn paragraph(
+        out: &mut Vec<u8>,
+        units: &[u16],
+        starts: &[u16],
+        size: u16,
+        flags: u8,
+        changes: &[(usize, u8)],
+    ) {
+        let shape = |flags| {
+            let mut shape = [0u8; 31];
+            shape[..2].copy_from_slice(&size.to_le_bytes());
+            shape[26] = flags;
+            shape
+        };
+        let mut header = [0u8; 43 + 187];
+        header[1..3].copy_from_slice(&((units.len() + 1) as u16).to_le_bytes());
+        header[3..5].copy_from_slice(&(starts.len() as u16).to_le_bytes());
+        header[5] = u8::from(!changes.is_empty());
+        header[12..43].copy_from_slice(&shape(flags));
+        out.extend(header);
+        for start in starts {
+            out.extend(start.to_le_bytes());
+            out.extend([0; 12]);
+        }
+        if !changes.is_empty() {
+            for index in 0..=units.len() {
+                if let Some((_, style)) = changes.iter().find(|(i, _)| *i == index) {
+                    out.push(0);
+                    out.extend(shape(*style));
+                } else {
+                    out.push(1);
+                }
+            }
+        }
+        for unit in units.iter().copied().chain([13]) {
+            out.extend(unit.to_le_bytes());
+        }
+    }
+
+    let units = |text: &str| text.encode_utf16().collect::<Vec<_>>();
+    let mut hwp = b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05".to_vec();
+    hwp.resize(30 + 128 + 1008 + 16, 0);
+    paragraph(&mut hwp, &units("Main heading"), &[0], 300, 2, &[]);
+    paragraph(
+        &mut hwp,
+        &units("Read bold and underlined words here."),
+        &[0],
+        275,
+        0,
+        &[(0, 0), (5, 2), (9, 0), (14, 4), (24, 0)],
+    );
+    paragraph(&mut hwp, &units("Smaller heading"), &[0], 275, 2, &[]);
+    paragraph(&mut hwp, &units("unwrapped"), &[0, 2], 275, 0, &[]);
+    paragraph(&mut hwp, &units("real   spacing"), &[0], 275, 0, &[]);
+    paragraph(&mut hwp, &units("pad    ded"), &[0, 5], 275, 0, &[]);
+    let bullet = [0x343c]
+        .into_iter()
+        .chain(units(" Item"))
+        .collect::<Vec<_>>();
+    paragraph(&mut hwp, &bullet, &[0], 275, 0, &[(0, 0), (1, 2)]);
+    paragraph(&mut hwp, &units("    continuation"), &[0], 275, 0, &[]);
+    paragraph(&mut hwp, &bullet, &[0], 275, 0, &[]);
+    paragraph(&mut hwp, &[10, 0, 0, 10], &[0], 275, 0, &[]);
+    hwp.truncate(hwp.len() - 2);
+    let mut table = [0u8; 84 + 27];
+    table[80] = 1;
+    table[92..94].copy_from_slice(&2500u16.to_le_bytes());
+    table[94..96].copy_from_slice(&1200u16.to_le_bytes());
+    hwp.extend(table);
+    paragraph(&mut hwp, &units("First line"), &[0], 225, 0, &[]);
+    paragraph(&mut hwp, &units("Second line"), &[0], 225, 2, &[]);
+    hwp.extend([0; 43 * 2]);
+    hwp.extend(13u16.to_le_bytes());
+    hwp.extend([0; 43]);
+
+    let doc = convert(&hwp, false).unwrap();
+    let html = render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+    for content in [
+        "<strong>bold</strong>",
+        "<u>underlined</u>",
+        "list-style-type:'● ';",
+        "pad<br>ded",
+        "unwrapped",
+        "real   spacing",
+        "</span></p><p style=\"margin-top:0pt;margin-bottom:0pt;font-size:9pt;\"",
+        "<strong>Second line</strong></span></p></td>",
+    ] {
+        assert!(html.contains(content), "missing {content} in {html}");
+    }
+    let text = md(&doc);
+    for content in [
+        "# **Main heading**",
+        "## **Smaller heading**",
+        "Read **bold** and <u>underlined</u>",
+        "- **Item**  \n  continuation\n- Item",
+    ] {
+        assert!(text.contains(content), "missing {content} in {text}");
+    }
+}
+
+#[test]
+fn markdown_infers_structure_from_rtf_styles_and_literal_bullets() {
+    let data = br"{\rtf1\ansi\pard\fs36\b Overview\par\pard\fs28 Details\par\pard\b0\fs20
+    This paragraph is normal body text and anchors the document font size.\par
+    \bullet\tab First\par\bullet\tab Second\par - Typed first\par - Typed second\par
+    Aside without a marker.\par - Isolated punctuation\par}";
+    let doc = convert(data, false).unwrap();
+    for mode in ["semantic", "hybrid", "layout"] {
+        let text = render(&doc, "md", mode, &Properties::new()).unwrap();
+        assert!(text.contains("# **Overview**\n\n## **Details**"));
+        assert!(text.contains("- First\n- Second\n- Typed first\n- Typed second"));
+        assert!(!text.lines().any(|line| line == "- Isolated punctuation"));
+    }
+    let html = render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+    assert!(html.contains("•\tFirst"));
+    assert!(!html.contains("<h1"));
+
+    let explicit = convert(
+        br"{\rtf1\ansi\pard\outlinelevel2 Native title\par\pard Normal\par}",
+        false,
+    )
+    .unwrap();
+    assert!(md(&explicit).contains("### Native title\n\nNormal"));
+}
+
+#[test]
+fn markdown_keeps_hwpx_outline_and_mixed_docx_numbering_levels() {
+    let hwpx = package(&[
+        ("Contents/content.hpf", "<package/>"),
+        (
+            "Contents/header.xml",
+            r#"<head>
+            <paraPr id="1"><heading type="OUTLINE" level="1"/></paraPr>
+            <paraPr id="2"><heading type="BULLET" level="0"/></paraPr>
+            <paraPr id="3"><heading type="NUMBER" level="1"/></paraPr>
+        </head>"#,
+        ),
+        (
+            "Contents/section0.xml",
+            r#"<sec>
+            <p paraPrIDRef="1"><run><t>Outline</t></run></p>
+            <p paraPrIDRef="2"><run><t>Bullet</t></run></p>
+            <p paraPrIDRef="3"><run><t>Numbered child</t></run></p>
+        </sec>"#,
+        ),
+    ]);
+    let text = md(&convert(&hwpx, false).unwrap());
+    assert!(text.contains("## Outline\n\n- Bullet\n  1. Numbered child"));
+
+    let docx = package(&[
+        (
+            "_rels/.rels",
+            "<Relationships><Relationship Id='r1' Target='word/document.xml' Type='rel/officeDocument'/></Relationships>",
+        ),
+        (
+            "[Content_Types].xml",
+            "<Types><Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/></Types>",
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            "<Relationships><Relationship Id='N' Target='numbering.xml' Type='rel/numbering'/></Relationships>",
+        ),
+        (
+            "word/numbering.xml",
+            r#"<numbering><abstractNum abstractNumId="1">
+            <lvl ilvl="0"><numFmt val="decimal"/></lvl>
+            <lvl ilvl="1"><numFmt val="decimal"/></lvl>
+        </abstractNum><num numId="1"><abstractNumId val="1"/><lvlOverride ilvl="1">
+            <lvl ilvl="1"><numFmt val="bullet"/></lvl>
+        </lvlOverride></num></numbering>"#,
+        ),
+        (
+            "word/document.xml",
+            r#"<document><body>
+            <p><pPr><outlineLvl val="0"/></pPr><r><t>Outline</t></r></p>
+            <p><pPr><numPr><ilvl val="0"/><numId val="1"/></numPr></pPr><r><t>Numbered</t></r></p>
+            <p><pPr><numPr><ilvl val="1"/><numId val="1"/></numPr></pPr><r><t>Bullet child</t></r></p>
+            <p><pPr><numPr><numId val="0"/></numPr></pPr><r><t>Normal</t></r></p>
+        </body></document>"#,
+        ),
+    ]);
+    let text = md(&convert(&docx, false).unwrap());
+    assert!(text.contains("# Outline\n\n1. Numbered\n   - Bullet child\n\nNormal"));
+}
+
+#[test]
 fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
     fn short(buffer: &mut [u8], offset: usize, value: u16) {
         buffer[offset..offset + 2].copy_from_slice(&value.to_le_bytes());

@@ -18,6 +18,7 @@ pub mod render;
 mod rtf;
 pub mod search;
 mod sheets;
+mod structure;
 mod visibility;
 mod xls;
 use model::*;

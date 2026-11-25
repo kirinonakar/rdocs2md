@@ -1875,12 +1875,14 @@ struct LineInfo {
 
 impl LineInfo {
     fn list_marker(&self) -> bool {
-        self.first.starts_with(['•', '▪', '■', '◦'])
-            || self
-                .first
-                .chars()
-                .next()
-                .is_some_and(|c| ('①'..='⑳').contains(&c) || ('❶'..='❿').contains(&c))
+        self.first.chars().next().is_some_and(|c| {
+            crate::structure::is_bullet(c)
+                && (self.first.len() == c.len_utf8() || matches!(c, '•' | '◦' | '▪' | '▫'))
+        }) || self
+            .first
+            .chars()
+            .next()
+            .is_some_and(|c| ('①'..='⑳').contains(&c) || ('❶'..='❿').contains(&c))
             || self.first.strip_suffix(['.', ')']).is_some_and(|n| {
                 !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit())
             })

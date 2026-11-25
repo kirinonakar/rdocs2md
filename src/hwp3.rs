@@ -1,4 +1,7 @@
-use crate::model::*;
+use crate::{
+    model::*,
+    structure::{self, HeadingEvidence, Headings},
+};
 use flate2::read::DeflateDecoder;
 use std::{borrow::Cow, io::Read};
 
@@ -81,8 +84,12 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
         ..ParseState::default()
     };
     let mut section = Section::new("section", "document");
-    section.blocks = paragraph_list(&mut cursor, 0, &mut state)?;
+    section.blocks = paragraph_list(&mut cursor, 0, &mut state, false)?;
+    classify_paragraphs(&mut section.blocks);
     section.hwp3_layout = state.layout(section.blocks.len());
+    if section.hwp3_layout.is_none() {
+        join_list_continuations(&mut section.blocks);
+    }
     if state.partial_graphics {
         doc.warn(
             "Some HWP 3.0 graphics could only be restored partially or could not be rendered.",
@@ -121,8 +128,6 @@ struct ParseState {
     partial_graphics: bool,
     paper: Option<Paper>,
     page: usize,
-    paragraph_indent: i32,
-    first_indent: i32,
     layout_bytes: usize,
     paragraphs: Vec<PositionedParagraph>,
     graphics: std::collections::BTreeMap<usize, Vec<Hwp3Graphic>>,
@@ -231,39 +236,49 @@ fn read_u16_at(data: &[u8], offset: usize) -> Result<u16> {
     ))
 }
 
-fn paragraph_list(
-    cursor: &mut Cursor<'_>,
+fn paragraph_list<'a>(
+    cursor: &mut Cursor<'a>,
     depth: usize,
     state: &mut ParseState,
+    in_cell: bool,
 ) -> Result<Vec<Block>> {
     if depth > MAX_NESTING {
         return Err("HWP 3.0 object nesting limit exceeded".into());
     }
     let mut blocks = Vec::new();
+    let mut shape = ParagraphShape {
+        data: None,
+        in_cell,
+    };
     loop {
         state.nodes += 1;
         if state.nodes > NODE_LIMIT {
             return Err("HWP 3.0 paragraph limit exceeded".into());
         }
-        let Some(mut paragraph) = parse_paragraph(cursor, depth, state, blocks.len())? else {
+        let Some(mut paragraph) = parse_paragraph(cursor, depth, state, blocks.len(), &mut shape)?
+        else {
             return Ok(blocks);
         };
         blocks.append(&mut paragraph);
     }
 }
 
-fn parse_paragraph(
-    cursor: &mut Cursor<'_>,
+fn parse_paragraph<'a>(
+    cursor: &mut Cursor<'a>,
     depth: usize,
     state: &mut ParseState,
     block_start: usize,
+    shape: &mut ParagraphShape<'a>,
 ) -> Result<Option<Vec<Block>>> {
     let previous_shape = cursor.u8()?;
     let char_count = usize::from(cursor.u16()?);
     let line_count = usize::from(cursor.u16()?);
     let has_char_shapes = cursor.u8()? != 0;
     cursor.skip(1 + 4 + 1)?;
-    let default_size = read_u16_at(cursor.take(31)?, 0)?;
+    let default_shape = cursor.take(31)?;
+    if char_count == 0 {
+        return Ok(None);
+    }
     let positioned = if depth == 0 && state.paper.is_some() {
         state.layout_bytes = state
             .layout_bytes
@@ -272,22 +287,39 @@ fn parse_paragraph(
     } else {
         false
     };
-    if previous_shape == 0 && char_count > 0 {
-        let shape = cursor.take(187)?;
-        if positioned {
-            state.paragraph_indent = i32::from(read_u16_at(shape, 0)?);
-            state.first_indent = i32::from(read_u16_at(shape, 4)? as i16);
-        }
-    }
-    if char_count == 0 {
-        return Ok(None);
+    if previous_shape == 0 {
+        shape.data = Some(cursor.take(187)?);
     }
     let line_info = cursor.take(
         line_count
             .checked_mul(14)
             .ok_or("HWP 3.0 line table overflow")?,
     )?;
-    let (mut lines, mut starts) = (Vec::new(), Vec::new());
+    let starts: Vec<_> = line_info
+        .as_chunks::<14>()
+        .0
+        .iter()
+        .map(|line| usize::from(u16::from_le_bytes([line[0], line[1]])))
+        .collect();
+    let mut changes = Vec::new();
+    if has_char_shapes {
+        for index in 0..char_count {
+            if cursor.u8()? != 1 {
+                changes.push((index, cursor.take(31)?));
+            }
+        }
+    }
+    let mut changes = changes.into_iter().peekable();
+    let initial_shape = changes
+        .next_if(|(index, _)| *index == 0)
+        .map_or(default_shape, |(_, s)| s);
+    let default_size = read_u16_at(initial_shape, 0)?;
+    let mut paragraph = ParagraphText {
+        style: char_style(initial_shape),
+        properties: shape.properties(default_size),
+        ..ParagraphText::default()
+    };
+    let mut lines = Vec::new();
     let mut paragraph_page = state.page;
     if positioned {
         let paper = state.paper.as_ref().unwrap();
@@ -298,11 +330,8 @@ fn parse_paragraph(
             if i == 0 {
                 paragraph_page = state.page;
             }
-            starts.push(usize::from(read_u16_at(line, 0)?));
             lines.push(Hwp3Line {
-                x: paper.left
-                    + state.paragraph_indent
-                    + if i == 0 { state.first_indent } else { 0 },
+                x: paper.left + shape.left() + if i == 0 { shape.indent() } else { 0 },
                 y: paper.top + i32::from(read_u16_at(line, 6)?),
                 size: if (25..=10000).contains(&default_size) {
                     default_size
@@ -313,7 +342,8 @@ fn parse_paragraph(
             });
         }
     }
-    let mut replaces = starts.first() == Some(&0)
+    let mut replaces = positioned
+        && starts.first() == Some(&0)
         && paragraph_page == state.page
         && starts.windows(2).all(|pair| pair[0] <= pair[1])
         && lines.iter().all(|line| {
@@ -322,25 +352,28 @@ fn parse_paragraph(
                 .as_ref()
                 .is_some_and(|paper| line.y < paper.size[1])
         });
-    if has_char_shapes {
-        for _ in 0..char_count {
-            if cursor.u8()? != 1 {
-                cursor.skip(31)?;
-            }
-        }
-    }
-
     let mut out = Vec::new();
-    let mut text = String::new();
-    let mut runs = Vec::new();
     let mut graphics = Vec::new();
     let mut line = 0;
     let mut consumed = 0usize;
+    let mut spaces_end = 0;
+    let mut wrap_padding_end = 0;
     while consumed < char_count {
+        let mut next_shape = None;
+        while let Some((_, raw)) = changes.next_if(|(index, _)| *index <= consumed) {
+            next_shape = Some(raw);
+        }
+        if let Some(raw) = next_shape {
+            let style = char_style(raw);
+            if style != paragraph.style {
+                paragraph.flush_run();
+                paragraph.style = style;
+            }
+        }
         while starts.get(line + 1).is_some_and(|&start| start <= consumed) {
             line += 1;
         }
-        let text_start = text.len();
+        let text_start = paragraph.text.len();
         let code = cursor.u16()?;
         consumed += 1;
         match code {
@@ -364,14 +397,14 @@ fn parse_paragraph(
                 let width = cursor.u16()?;
                 cursor.skip(4)?;
                 consumed += 3;
-                text.push('\t');
+                paragraph.text.push('\t');
                 if replaces {
                     lines[line].parts.push(Hwp3Text::Tab(width));
                 }
             }
             10 => {
                 replaces = false;
-                flush_paragraph(&mut out, &mut runs, &mut text);
+                paragraph.flush(&mut out);
                 cursor.skip(6)?;
                 consumed += 3;
                 parse_box(cursor, depth + 1, state, &mut out)?;
@@ -387,7 +420,7 @@ fn parse_paragraph(
                 } else {
                     None
                 };
-                let captions = paragraph_list(cursor, depth + 1, state)?;
+                let captions = paragraph_list(cursor, depth + 1, state, false)?;
                 if let Some((key, [dx, dy, width, height], order)) = graphic {
                     if replaces
                         && captions.is_empty()
@@ -405,8 +438,8 @@ fn parse_paragraph(
                     } else {
                         replaces = false;
                     }
-                    flush_run(&mut runs, &mut text);
-                    runs.push(Run {
+                    paragraph.flush_run();
+                    paragraph.runs.push(Run {
                         text: "[그림]".into(),
                         image: Some(key),
                         image_alt: Some(String::new()),
@@ -420,10 +453,10 @@ fn parse_paragraph(
                 } else {
                     replaces = false;
                     state.partial_graphics |= state.images;
-                    text.push_str("[그림]");
+                    paragraph.text.push_str("[그림]");
                 }
                 if !captions.is_empty() {
-                    flush_paragraph(&mut out, &mut runs, &mut text);
+                    paragraph.flush(&mut out);
                     out.extend(captions);
                 }
             }
@@ -436,19 +469,19 @@ fn parse_paragraph(
                 replaces = false;
                 cursor.skip(14)?;
                 consumed += 3;
-                append_nested(cursor, depth, state, &mut out, &mut runs, &mut text)?;
+                append_nested(cursor, depth, state, &mut out, &mut paragraph)?;
             }
             16 => {
                 replaces = false;
                 cursor.skip(16)?;
                 consumed += 3;
-                append_nested(cursor, depth, state, &mut out, &mut runs, &mut text)?;
+                append_nested(cursor, depth, state, &mut out, &mut paragraph)?;
             }
             17 => {
                 replaces = false;
                 cursor.skip(20)?;
                 consumed += 3;
-                append_nested(cursor, depth, state, &mut out, &mut runs, &mut text)?;
+                append_nested(cursor, depth, state, &mut out, &mut paragraph)?;
             }
             18..=21 => {
                 cursor.skip(6)?;
@@ -465,7 +498,7 @@ fn parse_paragraph(
             24 => {
                 cursor.skip(4)?;
                 consumed += 2;
-                text.push('-');
+                paragraph.text.push('-');
             }
             25 => {
                 cursor.skip(4)?;
@@ -482,28 +515,63 @@ fn parse_paragraph(
             30 => {
                 cursor.skip(2)?;
                 consumed += 1;
-                text.push('\u{00a0}');
+                paragraph.text.push('\u{00a0}');
             }
             31 => {
                 cursor.skip(2)?;
                 consumed += 1;
-                text.push(' ');
+                paragraph.text.push(' ');
             }
-            _ => text.push(hnc_char(code).unwrap_or('\u{fffd}')),
+            32 => {
+                if consumed > spaces_end {
+                    spaces_end = consumed
+                        + cursor.data[cursor.pos..]
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .take(char_count - consumed)
+                            .take_while(|&&unit| unit == [32, 0])
+                            .count();
+                    // Padded continuations used literal spaces to lay out both
+                    // ends of a line. Keep the source break instead of moving
+                    // that padding into the middle of a word or guessing a separator.
+                    if starts
+                        .get(line + 1)
+                        .is_some_and(|&start| consumed < start && start + 2 <= spaces_end)
+                    {
+                        wrap_padding_end = spaces_end;
+                        paragraph.text.push('\n');
+                    }
+                }
+                if consumed > wrap_padding_end {
+                    paragraph.text.push(' ');
+                }
+            }
+            _ => paragraph.text.push(hnc_char(code).unwrap_or('\u{fffd}')),
         }
         if consumed > char_count {
             return Err("invalid HWP 3.0 control character length".into());
         }
-        if replaces && code != 9 && text.len() > text_start {
-            let value = &text[text_start..];
-            if let Some(Hwp3Text::Text(last)) = lines[line].parts.last_mut() {
-                last.push_str(value);
+        if replaces && code != 9 && (code == 32 || paragraph.text.len() > text_start) {
+            let value = if code == 32 {
+                " "
             } else {
-                lines[line].parts.push(Hwp3Text::Text(value.into()));
+                &paragraph.text[text_start..]
+            };
+            if let Some(Hwp3Text::Text(last)) = lines[line].parts.last_mut()
+                && last.style == paragraph.style
+            {
+                last.text.push_str(value);
+            } else {
+                lines[line].parts.push(Hwp3Text::Text(Box::new(Run {
+                    text: value.into(),
+                    style: paragraph.style.clone(),
+                    ..Run::default()
+                })));
             }
         }
     }
-    flush_paragraph(&mut out, &mut runs, &mut text);
+    paragraph.flush(&mut out);
     if positioned {
         if replaces && !graphics.is_empty() {
             state
@@ -535,12 +603,11 @@ fn append_nested(
     depth: usize,
     state: &mut ParseState,
     out: &mut Vec<Block>,
-    runs: &mut Vec<Run>,
-    text: &mut String,
+    paragraph: &mut ParagraphText,
 ) -> Result<()> {
-    let nested = paragraph_list(cursor, depth + 1, state)?;
+    let nested = paragraph_list(cursor, depth + 1, state, false)?;
     if !nested.is_empty() {
-        flush_paragraph(out, runs, text);
+        paragraph.flush(out);
         out.extend(nested);
     }
     Ok(())
@@ -567,9 +634,9 @@ fn parse_box(
     }
     let mut contents = Vec::with_capacity(cell_count);
     for _ in 0..cell_count {
-        contents.push(paragraph_list(cursor, depth + 1, state)?);
+        contents.push(paragraph_list(cursor, depth + 1, state, kind == 0)?);
     }
-    let captions = paragraph_list(cursor, depth + 1, state)?;
+    let captions = paragraph_list(cursor, depth + 1, state, false)?;
 
     if kind == 0 && cell_count > 0 {
         let table = table_from_cells(&cells, contents)?;
@@ -731,17 +798,200 @@ fn table_grid(metadata: &[&[u8]]) -> Option<(usize, usize, Vec<CellLocation>)> {
     Some((columns, rows, locations))
 }
 
-fn flush_run(runs: &mut Vec<Run>, text: &mut String) {
-    if !text.is_empty() {
-        runs.push(Run::text(std::mem::take(text)));
+struct ParagraphShape<'a> {
+    data: Option<&'a [u8]>,
+    in_cell: bool,
+}
+
+impl ParagraphShape<'_> {
+    fn value(&self, offset: usize) -> u16 {
+        self.data.map_or(0, |data| {
+            u16::from_le_bytes([data[offset], data[offset + 1]])
+        })
+    }
+
+    fn left(&self) -> i32 {
+        i32::from(self.value(0))
+    }
+
+    fn indent(&self) -> i32 {
+        i32::from(self.value(4) as i16)
+    }
+
+    fn properties(&self, size: u16) -> Properties {
+        let mut props = Properties::new();
+        if self.in_cell {
+            for (key, offset) in [("margin-top", 183), ("margin-bottom", 8)] {
+                crate::formatting::points(
+                    &mut props,
+                    key,
+                    Some(f64::from(self.value(offset)) / 25.),
+                );
+            }
+            if let Some(size) = font_size(size) {
+                props.insert("font-size".into(), size);
+            }
+            let leading = self.value(6);
+            if leading > 0 {
+                let height = if leading & 0x8000 != 0 {
+                    format!("{}pt", f64::from(leading & 0x7fff) / 25.)
+                } else {
+                    format!("{leading}%")
+                };
+                props.insert("line-height".into(), height);
+            }
+        }
+        props
     }
 }
 
-fn flush_paragraph(out: &mut Vec<Block>, runs: &mut Vec<Run>, text: &mut String) {
-    flush_run(runs, text);
-    if !runs.is_empty() {
-        out.push(Block::flow(std::mem::take(runs)));
+#[derive(Default)]
+struct ParagraphText {
+    runs: Vec<Run>,
+    text: String,
+    style: Style,
+    properties: Properties,
+}
+
+impl ParagraphText {
+    fn flush_run(&mut self) {
+        if !self.text.is_empty() {
+            self.runs.push(Run {
+                text: std::mem::take(&mut self.text),
+                style: self.style.clone(),
+                ..Run::default()
+            });
+        }
     }
+
+    fn flush(&mut self, out: &mut Vec<Block>) {
+        self.flush_run();
+        if !self.runs.is_empty() {
+            out.push(Block::Paragraph {
+                heading: 0,
+                list: None,
+                runs: std::mem::take(&mut self.runs),
+                properties: self.properties.clone(),
+            });
+        }
+    }
+}
+
+fn font_size(size: u16) -> Option<String> {
+    (25..=10000)
+        .contains(&size)
+        .then(|| format!("{}pt", f64::from(size) / 25.))
+}
+
+fn char_style(data: &[u8]) -> Style {
+    let flags = data[26];
+    let palette = [
+        "#0000ff", "#00ff00", "#00ffff", "#ff0000", "#ff00ff", "#ffff00", "#ffffff",
+    ];
+    Style {
+        italic: flags & 1 != 0,
+        bold: flags & 2 != 0,
+        underline: flags & 4 != 0,
+        script: match flags & 0x60 {
+            0x20 => Some("sup".into()),
+            0x40 => Some("sub".into()),
+            _ => None,
+        },
+        color: data[24]
+            .checked_sub(1)
+            .and_then(|index| palette.get(usize::from(index)))
+            .map(|&color| color.into()),
+        size: font_size(u16::from_le_bytes([data[0], data[1]])),
+        ..Style::default()
+    }
+}
+
+const BULLET_GROUPS: [(char, char); 7] = [
+    ('□', '■'),
+    ('○', '●'),
+    ('◇', '◆'),
+    ('△', '▲'),
+    ('▽', '▼'),
+    ('◁', '◀'),
+    ('▷', '▶'),
+];
+
+fn classify_paragraphs(blocks: &mut [Block]) {
+    for block in blocks.iter_mut() {
+        if let Block::Paragraph {
+            runs,
+            list,
+            properties,
+            ..
+        } = block
+            && let Some((marker, prefix)) = structure::bullet_prefix(runs)
+            && structure::is_bullet(marker)
+        {
+            structure::remove_prefix(runs, prefix);
+            *list = Some(List {
+                ordered: false,
+                depth: 0,
+            });
+            properties.insert("list-marker".into(), marker.to_string());
+        }
+    }
+    if let Some(headings) = Headings::infer(blocks.iter(), HeadingEvidence::Hwp3) {
+        for block in blocks {
+            if let Block::Paragraph {
+                heading,
+                runs,
+                list: None,
+                ..
+            } = block
+            {
+                *heading = headings.level(runs).unwrap_or(0);
+            }
+        }
+    }
+}
+
+fn join_list_continuations(blocks: &mut Vec<Block>) {
+    if !blocks
+        .iter()
+        .any(|block| matches!(block, Block::Paragraph { list: Some(_), .. }))
+    {
+        return;
+    }
+    let mut joined = Vec::with_capacity(blocks.len());
+    for mut block in std::mem::take(blocks) {
+        if let (
+            Some(Block::Paragraph {
+                list: Some(_),
+                runs: previous,
+                ..
+            }),
+            Block::Paragraph {
+                heading: 0,
+                list: None,
+                runs,
+                ..
+            },
+        ) = (joined.last_mut(), &mut block)
+            && let Some(last) = previous.last_mut()
+            && !last
+                .text
+                .trim_end()
+                .ends_with(['.', '!', '?', '。', '！', '？'])
+            && let Some(first) = runs.first_mut()
+            && first.text.starts_with("    ")
+            && !first.text.trim().is_empty()
+        {
+            first
+                .text
+                .drain(..first.text.len() - first.text.trim_start_matches(' ').len());
+            last.text.truncate(last.text.trim_end_matches(' ').len());
+            previous.push(Run::text("\n"));
+            previous.append(runs);
+        } else {
+            joined.push(block);
+        }
+    }
+    *blocks = joined;
 }
 
 fn decode_hchar_array(data: &[u8]) -> String {
@@ -773,6 +1023,26 @@ fn hnc_char(code: u16) -> Option<char> {
         0x0086 => Some('„'),
         0x0087 => Some('‟'),
         0x0088..=0x00a0 => Some('\u{3000}'),
+        0x2f08 => Some('▪'),
+        0x2f11 | 0x2f14 => Some('◦'),
+        0x2f17 => Some('•'),
+        0x2f67 => Some('▸'),
+        0x2f00..=0x2f6f if code & 0xf < 9 => {
+            let (open, filled) = BULLET_GROUPS[usize::from((code - 0x2f00) >> 4)];
+            Some(if code & 0xf < 6 { open } else { filled })
+        }
+        0x3400 => Some('\u{3000}'),
+        0x3404 => Some('․'),
+        0x3401..=0x37bf => {
+            // HNC symbols are arranged in 96-column KS X 1001 rows,
+            // with the kana rows skipped in the last group.
+            let offset = code - 0x3400;
+            let row = offset / 96 + if offset / 96 == 9 { 0xa3 } else { 0xa1 };
+            let bytes = [row as u8, (offset % 96 + 0xa0) as u8];
+            let text =
+                encoding_rs::EUC_KR.decode_without_bom_handling_and_without_replacement(&bytes)?;
+            text.chars().next()
+        }
         0x420f => Some('軍'),
         0x4216 => Some('弓'),
         0x4584 => Some('名'),

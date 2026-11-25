@@ -1,4 +1,4 @@
-use crate::{formatting, model::*, output};
+use crate::{formatting, model::*, output, structure};
 use std::{borrow::Cow, collections::HashSet, fmt::Write, ops::Range};
 pub fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -160,12 +160,12 @@ impl<'a> MarkdownEscaper<'a> {
     fn new(source: &'a str, context: MarkdownContext, runs: &[Run]) -> Self {
         let mut markup_edges = Vec::new();
         let mut offset = 0;
-        for run in runs {
-            let plain = markdown_plain(run);
+        for group in runs.chunk_by(same_markdown_style) {
+            let plain = markdown_plain(&group[0]);
             if !plain {
                 markup_edges.push(offset);
             }
-            offset += run.text.len();
+            offset += group.iter().map(|run| run.text.len()).sum::<usize>();
             if !plain {
                 markup_edges.push(offset);
             }
@@ -346,16 +346,27 @@ fn html_image(alt: &str, src: &str, path: &str, layout: &ImageGeometry) -> Strin
     }
 }
 
+fn markdown_text(run: &Run) -> bool {
+    run.link.is_none() && run.image.is_none() && run.latex.is_none() && run.mathml.is_none()
+}
+
 fn markdown_plain(run: &Run) -> bool {
     !run.style.bold
         && !run.style.italic
         && !run.style.strike
         && !run.style.underline
         && run.style.script.is_none()
-        && run.link.is_none()
-        && run.image.is_none()
-        && run.latex.is_none()
-        && run.mathml.is_none()
+        && markdown_text(run)
+}
+
+fn same_markdown_style(a: &Run, b: &Run) -> bool {
+    markdown_text(a)
+        && markdown_text(b)
+        && a.style.bold == b.style.bold
+        && a.style.italic == b.style.italic
+        && a.style.strike == b.style.strike
+        && a.style.underline == b.style.underline
+        && a.style.script == b.style.script
 }
 
 fn runs(
@@ -375,7 +386,7 @@ fn runs(
     let mut out = String::new();
     let mut at_margin = true;
     let mut offset = 0;
-    for group in items.chunk_by(|a, b| !html && markdown_plain(a) && markdown_plain(b)) {
+    for group in items.chunk_by(|a, b| !html && same_markdown_style(a, b)) {
         let r = &group[0];
         let mut t = match &mut markdown {
             None => escape(&r.text).replace('\n', "<br>"),
@@ -528,7 +539,7 @@ fn hwp3_page(out: &mut String, paper: [i32; 2], page: &Hwp3Page, links: &Propert
     }
     for line in &page.lines {
         if line.parts.iter().all(|p| match p {
-            Hwp3Text::Text(t) => t.trim().is_empty(),
+            Hwp3Text::Text(run) => run.text.trim().is_empty(),
             Hwp3Text::Tab(_) => true,
         }) {
             continue;
@@ -542,7 +553,18 @@ fn hwp3_page(out: &mut String, paper: [i32; 2], page: &Hwp3Page, links: &Propert
         )?;
         for part in parts {
             match part {
-                Hwp3Text::Text(value) => out.push_str(&escape(value)),
+                Hwp3Text::Text(run) => {
+                    let mut run = (**run).clone();
+                    run.style.size = run
+                        .style
+                        .size
+                        .as_deref()
+                        .and_then(formatting::length_in_points)
+                        .map(|pt| pt * 25. / f64::from(*size))
+                        .filter(|scale| (*scale - 1.).abs() > f64::EPSILON)
+                        .map(|scale| format!("{scale}em"));
+                    out.push_str(&runs(std::slice::from_ref(&run), None, links, true));
+                }
                 Hwp3Text::Tab(width) => write!(
                     out,
                     "<span style=\"display:inline-block;width:{width}px\"></span>"
@@ -696,10 +718,11 @@ fn paragraph_css(props: &Properties, preserve_space: bool, left: Option<f32>) ->
         "margin-bottom",
         "text-indent",
         "line-height",
+        "font-size",
     ] {
         if let Some(value) = props
             .get(key)
-            .and_then(|v| formatting::length(v, key != "line-height"))
+            .and_then(|v| formatting::length(v, !matches!(key, "line-height" | "font-size")))
         {
             write!(css, "{key}:{value};")?;
         }
@@ -711,6 +734,13 @@ fn paragraph_css(props: &Properties, preserve_space: bool, left: Option<f32>) ->
         && matches!(writing_mode.as_str(), "vertical-rl" | "vertical-lr")
     {
         write!(css, "writing-mode:{writing_mode};")?;
+    }
+    if let Some(marker) = props.get("list-marker")
+        && let Some(c) = marker.chars().next()
+        && marker.len() == c.len_utf8()
+        && structure::is_bullet(c)
+    {
+        write!(css, "list-style-type:'{c} ';")?;
     }
     Ok(css)
 }
@@ -838,7 +868,7 @@ fn html_table(
                             format!("h{}", (*heading).min(6))
                         };
                         let css = paragraph_css(properties, false, None)?;
-                        writeln!(
+                        write!(
                             out,
                             "<{elem}{} style=\"{css}\">{}</{elem}>",
                             direction(properties),
@@ -855,7 +885,7 @@ fn html_table(
         }
         out.push_str("</tr>\n")
     }
-    out.push_str("</table>\n");
+    out.push_str(if styled { "</table>" } else { "</table>\n" });
     Ok(())
 }
 
@@ -944,6 +974,22 @@ fn csv(doc: &Document) -> Result<String> {
     Ok(out)
 }
 
+fn markdown_bullet(blocks: &[Block], index: usize, runs: &[Run]) -> Option<usize> {
+    let (marker, prefix) = structure::bullet_prefix(runs)?;
+    if structure::is_bullet(marker) {
+        return Some(prefix);
+    }
+    // Matching adjacent items distinguish a typed marker from punctuation.
+    [index.wrapping_sub(1), index + 1]
+        .into_iter()
+        .any(|neighbor| {
+            matches!(blocks.get(neighbor), Some(Block::Paragraph {
+                heading: 0, list: None, runs, ..
+            }) if structure::bullet_prefix(runs).is_some_and(|(c, _)| c == marker))
+        })
+        .then_some(prefix)
+}
+
 pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> Result<String> {
     if !matches!(mode, "semantic" | "layout" | "hybrid") {
         return Err("mode must be semantic, layout or hybrid".into());
@@ -958,6 +1004,15 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
     if !html && format != "md" {
         return Err("format must be md, html, json or csv".into());
     }
+    let markdown_structure = !html && !matches!(doc.format.as_str(), "xls" | "xlsx" | "ods");
+    let headings = if markdown_structure {
+        structure::Headings::infer(
+            doc.sections.iter().flat_map(|section| &section.blocks),
+            structure::HeadingEvidence::Formatted,
+        )
+    } else {
+        None
+    };
     let embedded;
     let links = if html && links.is_empty() && !doc.assets.is_empty() {
         embedded = output::inline(doc, links)?;
@@ -1064,6 +1119,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             .unwrap_or(0.);
         let mut html_list = None;
         let mut in_list = false;
+        let mut list_indents = Vec::<usize>::new();
         let mut pages = s
             .hwp3_layout
             .as_ref()
@@ -1144,21 +1200,53 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                     if let Some(anchor) = properties.get("anchor") {
                         writeln!(out, "<a id=\"{}\"></a>", escape(anchor))?
                     }
+                    let bullet = if markdown_structure && *heading == 0 && list.is_none() {
+                        markdown_bullet(&s.blocks, index, items)
+                    } else {
+                        None
+                    };
+                    let mut stripped;
+                    let items = if let Some(prefix) = bullet {
+                        stripped = items.clone();
+                        structure::remove_prefix(&mut stripped, prefix);
+                        &stripped
+                    } else {
+                        items
+                    };
+                    let inferred_list = bullet.map(|_| List {
+                        ordered: false,
+                        depth: 0,
+                    });
+                    let heading = if *heading == 0 && list.is_none() && inferred_list.is_none() {
+                        headings.as_ref().and_then(|h| h.level(items)).unwrap_or(0)
+                    } else {
+                        *heading
+                    };
+                    let list = if html || heading == 0 {
+                        list.as_ref().or(inferred_list.as_ref())
+                    } else {
+                        None
+                    };
                     let use_html = html
-                        || (mode == "layout" && list.is_none() && *heading == 0)
-                        || (mode == "hybrid"
-                            && (properties.contains_key("dir")
-                                || properties.contains_key("writing-mode")));
-                    let context = if *heading > 0 && list.is_none() {
+                        || (list.is_none()
+                            && heading == 0
+                            && (mode == "layout"
+                                || (mode == "hybrid"
+                                    && (properties.contains_key("dir")
+                                        || properties.contains_key("writing-mode")))));
+                    let context = if heading > 0 && list.is_none() {
                         MarkdownContext::Heading
                     } else {
                         MarkdownContext::Block
                     };
                     let val = runs(items, (!use_html).then_some(context), links, html);
+                    if !html && in_list && list.is_none() {
+                        out.push('\n');
+                    }
                     if use_html {
                         previous_pdf_line = None;
-                        let elem = if *heading > 0 {
-                            format!("h{}", heading.clamp(&1, &6))
+                        let elem = if heading > 0 {
+                            format!("h{}", heading.clamp(1, 6))
                         } else {
                             "p".into()
                         };
@@ -1168,32 +1256,28 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                             (mode == "layout").then_some(left),
                         )?;
                         let dir = direction(properties);
-                        if let Some(l) = list {
-                            let t = if l.ordered { "ol" } else { "ul" };
-                            if html {
-                                writeln!(out, "<li{dir} style=\"{attrs}\">{val}</li>")?
-                            } else {
-                                writeln!(out, "<{t}><li>{val}</li></{t}>")?
-                            }
+                        if list.is_some() {
+                            writeln!(out, "<li{dir} style=\"{attrs}\">{val}</li>")?;
                         } else {
                             writeln!(out, "<{elem}{dir} style=\"{attrs}\">{val}</{elem}>\n")?
                         }
                     } else if let Some(l) = list {
                         previous_pdf_line = None;
+                        list_indents.truncate(l.depth.min(32));
+                        let indent: usize = list_indents.iter().sum();
+                        let marker = if l.ordered { "1. " } else { "- " };
+                        list_indents.push(marker.len());
                         writeln!(
                             out,
-                            "{}{} {val}",
-                            "  ".repeat(l.depth.min(32)),
-                            if l.ordered { "1." } else { "-" }
+                            "{}{marker}{}",
+                            " ".repeat(indent),
+                            val.replace('\n', &format!("\n{}", " ".repeat(indent + marker.len())))
                         )?
                     } else {
-                        if in_list {
-                            out.push('\n')
+                        if heading > 0 {
+                            write!(out, "{} ", "#".repeat(heading.min(6) as usize))?
                         }
-                        if *heading > 0 {
-                            write!(out, "{} ", "#".repeat((*heading).min(6) as usize))?
-                        }
-                        if doc.format == "pdf" && *heading == 0 {
+                        if doc.format == "pdf" && heading == 0 {
                             let y = pdf_baseline(properties);
                             let size = pdf_font_size(items);
                             let adjacent = y.is_some_and(|y| {
@@ -1215,10 +1299,17 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                         }
                     }
                     in_list = list.is_some();
+                    if !in_list {
+                        list_indents.clear();
+                    }
                 }
                 Block::Table { rows } => {
                     previous_pdf_line = None;
+                    if !html && in_list {
+                        out.push('\n');
+                    }
                     in_list = false;
+                    list_indents.clear();
                     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
                     if width == 0 {
                         continue;

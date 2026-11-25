@@ -8,11 +8,12 @@ pub struct Rules {
     pub table_cells: HashMap<String, Properties>,
     pub table_display: HashMap<String, String>,
     pub hwpx_borders: HashMap<String, Properties>,
+    pub hwpx_lists: HashMap<String, List>,
     pub table_bytes: std::rc::Rc<std::cell::Cell<usize>>,
     pub objects: HashMap<String, Run>,
     pub styles: HashMap<String, Style>,
     pub headings: HashMap<String, u8>,
-    pub numbers: HashMap<String, bool>,
+    pub numbers: HashMap<String, HashMap<usize, Option<bool>>>,
     pub rels: HashMap<String, String>,
     pub images: HashMap<String, String>,
     pub css: HashMap<String, String>,
@@ -396,6 +397,11 @@ impl Flow<'_> {
     }
     pub fn paragraph(&self, n: N) -> Result<Block> {
         let ppr = child(n, "pPr");
+        let hwpx_style = if self.kind == "hwpx" {
+            attr(n, "paraPrIDRef")
+        } else {
+            None
+        };
         let style_id = ppr
             .and_then(|p| child(p, "pStyle"))
             .and_then(|s| attr(s, "val"))
@@ -416,8 +422,8 @@ impl Flow<'_> {
             ppr.and_then(|p| child(p, "outlineLvl"))
                 .and_then(|s| attr(s, "val"))
                 .and_then(|n| n.parse::<u8>().ok())
-                .filter(|x| *x < 6)
-                .map(|x| x + 1)
+                .map(|x| if x < 9 { (x + 1).min(6) } else { 0 })
+                .or_else(|| hwpx_style.and_then(|id| self.rules.headings.get(id).copied()))
                 .or_else(|| self.rules.headings.get(style_id).copied())
                 .or_else(|| {
                     style_id
@@ -433,26 +439,34 @@ impl Flow<'_> {
             .filter(|v| matches!(tag(*v), "ol" | "ul" | "list"))
             .collect();
         let list = if let Some(l) = lists.first() {
+            let depth = lists.len() - 1;
+            let ordered = lists
+                .iter()
+                .find_map(|n| attr(*n, "style-name"))
+                .and_then(|id| self.rules.numbers.get(id))
+                .and_then(|levels| levels.get(&depth).or_else(|| levels.get(&0)))
+                .copied()
+                .flatten()
+                .unwrap_or(false);
             Some(List {
-                depth: lists.len() - 1,
-                ordered: tag(*l) == "ol"
-                    || attr(*l, "style-name")
-                        .and_then(|s| self.rules.numbers.get(s))
-                        .copied()
-                        .unwrap_or(false),
+                depth,
+                ordered: tag(*l) == "ol" || ordered,
             })
         } else if let Some(p) = num {
-            Some(List {
-                ordered: child(p, "numId")
-                    .and_then(|n| attr(n, "val"))
-                    .and_then(|v| self.rules.numbers.get(v))
+            let depth = child(p, "ilvl")
+                .and_then(|n| attr(n, "val"))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let id = child(p, "numId").and_then(|n| attr(n, "val"));
+            if id == Some("0") {
+                None
+            } else {
+                id.and_then(|id| self.rules.numbers.get(id))
+                    .and_then(|levels| levels.get(&depth).or_else(|| levels.get(&0)))
                     .copied()
-                    .unwrap_or(false),
-                depth: child(p, "ilvl")
-                    .and_then(|n| attr(n, "val"))
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0),
-            })
+                    .unwrap_or(Some(false))
+                    .map(|ordered| List { depth, ordered })
+            }
         } else if ppr
             .is_some_and(|p| child(p, "buChar").is_some() || child(p, "buAutoNum").is_some())
         {
@@ -464,7 +478,7 @@ impl Flow<'_> {
                     .unwrap_or(0),
             })
         } else {
-            None
+            hwpx_style.and_then(|id| self.rules.hwpx_lists.get(id).cloned())
         };
         let mut props = self
             .rules

@@ -255,7 +255,7 @@ pub(crate) struct Hwp3Line {
 }
 
 pub(crate) enum Hwp3Text {
-    Text(String),
+    Text(Box<Run>),
     Tab(u16),
 }
 impl Section {

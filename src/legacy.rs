@@ -154,7 +154,7 @@ fn hwp_record<'a>(raw: &mut &'a [u8]) -> Result<HwpRecord<'a>> {
 #[derive(Default)]
 struct HwpFormatting {
     borders: Vec<Properties>,
-    alignments: Vec<Option<&'static str>>,
+    paragraphs: Vec<u32>,
     characters: Vec<Style>,
 }
 
@@ -252,21 +252,12 @@ impl HwpFormatting {
                         ..Style::default()
                     });
                 }
-                25 if styles.alignments.len() <= u16::MAX as usize => {
-                    styles
-                        .alignments
-                        .push(
-                            record
-                                .data
-                                .first()
-                                .and_then(|flags| match (flags >> 2) & 7 {
-                                    0 | 4 | 5 => Some("justify"),
-                                    1 => Some("left"),
-                                    2 => Some("right"),
-                                    3 => Some("center"),
-                                    _ => None,
-                                }),
-                        );
+                25 if styles.paragraphs.len() <= u16::MAX as usize => {
+                    styles.paragraphs.push(
+                        u32le(record.data, 0).unwrap_or_else(|_| {
+                            u32::from(record.data.first().copied().unwrap_or(0))
+                        }),
+                    );
                 }
                 _ => {}
             }
@@ -485,11 +476,36 @@ fn hwp_block<'a>(
                 let runs = hwp_runs(text?.data, shapes, &styles.characters)?;
                 if !runs.is_empty() {
                     let mut block = Block::flow(runs);
-                    if let Block::Paragraph { properties, .. } = &mut block
+                    if let Block::Paragraph {
+                        heading,
+                        list,
+                        properties,
+                        ..
+                    } = &mut block
                         && let Ok(index) = u16le(record.data, 8)
-                        && let Some(Some(align)) = styles.alignments.get(usize::from(index))
+                        && let Some(&flags) = styles.paragraphs.get(usize::from(index))
                     {
-                        properties.insert("align".into(), (*align).into());
+                        let align = match (flags >> 2) & 7 {
+                            0 | 4 | 5 => Some("justify"),
+                            1 => Some("left"),
+                            2 => Some("right"),
+                            3 => Some("center"),
+                            _ => None,
+                        };
+                        if let Some(align) = align {
+                            properties.insert("align".into(), align.into());
+                        }
+                        let level = ((flags >> 25) & 7) as u8;
+                        match (flags >> 23) & 3 {
+                            1 => *heading = (level + 1).min(6),
+                            kind @ (2 | 3) => {
+                                *list = Some(List {
+                                    ordered: kind == 2,
+                                    depth: usize::from(level),
+                                });
+                            }
+                            _ => {}
+                        }
                     }
                     out.push(block);
                 }
@@ -722,6 +738,7 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     let mut doc = Document::new("doc");
     let mut sec = Section::new("section", "WordDocument");
     let mut line = String::new();
+    let mut line_pap = None;
     let mut fields = Vec::new();
     let mut index = 1;
     let mut selected = range.is_none_or(|r| r.contains(index));
@@ -757,7 +774,7 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
         }
         // Paragraph properties are keyed by file offset, so the offset has to
         // follow every character of the piece.
-        let mut offset = pos;
+        let mut offset = if compressed { pos / 2 } else { pos };
         for c in text.chars() {
             let pap = word_pap_at(&paps, offset);
             offset += if compressed { 1 } else { c.len_utf16() * 2 };
@@ -782,7 +799,7 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
                         sec.blocks.push(block);
                     }
                     if selected {
-                        sec.paragraph(std::mem::take(&mut line));
+                        word_paragraph(&mut sec, std::mem::take(&mut line), line_pap.take());
                         doc.sections.push(sec.indexed(index - 1));
                         sec = Section::new("section", "WordDocument");
                     }
@@ -794,15 +811,18 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
                 }
                 _ if !selected => {}
                 _ if tables.enter_table(pap) => {
-                    sec.paragraph(std::mem::take(&mut line));
+                    word_paragraph(&mut sec, std::mem::take(&mut line), line_pap.take());
                     tables.push(c, pap);
                 }
                 _ => {
                     for block in tables.finish() {
                         sec.blocks.push(block);
                     }
+                    line_pap = pap.or(line_pap);
                     match c {
-                        '\r' | '\u{7}' => sec.paragraph(std::mem::take(&mut line)),
+                        '\r' | '\u{7}' => {
+                            word_paragraph(&mut sec, std::mem::take(&mut line), line_pap.take())
+                        }
                         '\u{b}' => line.push('\n'),
                         '\t' => line.push('\t'),
                         _ if !c.is_control() => line.push(c),
@@ -819,19 +839,34 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
         for block in tables.finish() {
             sec.blocks.push(block);
         }
-        sec.paragraph(line);
+        word_paragraph(&mut sec, line, line_pap);
         doc.sections.push(sec.indexed(index - 1));
     }
     Ok(doc)
 }
 
-/// Paragraph properties that Word 97–2003 keeps out of the text stream, in
-/// 512-byte property pages. Only the properties that describe table structure
-/// are read.
+fn word_paragraph(section: &mut Section, text: String, pap: Option<&WordPap>) {
+    if !text.is_empty() {
+        let heading = pap.map_or(0, |pap| match pap.style {
+            1..=9 => pap.style.min(6) as u8,
+            _ => pap.outline,
+        });
+        section.blocks.push(Block::Paragraph {
+            heading,
+            list: None,
+            runs: vec![Run::text(text)],
+            properties: Properties::new(),
+        });
+    }
+}
+
+/// Outline and table properties from Word 97–2003 paragraph property pages.
 #[derive(Default)]
 struct WordPap {
     /// File offset where the paragraph described by this entry ends.
     fc_end: usize,
+    style: u16,
+    outline: u8,
     in_table: bool,
     ttp: bool,
     inner_ttp: bool,
@@ -957,7 +992,7 @@ fn word_pap(record: &[u8], table: &[u8], pap: &mut WordPap) {
         .get(start..)
         .map(|b| &b[..len.min(b.len())])
         .unwrap_or_default();
-    // The style index precedes the modifiers.
+    pap.style = u16le(grpprl, 0).unwrap_or_default();
     word_sprms(grpprl.get(2..).unwrap_or_default(), table, pap, 0);
 }
 
@@ -1000,6 +1035,12 @@ fn word_sprms(mut b: &[u8], table: &[u8], pap: &mut WordPap, depth: usize) {
             0x2416 => pap.in_table = data.first().is_some_and(|v| *v != 0),
             0x2417 => pap.ttp = data.first().is_some_and(|v| *v != 0),
             0x244c => pap.inner_ttp = data.first().is_some_and(|v| *v != 0),
+            0x2640 => {
+                pap.outline = data
+                    .first()
+                    .filter(|&&level| level < 9)
+                    .map_or(0, |&level| (level + 1).min(6));
+            }
             0x6646 => word_huge_papx(data, table, pap, depth),
             0x6649 => {
                 if let Some(v) = data.get(..4) {
@@ -1508,14 +1549,22 @@ fn children(mut b: &[u8]) -> impl Iterator<Item = Result<Record<'_>>> {
         Some(res)
     })
 }
-fn ppt_text(r: &Record, sec: &mut Section) -> Result<()> {
+fn ppt_title(r: &Record) -> bool {
+    matches!(u32le(r.body, 0), Ok(0 | 6))
+}
+
+fn ppt_text(r: &Record, sec: &mut Section, title: bool) -> Result<()> {
     let s = if r.kind == 4000 {
         utf16(r.body)?
     } else {
         r.body.iter().map(|b| char::from(*b)).collect()
     };
+    let first = sec.blocks.len();
     for line in s.split('\r') {
         sec.paragraph(line.replace('\u{b}', "\n"))
+    }
+    if title && let Some(Block::Paragraph { heading, .. }) = sec.blocks.get_mut(first) {
+        *heading = 1;
     }
     Ok(())
 }
@@ -1523,10 +1572,13 @@ fn shape_text(b: &[u8], sec: &mut Section, depth: usize) -> Result<()> {
     if depth > 64 {
         return Err("PPT record depth limit exceeded".into());
     }
+    let mut title = false;
     for r in children(b) {
         let r = r?;
-        if matches!(r.kind, 4000 | 4008) {
-            ppt_text(&r, sec)?
+        if r.kind == 3999 {
+            title = ppt_title(&r);
+        } else if matches!(r.kind, 4000 | 4008) {
+            ppt_text(&r, sec, std::mem::take(&mut title))?
         } else if r.container || r.kind == 0xf00d {
             shape_text(r.body, sec, depth + 1)?
         }
@@ -1588,16 +1640,20 @@ fn ppt(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     for r in children(d.body) {
         let r = r?;
         if r.kind == 4080 && r.instance == 0 {
+            let mut title = false;
             for item in children(r.body) {
                 let item = item?;
                 if item.kind == 1011 {
+                    title = false;
                     let id = u32le(item.body, 0)?;
                     slides.push((id, Section::new("slide", format!("persist:{id}"))))
+                } else if item.kind == 3999 {
+                    title = ppt_title(&item);
                 } else if matches!(item.kind, 4000 | 4008)
                     && range.is_none_or(|r| r.contains(slides.len()))
                     && let Some((_, s)) = slides.last_mut()
                 {
-                    ppt_text(&item, s)?
+                    ppt_text(&item, s, std::mem::take(&mut title))?
                 }
             }
         }
@@ -1631,6 +1687,42 @@ fn ppt(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_paragraphs_preserve_builtin_and_direct_outline_levels() {
+        let mut section = Section::default();
+        for (style, outline, title) in [(2, 0, "Built-in"), (12, 4, "Direct"), (12, 9, "Body")] {
+            let mut pap = WordPap::default();
+            word_pap(&record(&[style, 0, 0x40, 0x26, outline]), &[], &mut pap);
+            word_paragraph(&mut section, title.into(), Some(&pap));
+        }
+        let mut doc = Document::new("doc");
+        doc.sections.push(section);
+        let md = crate::render::render(&doc, "md", "semantic", &Properties::new()).unwrap();
+        assert_eq!(md, "## Built-in\n\n##### Direct\n\nBody\n\n");
+    }
+
+    #[test]
+    fn powerpoint_title_text_records_become_headings() {
+        let mut content = Vec::new();
+        for (kind, data) in [
+            (3999u16, &6u32.to_le_bytes()[..]),
+            (4008, b"PPT title"),
+            (3999, &1u32.to_le_bytes()[..]),
+            (4008, b"Body"),
+        ] {
+            content.extend([0, 0]);
+            content.extend(kind.to_le_bytes());
+            content.extend((data.len() as u32).to_le_bytes());
+            content.extend(data);
+        }
+        let mut section = Section::default();
+        shape_text(&content, &mut section, 0).unwrap();
+        let mut doc = Document::new("ppt");
+        doc.sections.push(section);
+        let md = crate::render::render(&doc, "md", "semantic", &Properties::new()).unwrap();
+        assert_eq!(md, "# PPT title\n\nBody\n\n");
+    }
 
     /// One property record with a style index and the given modifiers, as a
     /// property page stores it.

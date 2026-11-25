@@ -61,13 +61,18 @@ fn read_styles(root: N, rules: &mut Rules, odf: bool) -> Result<()> {
             let parent = attr(n, "parent-style-name")
                 .or_else(|| child(n, "basedOn").and_then(|c| attr(c, "val")));
             raw.insert(id, (parent, n));
-            if let Some(h) = desc(n, "outlineLvl")
-                .next()
-                .and_then(|c| attr(c, "val"))
-                .and_then(|v| v.parse::<u8>().ok())
-                .filter(|v| *v < 6)
+            if let Some(h) = attr(n, "default-outline-level")
+                .and_then(|level| level.parse::<u8>().ok())
+                .filter(|&level| level > 0)
+                .or_else(|| {
+                    desc(n, "outlineLvl")
+                        .next()
+                        .and_then(|c| attr(c, "val"))
+                        .and_then(|v| v.parse::<u8>().ok())
+                        .map(|level| if level < 9 { level + 1 } else { 0 })
+                })
             {
-                rules.headings.insert(id.into(), h + 1);
+                rules.headings.insert(id.into(), h.min(6));
             }
         }
     }
@@ -168,13 +173,34 @@ fn read_styles(root: N, rules: &mut Rules, odf: bool) -> Result<()> {
     }
     for n in desc(root, "list-style") {
         if let Some(id) = attr(n, "name") {
-            rules
-                .numbers
-                .insert(id.into(), child(n, "list-level-style-number").is_some());
+            let levels = n.children().filter_map(|definition| {
+                let ordered = match tag(definition) {
+                    "list-level-style-number" => true,
+                    "list-level-style-bullet" | "list-level-style-image" => false,
+                    _ => return None,
+                };
+                let level = attr(definition, "level")
+                    .and_then(|level| level.parse::<usize>().ok())
+                    .unwrap_or(1);
+                Some((level.saturating_sub(1), Some(ordered)))
+            });
+            rules.numbers.insert(id.into(), levels.collect());
         }
     }
     Ok(())
 }
+fn word_number_level(node: N) -> Option<(usize, Option<bool>)> {
+    if tag(node) != "lvl" {
+        return None;
+    }
+    let level = attr(node, "ilvl")?
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n < 9)?;
+    let kind = attr(child(node, "numFmt")?, "val")?;
+    Some((level, (kind != "none").then_some(kind != "bullet")))
+}
+
 fn ooxml(
     pkg: &mut Package,
     main: &str,
@@ -203,22 +229,29 @@ fn ooxml(
             if let Some(p) = types.get("numbering") {
                 let s = pkg.text(p)?;
                 let x = xml(&s)?;
-                let defs: HashMap<_, _> = desc(x.root(), "abstractNum")
+                let defs: HashMap<_, HashMap<_, _>> = desc(x.root(), "abstractNum")
                     .filter_map(|v| {
                         Some((
                             attr(v, "abstractNumId")?,
-                            attr(desc(v, "numFmt").next()?, "val")? != "bullet",
+                            v.children().filter_map(word_number_level).collect(),
                         ))
                     })
                     .collect();
                 for v in desc(x.root(), "num") {
-                    if let (Some(id), Some(val)) = (
-                        attr(v, "numId"),
-                        child(v, "abstractNumId")
+                    if let Some(id) = attr(v, "numId") {
+                        let mut levels = child(v, "abstractNumId")
                             .and_then(|c| attr(c, "val"))
-                            .and_then(|k| defs.get(k)),
-                    ) {
-                        rules.numbers.insert(id.into(), *val);
+                            .and_then(|k| defs.get(k))
+                            .cloned()
+                            .unwrap_or_default();
+                        for override_level in v.children().filter(|n| tag(*n) == "lvlOverride") {
+                            if let Some((level, kind)) =
+                                child(override_level, "lvl").and_then(word_number_level)
+                            {
+                                levels.insert(level, kind);
+                            }
+                        }
+                        rules.numbers.insert(id.into(), levels);
                     }
                 }
             }
@@ -764,6 +797,33 @@ fn hwpx(pkg: &mut Package, range: Option<&SectionRange>) -> Result<Document> {
                 let mut props = Properties::new();
                 if let Some(align) = child(n, "align").and_then(|n| attr(n, "horizontal")) {
                     props.insert("align".into(), align.into());
+                }
+                if let Some(head) = child(n, "heading").or_else(|| {
+                    child(n, "switch")
+                        .and_then(|switch| {
+                            child(switch, "case").or_else(|| child(switch, "default"))
+                        })
+                        .and_then(|branch| child(branch, "heading"))
+                }) {
+                    let level = attr(head, "level")
+                        .and_then(|level| level.parse::<u8>().ok())
+                        .unwrap_or(0)
+                        .min(7);
+                    match attr(head, "type") {
+                        Some("OUTLINE") => {
+                            rules.headings.insert(id.into(), (level + 1).min(6));
+                        }
+                        Some(kind @ ("NUMBER" | "BULLET")) => {
+                            rules.hwpx_lists.insert(
+                                id.into(),
+                                List {
+                                    ordered: kind == "NUMBER",
+                                    depth: usize::from(level),
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 rules.paragraph_styles.insert(id.into(), props);
             }
