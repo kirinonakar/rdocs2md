@@ -7,16 +7,22 @@ pub fn escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// A `<` needs escaping only when it can start an HTML tag or an autolink, which
-/// always continues with an ASCII letter, digit or tag punctuation. Labels such
-/// as `<보기>`, `<보 기>` and `<A>` are plain text in Korean exam papers, and font
-/// changes split one label into several runs, so a trailing `<` is also plain.
+/// Escape markup while preserving literal labels such as `<보기>` and `<100점>`.
+/// A trailing `<` is plain text when a style change splits a label across runs.
 fn potential_markup(tail: &str) -> bool {
     let mut chars = tail.chars();
     let Some(first) = chars.next() else {
         return false;
     };
-    if !(first.is_ascii_alphanumeric() || matches!(first, '/' | '!' | '?')) {
+    if first.is_ascii_digit() {
+        // Only an email autolink can begin with a digit.
+        return tail
+            .split(|c: char| !c.is_ascii_graphic() || c == '<')
+            .next()
+            .and_then(|token| token.split_once('>'))
+            .is_some_and(|(address, _)| address.contains('@'));
+    }
+    if !(first.is_ascii_alphabetic() || matches!(first, '/' | '!' | '?')) {
         return false;
     }
     // A short all-uppercase label cannot be a tag name.
@@ -1482,6 +1488,8 @@ mod tests {
     #[test]
     fn labels_keep_literal_angle_brackets() {
         assert_eq!(markdown("<보기>는"), "<보기>는");
+        assert_eq!(markdown("<100점 만점 기준>"), "<100점 만점 기준>");
+        assert_eq!(markdown("<1~3>과 <42>"), "<1~3>과 <42>");
         assert_eq!(markdown("<"), "<");
         assert_eq!(markdown(">"), ">");
         assert_eq!(markdown("고개 > 고개"), "고개 > 고개");
@@ -1492,6 +1500,7 @@ mod tests {
     fn markup_is_still_escaped() {
         assert_eq!(markdown("<div>"), "\\<div>");
         assert_eq!(markdown("<https://example.com>"), "\\<https://example.com>");
+        assert_eq!(markdown("<123@example.com>"), "\\<123@example.com>");
     }
 
     #[test]
