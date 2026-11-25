@@ -1,8 +1,8 @@
 use crate::{formatting, model::*};
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
-    io::{Cursor, Read},
+    collections::{BTreeSet, HashMap, HashSet},
+    io::{Cursor, Read, Seek, SeekFrom},
 };
 type Ole<'a> = cfb::CompoundFile<Cursor<&'a [u8]>>;
 pub fn u16le(b: &[u8], i: usize) -> Result<u16> {
@@ -733,7 +733,17 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     }
     let clx = p + 2 + 33 * 8;
     // Table structure lives in paragraph properties, outside the text stream.
-    let paps = word_paps(&data, &table, p + 2, pairs);
+    let mut extra = ole.open_stream("/Data").ok();
+    let paps = word_paps(&data, &table, p + 2, &mut |offset| {
+        let extra = extra.as_mut()?;
+        extra.seek(SeekFrom::Start(offset)).ok()?;
+        let mut len = [0; 2];
+        extra.read_exact(&mut len).ok()?;
+        let mut grpprl = vec![0; usize::from(u16::from_le_bytes(len))];
+        extra.read_exact(&mut grpprl).ok()?;
+        Some(grpprl)
+    });
+    drop(extra);
     let ttp = paps.iter().any(|p| p.ttp || p.inner_ttp);
     let off = u32le(&data, clx)? as usize;
     let len = u32le(&data, clx + 4)? as usize;
@@ -879,23 +889,26 @@ fn word_paragraph(section: &mut Section, text: String, pap: Option<&WordPap>) {
 /// Outline and table properties from Word 97–2003 paragraph property pages.
 #[derive(Default)]
 struct WordPap {
-    /// File offset where the paragraph described by this entry ends.
+    fc_start: usize,
     fc_end: usize,
     style: u16,
     outline: u8,
     in_table: bool,
     ttp: bool,
+    inner_cell: bool,
     inner_ttp: bool,
     itap: usize,
+    align: Option<&'static str>,
     tap: Option<WordTap>,
-    edges: Option<[Option<String>; 6]>,
+    edges: Option<[Option<WordBorder>; 6]>,
+    row_height: u16,
 }
 
 /// Cell definitions of one table row: the `rgdxaCenter` column boundaries in
-/// points followed by one descriptor per grid column.
+/// twips followed by one descriptor per grid column.
 #[derive(Clone, Default)]
 struct WordTap {
-    bounds: Vec<f32>,
+    bounds: Vec<i16>,
     cells: Vec<WordTc>,
 }
 
@@ -905,7 +918,11 @@ struct WordTc {
     merged: bool,
     vert_merge: bool,
     vert_restart: bool,
-    borders: [Option<String>; 4],
+    vertical_align: Option<&'static str>,
+    borders: [Option<WordBorder>; 4],
+    border_colors: [Option<String>; 4],
+    padding: [Option<u16>; 4],
+    fill: Option<String>,
 }
 
 impl WordTap {
@@ -934,13 +951,17 @@ impl WordTap {
 
 fn word_pap_at(paps: &[WordPap], fc: usize) -> Option<&WordPap> {
     paps.get(paps.partition_point(|p| p.fc_end <= fc))
+        .filter(|p| p.fc_start <= fc)
 }
 
-fn word_paps(data: &[u8], table: &[u8], base: usize, pairs: usize) -> Vec<WordPap> {
+fn word_paps(
+    data: &[u8],
+    table: &[u8],
+    base: usize,
+    extra: &mut impl FnMut(u64) -> Option<Vec<u8>>,
+) -> Vec<WordPap> {
     let mut paps = Vec::new();
-    if pairs >= 14 {
-        word_papx(data, table, base, &mut paps);
-    }
+    word_papx(data, table, base, extra, &mut paps);
     paps.sort_unstable_by_key(|p| p.fc_end);
     paps
 }
@@ -948,11 +969,17 @@ fn word_paps(data: &[u8], table: &[u8], base: usize, pairs: usize) -> Vec<WordPa
 /// Read every property page named by the `PlcfBtePapx` bin table. Property data
 /// for a page's paragraphs sits behind their forward links, at the page offset
 /// recorded for each of them.
-fn word_papx(data: &[u8], table: &[u8], base: usize, paps: &mut Vec<WordPap>) {
-    let Ok(off) = u32le(table, base + 13 * 8) else {
+fn word_papx(
+    data: &[u8],
+    table: &[u8],
+    base: usize,
+    extra: &mut impl FnMut(u64) -> Option<Vec<u8>>,
+    paps: &mut Vec<WordPap>,
+) {
+    let Ok(off) = u32le(data, base + 13 * 8) else {
         return;
     };
-    let Ok(len) = u32le(table, base + 13 * 8 + 4) else {
+    let Ok(len) = u32le(data, base + 13 * 8 + 4) else {
         return;
     };
     let (off, len) = (off as usize, len as usize);
@@ -977,16 +1004,20 @@ fn word_papx(data: &[u8], table: &[u8], base: usize, paps: &mut Vec<WordPap>) {
             return;
         }
         for k in 0..count {
+            let Ok(start) = u32le(page, k * 4) else {
+                return;
+            };
             let Ok(end) = u32le(page, (k + 1) * 4) else {
                 return;
             };
             let mut pap = WordPap {
+                fc_start: start as usize,
                 fc_end: end as usize,
                 ..WordPap::default()
             };
             let offset = page[rgbx + 13 * k] as usize;
             if offset != 0 && 2 * offset < 511 {
-                word_pap(&page[2 * offset..], table, &mut pap);
+                word_pap(&page[2 * offset..511], extra, &mut pap);
             }
             paps.push(pap);
         }
@@ -995,7 +1026,7 @@ fn word_papx(data: &[u8], table: &[u8], base: usize, paps: &mut Vec<WordPap>) {
 
 /// Apply one `PapxInFkp` record. The record holds the style index of the
 /// paragraph followed by the property modifiers that override it.
-fn word_pap(record: &[u8], table: &[u8], pap: &mut WordPap) {
+fn word_pap(record: &[u8], extra: &mut impl FnMut(u64) -> Option<Vec<u8>>, pap: &mut WordPap) {
     let Some(&cb) = record.first() else {
         return;
     };
@@ -1009,12 +1040,27 @@ fn word_pap(record: &[u8], table: &[u8], pap: &mut WordPap) {
         .map(|b| &b[..len.min(b.len())])
         .unwrap_or_default();
     pap.style = u16le(grpprl, 0).unwrap_or_default();
-    word_sprms(grpprl.get(2..).unwrap_or_default(), table, pap, 0);
+    let mut row_format = Vec::new();
+    word_sprms(
+        grpprl.get(2..).unwrap_or_default(),
+        extra,
+        pap,
+        &mut row_format,
+        0,
+    );
+    pap.apply_row_format(&row_format);
 }
 
 /// Read property modifiers. `depth` bounds the `sprmPHugePapx` indirection that
-/// moves an oversized modifier list out of its page and into the table stream.
-fn word_sprms(mut b: &[u8], table: &[u8], pap: &mut WordPap, depth: usize) {
+/// moves an oversized modifier list out of its page and into the Data stream.
+fn word_sprms(
+    mut b: &[u8],
+    extra: &mut impl FnMut(u64) -> Option<Vec<u8>>,
+    pap: &mut WordPap,
+    row_format: &mut Vec<(u16, Vec<u8>)>,
+    depth: usize,
+) {
+    let mut table_props = None;
     while b.len() > 2 {
         let sprm = u16::from_le_bytes([b[0], b[1]]);
         b = &b[2..];
@@ -1031,16 +1077,12 @@ fn word_sprms(mut b: &[u8], table: &[u8], pap: &mut WordPap, depth: usize) {
             2 | 4 | 5 => (2, 0),
             3 => (4, 0),
             7 => (3, 0),
-            // A variable modifier records its size in the first byte, or in the
-            // two bytes behind a 0xFF marker.
-            _ => match b.first().copied().unwrap_or(0) {
-                0xff => (
-                    b.get(1..3)
-                        .map_or(0, |v| usize::from(u16::from_le_bytes([v[0], v[1]]))),
-                    2,
-                ),
-                n => (usize::from(n), 1),
-            },
+            _ if sprm == 0xc615 && b.first() == Some(&0xff) => (
+                b.get(1..3)
+                    .map_or(0, |v| usize::from(u16::from_le_bytes([v[0], v[1]]))),
+                2,
+            ),
+            _ => (usize::from(b[0]), 1),
         };
         let total = size.saturating_add(skip);
         if total == 0 || b.len() < total {
@@ -1048,8 +1090,18 @@ fn word_sprms(mut b: &[u8], table: &[u8], pap: &mut WordPap, depth: usize) {
         }
         let data = &b[skip..total];
         match sprm {
+            0x2403 | 0x2461 => {
+                pap.align = match data[0] {
+                    0 => Some("left"),
+                    1 => Some("center"),
+                    2 => Some("right"),
+                    3..=9 => Some("justify"),
+                    _ => None,
+                };
+            }
             0x2416 => pap.in_table = data.first().is_some_and(|v| *v != 0),
             0x2417 => pap.ttp = data.first().is_some_and(|v| *v != 0),
+            0x244b => pap.inner_cell = data.first().is_some_and(|v| *v != 0),
             0x244c => pap.inner_ttp = data.first().is_some_and(|v| *v != 0),
             0x2640 => {
                 pap.outline = data
@@ -1057,35 +1109,47 @@ fn word_sprms(mut b: &[u8], table: &[u8], pap: &mut WordPap, depth: usize) {
                     .filter(|&&level| level < 9)
                     .map_or(0, |&level| (level + 1).min(6));
             }
-            0x6646 => word_huge_papx(data, table, pap, depth),
+            0x6646 => {
+                if depth < 4
+                    && let Ok(offset) = u32le(data, 0)
+                    && let Some(grpprl) = extra(u64::from(offset))
+                {
+                    word_sprms(&grpprl, extra, pap, row_format, depth + 1);
+                }
+                return;
+            }
+            0x646b => table_props = u32le(data, 0).ok(),
             0x6649 => {
                 if let Some(v) = data.get(..4) {
                     pap.itap = u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize;
                 }
             }
-            0xd605 => pap.edges = word_table_borders(data),
+            0x9407 => pap.row_height = i16::from_le_bytes([data[0], data[1]]).unsigned_abs(),
+            0xd605
+            | 0xd609
+            | 0xd60c
+            | 0xd612
+            | 0xd613
+            | 0xd616
+            | 0xd61a..=0xd61d
+            | 0xd620
+            | 0xd62c..=0xd62f
+            | 0xd632
+            | 0xd634
+            | 0xd670..=0xd672 => {
+                row_format.push((sprm, data.to_vec()));
+            }
             _ => {}
         }
         b = &b[total..];
     }
-}
-
-fn word_huge_papx(data: &[u8], table: &[u8], pap: &mut WordPap, depth: usize) {
-    if depth >= 4 {
-        return;
+    // PTableProps holds the full row formatting. Keep the inline TDefTable as
+    // the cell grid for files that use TInsert in the referenced modifiers.
+    if depth < 4
+        && let Some(grpprl) = table_props.and_then(|offset| extra(u64::from(offset)))
+    {
+        word_sprms(&grpprl, extra, pap, row_format, depth + 1);
     }
-    let Some(v) = data.get(..4) else {
-        return;
-    };
-    let offset = u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as usize;
-    let Some(size) = table.get(offset..offset + 2) else {
-        return;
-    };
-    let size = u16::from_le_bytes([size[0], size[1]]) as usize;
-    let Some(grpprl) = table.get(offset + 2..offset + 2 + size) else {
-        return;
-    };
-    word_sprms(grpprl, table, pap, depth + 1);
 }
 
 /// Cell definitions of a row: the column boundaries followed by one descriptor
@@ -1113,7 +1177,7 @@ fn word_tap(b: &[u8]) -> Option<(WordTap, usize)> {
         let mut bounds = Vec::with_capacity(columns + 1);
         for i in 0..=columns {
             let at = 1 + 2 * i;
-            bounds.push(f32::from(i16::from_le_bytes([operand[at], operand[at + 1]])) / 20.);
+            bounds.push(i16::from_le_bytes([operand[at], operand[at + 1]]));
         }
         if bounds.windows(2).any(|w| w[1] < w[0]) {
             continue;
@@ -1123,15 +1187,20 @@ fn word_tap(b: &[u8]) -> Option<(WordTap, usize)> {
             let at = 1 + 2 * (columns + 1) + 20 * i;
             let flags = u16::from_le_bytes([operand[at], operand[at + 1]]);
             let mut borders = [None, None, None, None];
-            for (side, border) in borders.iter_mut().enumerate() {
-                *border = word_brc(&operand[at + 4 + 4 * side..at + 8 + 4 * side]);
+            for (side, border) in WORD_SIDE_ORDER.into_iter().zip(&mut borders) {
+                let value = &operand[at + 4 + 4 * side..at + 8 + 4 * side];
+                if value[1] != 0 {
+                    *border = word_brc(value);
+                }
             }
             cells.push(WordTc {
                 // 1 continues a merged set; 2 and 3 start one.
                 merged: flags & 3 == 1,
                 vert_merge: flags & 0x20 != 0,
                 vert_restart: flags & 0x40 != 0,
+                vertical_align: word_vertical_align(((flags >> 7) & 3) as u8),
                 borders,
+                ..WordTc::default()
             });
         }
         return Some((WordTap { bounds, cells }, field + size));
@@ -1139,70 +1208,227 @@ fn word_tap(b: &[u8]) -> Option<(WordTap, usize)> {
     None
 }
 
-/// One cell side. Word stores the width in eighths of a point, the line style
-/// and an index into a fixed palette.
-fn word_brc(b: &[u8]) -> Option<String> {
-    const PALETTE: [&str; 17] = [
-        "currentColor",
-        "#000000",
-        "#0000ff",
-        "#00ffff",
-        "#00ff00",
-        "#ff00ff",
-        "#ff0000",
-        "#ffff00",
-        "#ffffff",
-        "#000080",
-        "#008080",
-        "#008000",
-        "#800080",
-        "#800000",
-        "#808000",
-        "#808080",
-        "#c0c0c0",
+fn word_palette(index: u8) -> Option<&'static str> {
+    const PALETTE: [&str; 16] = [
+        "#000000", "#0000ff", "#00ffff", "#00ff00", "#ff00ff", "#ff0000", "#ffff00", "#ffffff",
+        "#000080", "#008080", "#008000", "#800080", "#800000", "#808000", "#808080", "#c0c0c0",
     ];
-    let style = match *b.get(1)? {
-        0 => return None,
-        3 | 9..=18 => "double",
-        4 => "dotted",
-        5 | 7 | 8 | 21 | 22 => "dashed",
-        6 => "solid",
-        _ => "solid",
+    PALETTE.get(usize::from(index.checked_sub(1)?)).copied()
+}
+
+fn word_color(b: &[u8]) -> Option<String> {
+    let &[r, g, b, 0] = b else { return None };
+    Some(format!("#{r:02x}{g:02x}{b:02x}"))
+}
+
+#[derive(Clone)]
+struct WordBorder {
+    width: u8,
+    kind: u8,
+    color: Option<String>,
+}
+
+impl WordBorder {
+    fn css(&self, color: Option<&str>) -> String {
+        let style = match self.kind {
+            0 | 0xff => return "none".into(),
+            3 | 10..=19 | 21 => "double",
+            6 => "dotted",
+            7..=9 | 22 | 23 => "dashed",
+            24 | 26 => "outset",
+            25 | 27 => "inset",
+            _ => "solid",
+        };
+        let width = if self.kind < 0x40 {
+            f32::from(self.width.max(2)) / 8.
+        } else {
+            f32::from(self.width)
+        };
+        let color = color.or(self.color.as_deref()).unwrap_or("currentColor");
+        format!("{width}pt {style} {color}")
+    }
+}
+
+fn word_brc(b: &[u8]) -> Option<WordBorder> {
+    let (width, kind, color) = match b {
+        &[width, kind, palette, _] => (width, kind, word_palette(palette).map(str::to_owned)),
+        &[r, g, b, auto, width, kind, _, _] => (width, kind, word_color(&[r, g, b, auto])),
+        _ => return None,
     };
-    let width = f32::from(*b.first()?) / 8.;
-    let width = if width < 0.25 {
-        "0.5pt".to_string()
-    } else {
-        format!("{width}pt")
-    };
-    let shade = PALETTE
-        .get(*b.get(2).unwrap_or(&0) as usize)
-        .copied()
-        .unwrap_or("#000000");
-    Some(format!("{width} {style} {shade}"))
+    Some(WordBorder { width, kind, color })
 }
 
 /// The borders of a whole table: top, left, bottom, right, then the borders
 /// between rows and between columns.
-fn word_table_borders(b: &[u8]) -> Option<[Option<String>; 6]> {
-    if b.len() < 24 {
+fn word_table_borders(b: &[u8], size: usize) -> Option<[Option<WordBorder>; 6]> {
+    if b.len() != size * 6 {
         return None;
     }
-    let mut edges: [Option<String>; 6] = Default::default();
-    for (slot, edge) in edges.iter_mut().zip(b.as_chunks::<4>().0) {
-        *slot = word_brc(edge);
+    Some(std::array::from_fn(|i| {
+        word_brc(&b[i * size..(i + 1) * size])
+    }))
+}
+
+fn word_shd(b: &[u8]) -> Option<String> {
+    match b {
+        [lo, hi] => {
+            let shade = u16::from_le_bytes([*lo, *hi]);
+            let color = if shade >> 10 == 1 {
+                shade & 31
+            } else {
+                (shade >> 5) & 31
+            };
+            word_palette(color as u8).map(str::to_owned)
+        }
+        [fore @ .., r, g, b, auto, lo, hi] if fore.len() == 4 => {
+            match u16::from_le_bytes([*lo, *hi]) {
+                0xffff => None,
+                1 => word_color(fore),
+                _ => word_color(&[*r, *g, *b, *auto]),
+            }
+        }
+        _ => None,
     }
-    Some(edges)
+}
+
+fn word_vertical_align(value: u8) -> Option<&'static str> {
+    match value {
+        0 => Some("top"),
+        1 => Some("middle"),
+        2 => Some("bottom"),
+        _ => None,
+    }
+}
+
+// Internal cell sides are left, right, top, bottom; Word orders them top,
+// left, bottom, right in border records and masks.
+const WORD_SIDE_ORDER: [usize; 4] = [1, 3, 0, 2];
+
+impl WordPap {
+    fn apply_row_format(&mut self, modifiers: &[(u16, Vec<u8>)]) {
+        let Some(tap) = self.tap.as_mut() else { return };
+        let mut default_padding = [None; 4];
+        // Read compatibility fill records first. Raw ShdNil inherits the table
+        // style, whose resolved fill can be present in the compatibility data.
+        for (code, b) in modifiers {
+            let (start, size) = match code {
+                0xd609 => (0, 2),
+                0xd612 => (0, 10),
+                0xd616 => (22, 10),
+                0xd60c => (44, 10),
+                _ => continue,
+            };
+            for (cell, shade) in tap.cells.iter_mut().skip(start).zip(b.chunks_exact(size)) {
+                cell.fill = word_shd(shade);
+            }
+        }
+        for (code, b) in modifiers {
+            match *code {
+                0xd605 | 0xd613 => {
+                    self.edges = word_table_borders(b, if *code == 0xd605 { 4 } else { 8 })
+                        .or(self.edges.take());
+                }
+                0xd61a..=0xd61d => {
+                    let side = WORD_SIDE_ORDER[usize::from(*code - 0xd61a)];
+                    for (cell, color) in tap.cells.iter_mut().zip(b.chunks_exact(4)) {
+                        cell.border_colors[side] = word_color(color);
+                    }
+                }
+                0xd634 => {
+                    if let Some((mask, width)) = word_padding(b) {
+                        word_set_padding(&mut default_padding, mask, width);
+                    }
+                }
+                0xd670..=0xd672 => {
+                    let start = 22 * usize::from(*code - 0xd670);
+                    for (cell, shade) in tap.cells.iter_mut().skip(start).zip(b.chunks_exact(10)) {
+                        if shade != [0xff; 10] {
+                            cell.fill = word_shd(shade);
+                        }
+                    }
+                }
+                _ => word_apply_cell_range(&mut tap.cells, *code, b),
+            }
+        }
+        for cell in &mut tap.cells {
+            for (padding, default) in cell.padding.iter_mut().zip(default_padding) {
+                *padding = padding.or(default);
+            }
+        }
+    }
+}
+
+fn word_padding(b: &[u8]) -> Option<(u8, u16)> {
+    match b {
+        &[_, _, mask, 0, _, _] => Some((mask, 0)),
+        &[_, _, mask, 3, lo, hi] => Some((mask, u16::from_le_bytes([lo, hi]).min(31680))),
+        _ => None,
+    }
+}
+
+fn word_set_padding(padding: &mut [Option<u16>; 4], mask: u8, width: u16) {
+    for (side, value) in WORD_SIDE_ORDER.into_iter().zip(padding) {
+        if mask & (1 << side) != 0 {
+            *value = Some(width);
+        }
+    }
+}
+
+fn word_apply_cell_range(cells: &mut [WordTc], code: u16, b: &[u8]) {
+    let &[first, end, ref operand @ ..] = b else {
+        return;
+    };
+    let Some(cells) = cells.get_mut(usize::from(first)..usize::from(end)) else {
+        return;
+    };
+    match (code, operand) {
+        (0xd620 | 0xd62f, [mask, border @ ..]) => {
+            let Some(border) = word_brc(border) else {
+                return;
+            };
+            for cell in cells {
+                for (index, side) in WORD_SIDE_ORDER.into_iter().enumerate() {
+                    if mask & (1 << side) != 0 {
+                        cell.borders[index] = Some(border.clone());
+                        cell.border_colors[index] = None;
+                    }
+                }
+            }
+        }
+        (0xd62c, &[align]) => {
+            for cell in cells {
+                cell.vertical_align = word_vertical_align(align);
+            }
+        }
+        (0xd62d | 0xd62e, shade) if shade.len() == 10 => {
+            let step = if code == 0xd62e { 2 } else { 1 };
+            for cell in cells.iter_mut().step_by(step) {
+                cell.fill = word_shd(shade);
+            }
+        }
+        (0xd632, _) => {
+            if let Some((mask, width)) = word_padding(b) {
+                for cell in cells {
+                    word_set_padding(&mut cell.padding, mask, width);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build the cell for a run of text collected from the text stream. Cell marks
 /// also end the paragraph around them, so a trailing break is dropped.
-fn table_cell(text: String) -> Cell {
+fn table_cell(text: String, align: Option<&str>) -> Cell {
     let text = text.trim_end_matches('\n');
     if text.is_empty() {
         Cell::default()
     } else {
-        Cell::text(text)
+        let mut cell = Cell::text(text);
+        if let Some(align) = align {
+            cell.properties.insert("text-align".into(), align.into());
+        }
+        cell
     }
 }
 
@@ -1213,6 +1439,7 @@ fn table_cell(text: String) -> Cell {
 struct WordTables {
     open: Vec<WordTable>,
     text: String,
+    align: Option<&'static str>,
     /// Whether the document records row marks as paragraph properties.
     ttp: bool,
     /// The previous character closed a cell.
@@ -1223,13 +1450,17 @@ struct WordTables {
 
 #[derive(Default)]
 struct WordTable {
-    rows: Vec<Vec<Cell>>,
+    rows: Vec<WordRow>,
     row: Vec<Cell>,
-    tap: Option<WordTap>,
-    edges: Option<[Option<String>; 6]>,
-    merges: HashMap<usize, (usize, usize)>,
     /// A nested table was placed in the cell that is currently open.
     nested: bool,
+}
+
+struct WordRow {
+    cells: Vec<Cell>,
+    tap: Option<WordTap>,
+    edges: Option<[Option<WordBorder>; 6]>,
+    height: u16,
 }
 
 impl WordTables {
@@ -1250,6 +1481,7 @@ impl WordTables {
             self.disabled = true;
             self.open.clear();
             self.text.clear();
+            self.align = None;
             return false;
         }
         let depth = pap.itap.clamp(1, 8);
@@ -1272,7 +1504,7 @@ impl WordTables {
             && !t.nested
         {
             let text = std::mem::take(&mut self.text);
-            t.row.push(table_cell(text));
+            t.row.push(table_cell(text, self.align.take()));
         }
     }
 
@@ -1280,35 +1512,30 @@ impl WordTables {
         if self.open.is_empty() {
             return;
         }
-        let cell_mark = c == '\u{7}';
+        let cell_mark = c == '\u{7}' || (c == '\r' && pap.is_some_and(|p| p.inner_cell));
         // A row ends at its row mark: a cell mark that also carries the table
         // properties on depth one, or a paragraph mark inside a nested table.
         // Text without any row mark falls back to two cell marks in a row.
-        let row = if cell_mark {
-            pap.is_some_and(|p| p.ttp) || (!self.ttp && self.mark && self.text.is_empty())
-        } else {
-            pap.is_some_and(|p| p.inner_ttp)
+        let row = match c {
+            '\u{7}' => {
+                pap.is_some_and(|p| p.ttp) || (!self.ttp && self.mark && self.text.is_empty())
+            }
+            '\r' => pap.is_some_and(|p| p.inner_ttp),
+            _ => false,
         };
         if row {
             if !self.text.is_empty() {
                 self.cell_mark();
             }
-            if let Some(p) = pap
-                && let Some(t) = self.open.last_mut()
-            {
-                t.tap = p.tap.clone();
-                if t.edges.is_none() {
-                    t.edges = p.edges.clone();
-                }
-            }
-            self.end_row();
+            self.end_row(pap);
+            return;
+        }
+        if cell_mark {
+            self.mark = true;
+            self.cell_mark();
             return;
         }
         match c {
-            '\u{7}' => {
-                self.mark = true;
-                self.cell_mark();
-            }
             '\r' | '\u{c}' | '\u{b}' => {
                 self.mark = false;
                 self.text.push('\n');
@@ -1319,6 +1546,7 @@ impl WordTables {
             }
             c if !c.is_control() => {
                 self.mark = false;
+                self.align = self.align.or(pap.and_then(|p| p.align));
                 self.text.push(c);
             }
             _ => {}
@@ -1331,17 +1559,23 @@ impl WordTables {
             return;
         }
         let text = std::mem::take(&mut self.text);
+        let align = self.align.take();
         if let Some(t) = self.open.last_mut() {
             if t.nested {
                 t.nested = false;
                 if !text.is_empty()
                     && let Some(cell) = t.row.last_mut()
                 {
+                    if let Some(align) = align {
+                        cell.properties
+                            .entry("text-align".into())
+                            .or_insert_with(|| align.into());
+                    }
                     push_run(&mut cell.runs, Run::text(text));
                 }
                 return;
             }
-            t.row.push(table_cell(text));
+            t.row.push(table_cell(text, align));
         }
         self.cells += 1;
     }
@@ -1352,17 +1586,19 @@ impl WordTables {
         }
     }
 
-    fn end_row(&mut self) {
+    fn end_row(&mut self, pap: Option<&WordPap>) {
         self.mark = false;
         let Some(t) = self.open.last_mut() else {
             return;
         };
-        if t.row.is_empty() {
-            t.tap = None;
-            return;
+        if !t.row.is_empty() {
+            t.rows.push(WordRow {
+                cells: std::mem::take(&mut t.row),
+                tap: pap.and_then(|p| p.tap.clone()),
+                edges: pap.and_then(|p| p.edges.clone()),
+                height: pap.map_or(0, |p| p.row_height),
+            });
         }
-        let row = std::mem::take(&mut t.row);
-        t.row_done(row);
     }
 
     /// Finish the innermost table and hand it to the cell around it.
@@ -1371,7 +1607,7 @@ impl WordTables {
             return;
         }
         self.flush_cell();
-        self.end_row();
+        self.end_row(None);
         let Some(table) = self.open.pop() else {
             return;
         };
@@ -1394,7 +1630,7 @@ impl WordTables {
                 continue;
             }
             self.flush_cell();
-            self.end_row();
+            self.end_row(None);
             if let Some(table) = self.open.pop()
                 && let Some(block) = table.finish()
             {
@@ -1402,76 +1638,153 @@ impl WordTables {
             }
         }
         self.text.clear();
+        self.align = None;
         self.mark = false;
         blocks
     }
 }
 
 impl WordTable {
-    /// Fold the collected cells into the row, applying the cell definitions
-    /// recorded on the row mark: column widths, spans and borders.
-    fn row_done(&mut self, row: Vec<Cell>) {
-        let tap = self.tap.take();
-        let groups = tap.as_ref().and_then(|t| t.groups(row.len()));
-        let y = self.rows.len();
-        let mut out: Vec<Cell> = Vec::with_capacity(row.len());
-        for (index, cell) in row.into_iter().enumerate() {
-            let (column, span) = groups.as_ref().map_or((index, 1), |g| g[index]);
-            let Some(tc) = tap.as_ref().and_then(|t| t.cells.get(column)) else {
-                out.push(cell);
-                continue;
-            };
-            let mut cell = cell;
-            if let Some(tap) = tap.as_ref() {
-                let left = tap.bounds.get(column).copied().unwrap_or(0.);
-                let right = tap.bounds.get(column + span).copied().unwrap_or(left);
-                formatting::points(
-                    &mut cell.properties,
-                    "width",
-                    Some(f64::from(right - left)).filter(|w| *w > 0.),
-                );
+    /// A Word row has its own boundaries. Combining them lets a wide cell in
+    /// one row span the narrower cells at the same position in another row.
+    fn grid(&self) -> Option<Vec<i16>> {
+        let bounds = &self.rows.first()?.tap.as_ref()?.bounds;
+        let mut grid = BTreeSet::new();
+        for row in &self.rows {
+            let tap = row.tap.as_ref()?;
+            if tap.bounds.first() != bounds.first()
+                || tap.bounds.last() != bounds.last()
+                || (row.cells.len() != tap.cells.len() && tap.groups(row.cells.len()).is_none())
+            {
+                return None;
             }
-            if span > 1 {
-                cell.colspan = Some(span);
+            grid.extend(tap.bounds.iter().copied());
+            if grid.len() > 512 {
+                return None;
             }
-            for (key, border) in formatting::BORDERS.iter().zip(tc.borders.iter()) {
-                if let Some(border) = border {
-                    cell.properties.insert((*key).into(), border.clone());
-                }
-            }
-            if tc.vert_restart {
-                self.merges.insert(column, (y, out.len()));
-            } else if tc.vert_merge {
-                if let Some(&(first, at)) = self.merges.get(&column)
-                    && let Some(origin) = self.rows.get_mut(first).and_then(|r| r.get_mut(at))
-                {
-                    origin.rowspan = Some(origin.rowspan.unwrap_or(1) + 1);
-                    if let Some(bottom) = cell.properties.remove("border-bottom") {
-                        origin.properties.insert("border-bottom".into(), bottom);
-                    }
-                    continue;
-                }
-            } else {
-                self.merges.remove(&column);
-            }
-            out.push(cell);
         }
-        // A row whose cells were all folded into the row above leaves nothing.
-        if !out.is_empty() {
-            self.rows.push(out);
-        }
+        Some(grid.into_iter().collect())
     }
 
-    /// Close the table, filling in the sides its borders do not name.
-    fn finish(mut self) -> Option<Block> {
-        self.apply_edges();
-        let bordered = self.rows.iter().flatten().any(|c| {
+    fn finish(self) -> Option<Block> {
+        let grid = self.grid().unwrap_or_default();
+        let default_edges = self.rows.iter().find_map(|row| row.edges.clone());
+        let mut merges = HashMap::<(i16, i16), (usize, usize)>::new();
+        let mut rows: Vec<Vec<Cell>> = Vec::with_capacity(self.rows.len());
+        let height = self.rows.len();
+        for (y, row) in self.rows.into_iter().enumerate() {
+            let count = row.cells.len();
+            let groups = row.tap.as_ref().and_then(|tap| tap.groups(count));
+            let mut out = Vec::with_capacity(count);
+            for (index, mut cell) in row.cells.into_iter().enumerate() {
+                let (column, span) = groups.as_ref().map_or((index, 1), |g| g[index]);
+                let source = row.tap.as_ref().and_then(|tap| {
+                    Some((
+                        *tap.bounds.get(column)?,
+                        *tap.bounds.get(column + span)?,
+                        tap.cells.get(column)?,
+                    ))
+                });
+                if let Some((left, right, tc)) = source {
+                    let width = f64::from(right) - f64::from(left);
+                    formatting::points(
+                        &mut cell.properties,
+                        "width",
+                        (width > 0.).then_some(width / 20.),
+                    );
+                    let span = grid
+                        .binary_search(&left)
+                        .ok()
+                        .zip(grid.binary_search(&right).ok())
+                        .map_or(span, |(start, end)| end - start);
+                    cell.colspan = (span > 1).then_some(span);
+                    if let Some(align) = tc.vertical_align {
+                        cell.properties
+                            .insert("vertical-align".into(), align.into());
+                    }
+                    if let Some(fill) = &tc.fill {
+                        cell.properties
+                            .insert("background-color".into(), fill.clone());
+                    }
+                    for (key, value) in [
+                        "padding-left",
+                        "padding-right",
+                        "padding-top",
+                        "padding-bottom",
+                    ]
+                    .into_iter()
+                    .zip(tc.padding)
+                    {
+                        formatting::points(
+                            &mut cell.properties,
+                            key,
+                            value.map(|v| f64::from(v) / 20.),
+                        );
+                    }
+                    for (index, (key, border)) in
+                        formatting::BORDERS.iter().zip(&tc.borders).enumerate()
+                    {
+                        if let Some(border) = border {
+                            cell.properties.insert(
+                                (*key).into(),
+                                border.css(tc.border_colors[index].as_deref()),
+                            );
+                        }
+                    }
+                }
+                if let Some(edges) = row.edges.as_ref().or(default_edges.as_ref()) {
+                    let sides = [
+                        if index == 0 { 1 } else { 5 },
+                        if index + 1 == count { 3 } else { 5 },
+                        if y == 0 { 0 } else { 4 },
+                        if y + 1 == height { 2 } else { 4 },
+                    ];
+                    for (index, (key, side)) in
+                        formatting::BORDERS.into_iter().zip(sides).enumerate()
+                    {
+                        if let Some(value) = &edges[side] {
+                            let color =
+                                source.and_then(|(_, _, tc)| tc.border_colors[index].as_deref());
+                            cell.properties
+                                .entry(key.into())
+                                .or_insert_with(|| value.css(color));
+                        }
+                    }
+                }
+                if let Some((left, right, tc)) = source.filter(|(left, right, _)| left < right) {
+                    let bounds = (left, right);
+                    if tc.vert_restart {
+                        merges.insert(bounds, (y, out.len()));
+                    } else if tc.vert_merge
+                        && let Some(&(first, at)) = merges.get(&bounds)
+                        && let Some(origin) = rows.get_mut(first).and_then(|r| r.get_mut(at))
+                        && first + origin.rowspan.unwrap_or(1) == y
+                    {
+                        origin.rowspan = Some(y - first + 1);
+                        if let Some(bottom) = cell.properties.remove("border-bottom") {
+                            origin.properties.insert("border-bottom".into(), bottom);
+                        }
+                        continue;
+                    }
+                }
+                if row.height != 0 && source.is_none_or(|(_, _, tc)| !tc.vert_restart) {
+                    formatting::points(
+                        &mut cell.properties,
+                        "height",
+                        Some(f64::from(row.height) / 20.),
+                    );
+                }
+                out.push(cell);
+            }
+            rows.push(out);
+        }
+        let bordered = rows.iter().flatten().any(|c| {
             formatting::BORDERS
                 .iter()
                 .any(|key| c.properties.contains_key(*key))
         });
         if bordered {
-            for cell in self.rows.iter_mut().flatten() {
+            for cell in rows.iter_mut().flatten() {
                 for key in formatting::BORDERS {
                     cell.properties
                         .entry(key.into())
@@ -1479,57 +1792,7 @@ impl WordTable {
                 }
             }
         }
-        (!self.rows.is_empty()).then_some(Block::Table { rows: self.rows })
-    }
-
-    /// Apply the table-wide borders to the sides the cells do not set
-    /// themselves: the outer edges of the table, otherwise the borders between
-    /// its rows and columns.
-    fn apply_edges(&mut self) {
-        let Some(edges) = self.edges.take() else {
-            return;
-        };
-        let height = self.rows.len();
-        let columns = self
-            .rows
-            .iter()
-            .map(|row| row.iter().map(|c| c.colspan.unwrap_or(1)).sum::<usize>())
-            .max()
-            .unwrap_or(0);
-        for (y, row) in self.rows.iter_mut().enumerate() {
-            let mut x = 0;
-            for cell in row.iter_mut() {
-                let span = cell.colspan.unwrap_or(1);
-                let outer = [
-                    x == 0,
-                    x + span >= columns,
-                    y == 0,
-                    y + cell.rowspan.unwrap_or(1) >= height,
-                ];
-                for ((key, edge), inside) in formatting::BORDERS
-                    .into_iter()
-                    .zip(outer)
-                    .zip([5usize, 5, 4, 4])
-                {
-                    let index = if edge {
-                        match key {
-                            "border-top" => 0,
-                            "border-left" => 1,
-                            "border-bottom" => 2,
-                            _ => 3,
-                        }
-                    } else {
-                        inside
-                    };
-                    if let Some(value) = &edges[index] {
-                        cell.properties
-                            .entry(key.into())
-                            .or_insert_with(|| value.clone());
-                    }
-                }
-                x += span;
-            }
-        }
+        (!rows.is_empty()).then_some(Block::Table { rows })
     }
 }
 struct Record<'a> {
@@ -1703,13 +1966,18 @@ fn ppt(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn word_paragraphs_preserve_builtin_and_direct_outline_levels() {
         let mut section = Section::default();
         for (style, outline, title) in [(2, 0, "Built-in"), (12, 4, "Direct"), (12, 9, "Body")] {
             let mut pap = WordPap::default();
-            word_pap(&record(&[style, 0, 0x40, 0x26, outline]), &[], &mut pap);
+            word_pap(
+                &record(&[style, 0, 0x40, 0x26, outline]),
+                &mut |_| None,
+                &mut pap,
+            );
             word_paragraph(&mut section, title.into(), Some(&pap));
         }
         let mut doc = Document::new("doc");
@@ -1777,11 +2045,15 @@ mod tests {
     #[test]
     fn word_papx_reads_the_cell_definition_of_a_row() {
         let mut pap = WordPap::default();
-        word_pap(&table_row(&[0, 1000, 3000], &[0, 2]), &[], &mut pap);
+        word_pap(
+            &table_row(&[0, 1000, 3000], &[0, 2]),
+            &mut |_| None,
+            &mut pap,
+        );
         assert!(pap.in_table && pap.ttp);
         assert_eq!(pap.itap, 1);
         let tap = pap.tap.expect("row definition");
-        assert_eq!(tap.bounds, vec![0., 50., 150.]);
+        assert_eq!(tap.bounds, vec![0, 1000, 3000]);
         assert_eq!(tap.cells.len(), 2);
         assert!(tap.cells.iter().all(|c| !c.merged));
     }
@@ -1793,12 +2065,131 @@ mod tests {
         let mut pap = WordPap::default();
         word_pap(
             &table_row(&[0, 1000, 2000, 4000], &[0, 3, 1]),
-            &[],
+            &mut |_| None,
             &mut pap,
         );
         let tap = pap.tap.expect("row definition");
         assert_eq!(tap.groups(2), Some(vec![(0, 1), (1, 2)]));
         assert_eq!(tap.groups(3), None);
+    }
+
+    #[test]
+    fn word_converts_rows_with_separate_property_streams_and_differing_boundaries() {
+        const TEXT: usize = 1024;
+        const FKP: usize = 2048;
+        const FIB_PAIRS: usize = 154;
+        let mut word = vec![0; FKP + 512];
+        let mut table = vec![0; 12];
+        word[..4].copy_from_slice(&[0xec, 0xa5, 0xc1, 0]);
+        word[32..34].copy_from_slice(&14u16.to_le_bytes());
+        word[62..64].copy_from_slice(&22u16.to_le_bytes());
+        word[152..154].copy_from_slice(&93u16.to_le_bytes());
+        let main = record(&[0, 0, 0x16, 0x24, 1, 0x61, 0x24, 1, 0]); // Centered cell text.
+        let huge = [0, 4, 0, 0, 0x46, 0x66, 6, 0, 0, 0];
+        // The last cell keeps the same bounds when the preceding cell is split.
+        let upper = table_row(&[0, 2000, 3000], &[0, 0x60]);
+        let lower = table_row(&[0, 1000, 2000, 3000], &[0, 0, 0x20]);
+        let mut upper = upper[3..].to_vec();
+        upper.extend_from_slice(&[0x07, 0x94, 0x20, 0x03]); // Row height of 40 pt.
+        upper.extend_from_slice(&[0x12, 0xd6, 20]); // Resolved compatibility shading.
+        upper.extend_from_slice(&[0, 0, 0, 255, 0xcc, 0xff, 0xcc, 0, 0, 0]);
+        upper.extend_from_slice(&[0, 0, 0, 255, 0xdd, 0xee, 0xff, 0, 0, 0]);
+        let indirect_offset = 6 + 2 + upper.len() + 6;
+        upper.extend_from_slice(&[0x6b, 0x64]); // sprmPTableProps
+        upper.extend_from_slice(&(indirect_offset as u32).to_le_bytes());
+        let mut indirect = vec![0x70, 0xd6, 20]; // Raw shade inherits for Grade and clears Count.
+        indirect.extend_from_slice(&[255; 10]);
+        indirect.extend_from_slice(&[0, 0, 0, 255, 0, 0, 0, 255, 0, 0]);
+        indirect.extend_from_slice(&[0x2f, 0xd6, 11, 0, 1, 4, 0x12, 0x34, 0x56, 0, 8, 1, 0, 0]);
+        indirect.extend_from_slice(&[0x34, 0xd6, 6, 0, 1, 0x0a, 3, 90, 0]); // Default left/right padding.
+        indirect.extend_from_slice(&[0x32, 0xd6, 6, 0, 1, 2, 3, 140, 0]); // First cell's left padding.
+        indirect.extend_from_slice(&[0x2c, 0xd6, 3, 0, 1, 2]); // First cell's vertical alignment.
+        let mut data = vec![0; 6];
+        data.extend_from_slice(&(upper.len() as u16).to_le_bytes());
+        data.extend_from_slice(&upper);
+        data.extend_from_slice(&(indirect.len() as u16).to_le_bytes());
+        data.extend_from_slice(&indirect);
+        let paragraphs: &[(&[u8], &[u8])] = &[
+            (b"Before\r", &[]),
+            (b"Grade\x07", &main),
+            (b"Count\x07", &main),
+            (b"\x07", &huge),
+            (b"A\x07", &main),
+            (b"B\x07", &main),
+            (b"\x07", &main),
+            (b"\x07", &lower),
+            (b"After\r", &[]),
+        ];
+        let mut fc = TEXT;
+        let mut bx = 510;
+        word[FKP + 511] = paragraphs.len() as u8;
+        for (i, (text, props)) in paragraphs.iter().enumerate() {
+            word[FKP + i * 4..FKP + i * 4 + 4].copy_from_slice(&(fc as u32).to_le_bytes());
+            word[fc..fc + text.len()].copy_from_slice(text);
+            fc += text.len();
+            if !props.is_empty() {
+                bx = (bx - props.len()) & !1;
+                word[FKP + 4 * (paragraphs.len() + 1) + i * 13] = (bx / 2) as u8;
+                word[FKP + bx..FKP + bx + props.len()].copy_from_slice(props);
+            }
+        }
+        let end = FKP + 4 * paragraphs.len();
+        word[end..end + 4].copy_from_slice(&(fc as u32).to_le_bytes());
+        let papx = FIB_PAIRS + 13 * 8;
+        word[papx..papx + 4].copy_from_slice(&4u32.to_le_bytes());
+        word[papx + 4..papx + 8].copy_from_slice(&12u32.to_le_bytes());
+        table[4..8].copy_from_slice(&(TEXT as u32).to_le_bytes());
+        table[8..12].copy_from_slice(&(fc as u32).to_le_bytes());
+        table.extend_from_slice(&((FKP / 512) as u32).to_le_bytes());
+        let clx = FIB_PAIRS + 33 * 8;
+        word[clx..clx + 4].copy_from_slice(&(table.len() as u32).to_le_bytes());
+        word[clx + 4..clx + 8].copy_from_slice(&21u32.to_le_bytes());
+        let chars = (fc - TEXT) as u32;
+        word[76..80].copy_from_slice(&chars.to_le_bytes());
+        table.extend_from_slice(&[2, 16, 0, 0, 0, 0, 0, 0, 0]);
+        table.extend_from_slice(&chars.to_le_bytes());
+        table.extend_from_slice(&[0, 0]);
+        table.extend_from_slice(&(0x4000_0000 | (2 * TEXT as u32)).to_le_bytes());
+        table.extend_from_slice(&[0, 0]);
+
+        let mut file = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+        for (name, bytes) in [("/WordDocument", word), ("/0Table", table), ("/Data", data)] {
+            file.create_stream(name).unwrap().write_all(&bytes).unwrap();
+        }
+        let doc = crate::convert(&file.into_inner().into_inner(), false).unwrap();
+        let md = crate::render::render(&doc, "md", "hybrid", &Properties::new()).unwrap();
+        assert!(md.starts_with("Before\n\n<table>\n"), "{md}");
+        assert!(
+            md.contains("<td colspan=\"2\">Grade</td><td rowspan=\"2\">Count</td>"),
+            "{md}"
+        );
+        assert!(
+            md.contains("<tr><td>A</td><td>B</td></tr>\n</table>\n\nAfter"),
+            "{md}"
+        );
+        let html = crate::render::render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+        assert!(
+            html.contains("width:150.0000pt;table-layout:fixed\"><colgroup>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<td colspan=\"2\"") && html.contains("<td rowspan=\"2\""),
+            "{html}"
+        );
+        assert!(html.contains("height:40pt;"), "{html}");
+        let style = html.split_once("<td colspan=\"2\" style=\"").unwrap().1;
+        let style = style.split_once('"').unwrap().0;
+        for property in [
+            "background-color:#ccffcc;",
+            "border-bottom:1pt solid #123456;",
+            "padding-left:7pt;",
+            "padding-right:4.5pt;",
+            "text-align:center;",
+            "vertical-align:bottom;",
+        ] {
+            assert!(style.contains(property), "{property} missing from {style}");
+        }
+        assert!(!html.contains("#ddeeff"));
     }
 
     #[test]
@@ -1819,7 +2210,7 @@ mod tests {
             ..WordPap::default()
         };
         mark.tap = Some(WordTap {
-            bounds: vec![0., 50., 100., 200.],
+            bounds: vec![0, 1000, 2000, 4000],
             cells: vec![
                 WordTc::default(),
                 WordTc::default(),
@@ -1868,7 +2259,7 @@ mod tests {
                 ..WordPap::default()
             };
             pap.tap = Some(WordTap {
-                bounds: vec![0., 100.],
+                bounds: vec![0, 2000],
                 cells: vec![WordTc {
                     vert_merge: flags & 1 != 0,
                     vert_restart: flags & 2 != 0,
@@ -1894,10 +2285,11 @@ mod tests {
         let [Block::Table { rows }] = blocks.as_slice() else {
             panic!("expected one table: {blocks:?}");
         };
-        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].len(), 1);
         assert_eq!(rows[0][0].runs[0].text, "위");
         assert_eq!(rows[0][0].rowspan, Some(2));
+        assert!(rows[1].is_empty());
     }
 
     #[test]
@@ -1916,6 +2308,12 @@ mod tests {
             itap: 2,
             ..WordPap::default()
         };
+        let inner_cell = WordPap {
+            in_table: true,
+            itap: 2,
+            inner_cell: true,
+            ..WordPap::default()
+        };
         let mut end = WordPap {
             in_table: true,
             itap: 2,
@@ -1923,7 +2321,7 @@ mod tests {
             ..WordPap::default()
         };
         end.tap = Some(WordTap {
-            bounds: vec![0., 100.],
+            bounds: vec![0, 2000],
             cells: vec![WordTc::default()],
         });
         let mut mark = WordPap {
@@ -1933,17 +2331,19 @@ mod tests {
             ..WordPap::default()
         };
         mark.tap = Some(WordTap {
-            bounds: vec![0., 100.],
+            bounds: vec![0, 2000],
             cells: vec![WordTc::default()],
         });
         for c in "바깥".chars() {
             tables.enter(&outer);
             tables.push(c, Some(&outer));
         }
-        for c in "안\u{7}".chars() {
+        for c in "안".chars() {
             tables.enter(&inner);
             tables.push(c, Some(&inner));
         }
+        tables.enter(&inner_cell);
+        tables.push('\r', Some(&inner_cell));
         tables.enter(&end);
         tables.push('\r', Some(&end));
         tables.enter(&outer);
