@@ -97,7 +97,9 @@ pub fn extract(d: &Document, dir: &Path, base: &Path) -> Result<Properties> {
     let mut links = Properties::new();
     for (i, key) in image_sources(d).iter().enumerate() {
         let Some(b) = d.assets.get(key) else { continue };
-        let Some(ext) = image_ext(b) else { continue };
+        let Some(ext) = asset_ext(key, b) else {
+            continue;
+        };
         let mut suffix = 0;
         loop {
             let stem = if suffix == 0 {
@@ -141,6 +143,16 @@ pub fn inline_key(key: &str) -> String {
     format!("{key}\u{1}data")
 }
 
+fn asset_ext(key: &str, bytes: &[u8]) -> Option<&'static str> {
+    if key.starts_with("hwp3/drawing/")
+        && bytes.starts_with(crate::hwp3::GENERATED_SVG_START.as_bytes())
+    {
+        Some("svg")
+    } else {
+        image_ext(bytes)
+    }
+}
+
 fn mime(ext: &str) -> &'static str {
     match ext {
         "png" => "image/png",
@@ -149,6 +161,7 @@ fn mime(ext: &str) -> &'static str {
         "webp" => "image/webp",
         "bmp" => "image/bmp",
         "tif" => "image/tiff",
+        "svg" => "image/svg+xml",
         _ => "application/octet-stream",
     }
 }
@@ -159,7 +172,11 @@ fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let tail = [*chunk.first().unwrap_or(&0), *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let tail = [
+            *chunk.first().unwrap_or(&0),
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let bits = u32::from(tail[0]) << 16 | u32::from(tail[1]) << 8 | u32::from(tail[2]);
         out.push(ALPHABET[(bits >> 18) as usize & 63] as char);
         out.push(ALPHABET[(bits >> 12) as usize & 63] as char);
@@ -177,26 +194,33 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// Return `links` plus an inlined `data:` URI for every extracted image, so an
-/// HTML result renders in a browser without the extracted folder. Each file path
-/// stays in the map and is written as `data-path`, which keeps the result
-/// traceable to the extracted file.
-pub fn inline(d: &Document, links: &Properties) -> Properties {
+/// Add data URIs for the displayed images. With no extracted paths this makes
+/// a single-file HTML document. Extracted paths, when present, remain available
+/// to the renderer as `data-path`.
+pub fn inline(d: &Document, links: &Properties) -> Result<Properties> {
     let mut out = links.clone();
+    let mut encoded_len = 0usize;
     for key in image_sources(d) {
-        if !links.contains_key(&key) {
+        if !links.is_empty() && !links.contains_key(&key) {
             continue;
         }
         let Some(bytes) = d.assets.get(&key) else {
             continue;
         };
-        let Some(ext) = image_ext(bytes) else {
+        let Some(ext) = asset_ext(&key, bytes) else {
             continue;
         };
+        encoded_len = encoded_len.saturating_add(bytes.len().div_ceil(3).saturating_mul(4));
+        if encoded_len > EXPANSION_LIMIT {
+            return Err(
+                "embedded images exceed the HTML output limit; extract them as separate files"
+                    .into(),
+            );
+        }
         out.insert(
             inline_key(&key),
             format!("data:{};base64,{}", mime(ext), base64(bytes)),
         );
     }
-    out
+    Ok(out)
 }

@@ -307,8 +307,7 @@ fn document_bytes(d: &Document) -> usize {
             .sum()
     }
     fn blocks(list: &[Block]) -> usize {
-        list
-            .iter()
+        list.iter()
             .map(|block| match block {
                 Block::Paragraph {
                     runs: text,
@@ -355,14 +354,19 @@ impl Conversion<'_> {
         root: &Path,
     ) -> Result<(String, Vec<String>)> {
         let sheets = self.sheets();
-        let d = load_sheets(input, dir.is_some(), self.range, &sheets)?;
+        let d = load_sheets(
+            input,
+            dir.is_some() || self.format == "html",
+            self.range,
+            &sheets,
+        )?;
         let mut links = if let Some(dir) = dir {
             output::extract(&d, dir, out.map(output::parent).unwrap_or(root))?
         } else {
             Properties::new()
         };
         if self.inline_images && !links.is_empty() {
-            links = output::inline(&d, &links);
+            links = output::inline(&d, &links)?;
         }
         let value = render(&d, self.format, self.mode, &links)?;
         Ok((value, d.warnings))
@@ -415,10 +419,7 @@ impl BatchReport {
 /// report is the text result itself.
 enum Reply {
     Text(String),
-    Report {
-        text: String,
-        warnings: Vec<String>,
-    },
+    Report { text: String, warnings: Vec<String> },
 }
 
 impl Reply {
@@ -620,7 +621,7 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
     // Without images the parsed document can be reused by later read-only
     // requests; image extraction changes the returned links, so it is not cached.
     let sheets = conversion.sheets();
-    let document = if dir.is_none() {
+    let document = if dir.is_none() && conversion.format != "html" {
         access
             .cache
             .borrow_mut()
@@ -634,7 +635,7 @@ fn call(access: &Access, name: &str, args: &Value) -> Result<Reply> {
         None => Properties::new(),
     };
     if conversion.inline_images {
-        links = output::inline(document, &links);
+        links = output::inline(document, &links)?;
     }
     let content = render(document, conversion.format, conversion.mode, &links)?;
     // Conversion tools keep the document in the text block only; warnings still

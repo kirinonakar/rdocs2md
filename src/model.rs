@@ -135,11 +135,9 @@ impl Document {
             }
             if let Ok(number) = selector.parse::<usize>() {
                 if !(1..=titles.len()).contains(&number) {
-                    return Err(format!(
-                        "sheet number {number} is outside 1-{}",
-                        titles.len()
-                    )
-                    .into());
+                    return Err(
+                        format!("sheet number {number} is outside 1-{}", titles.len()).into(),
+                    );
                 }
                 keep[number - 1] = true;
                 continue;
@@ -195,6 +193,70 @@ pub struct Section {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub properties: Properties,
     pub blocks: Vec<Block>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub hwp3_layout: Option<Hwp3Layout>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub slide_layout: Option<SlideLayout>,
+}
+
+pub struct SlideLayout {
+    pub(crate) size: [f64; 2],
+    pub(crate) background: Option<String>,
+    pub(crate) frames: Vec<SlideFrame>,
+}
+
+pub(crate) struct SlideFrame {
+    pub transform: [f64; 6],
+    pub size: [f64; 2],
+    pub blocks: std::ops::Range<usize>,
+    pub shape: Option<SlideShape>,
+    pub text: SlideText,
+}
+
+pub(crate) struct SlideShape {
+    pub kind: String,
+    pub fill: Option<String>,
+    pub stroke: Option<(String, f64)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SlideText {
+    pub size: f64,
+    pub padding: [f64; 4],
+    pub vertical: &'static str,
+}
+
+pub struct Hwp3Layout {
+    pub(crate) paper: [i32; 2],
+    pub(crate) pages: Vec<Hwp3Page>,
+}
+
+pub(crate) struct Hwp3Page {
+    pub number: usize,
+    pub first_block: usize,
+    pub graphics: Vec<Hwp3Graphic>,
+    pub lines: Vec<Hwp3Line>,
+    pub replaced_blocks: Vec<std::ops::Range<usize>>,
+}
+
+pub(crate) struct Hwp3Graphic {
+    pub asset: String,
+    pub rect: [i32; 4],
+    pub order: i32,
+}
+
+pub(crate) struct Hwp3Line {
+    pub x: i32,
+    pub y: i32,
+    pub size: u16,
+    pub parts: Vec<Hwp3Text>,
+}
+
+pub(crate) enum Hwp3Text {
+    Text(String),
+    Tab(u16),
 }
 impl Section {
     pub fn new(kind: &str, source: impl Into<String>) -> Self {
@@ -375,6 +437,12 @@ pub struct Run {
     pub image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_layout: Option<ImageLayout>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub image_geometry: Option<ImageGeometry>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub image_alt: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -401,6 +469,17 @@ pub struct ImageLayout {
     pub width: u32,
     pub height: u32,
     pub rotation_deg: u16,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ImageGeometry {
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub rotation: f64,
+    pub flip_x: bool,
+    pub flip_y: bool,
+    // Fractions removed at the left, top, right and bottom edges.
+    pub crop: [f64; 4],
 }
 fn is_plain(s: &Style) -> bool {
     *s == Style::default()

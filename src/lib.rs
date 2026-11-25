@@ -93,7 +93,7 @@ fn convert_selected(
         if let Some(range) = range {
             range.validate(1)?;
         }
-        hwp3::parse(b)?
+        hwp3::parse(b, images)?
     } else if b.starts_with(b"PK\x03\x04") {
         office::package(b, images, range)?
     } else if b.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") {
@@ -116,8 +116,8 @@ pub const FORMATS: &[(&str, &str, &str)] = &[
     ),
     (
         "hwp",
-        "HWP 3.x raw DEFLATE, KSSM text and controls; HWP 5 BodyText, Unicode paragraphs, tables and embedded raster pictures",
-        "HWP 3.x image extraction and detailed layout/style restoration are partial; HWP 5 distribution-protected files and general vector drawings are unsupported",
+        "HWP 3.x KSSM text, tables, vector drawings as SVG, and positioned HTML pages; HWP 5 BodyText, Unicode paragraphs, tables and embedded raster pictures",
+        "HWP 3.x legacy picture encodings, advanced drawing effects and typography are partial; HWP 5 distribution-protected files and general vector drawings are unsupported",
     ),
     (
         "hwpx",
@@ -141,8 +141,8 @@ pub const FORMATS: &[(&str, &str, &str)] = &[
     ),
     (
         "pptx",
-        "Presentation order, title placeholders, text boxes, tables, links, images, notes",
-        "Group transforms, charts, master inheritance and animations are partial",
+        "Presentation order, text boxes, tables, links, images, notes, and HTML slide geometry with group transforms and basic preset shapes",
+        "Charts, SmartArt, custom shapes, master styling and animations are partial",
     ),
     (
         "xls",

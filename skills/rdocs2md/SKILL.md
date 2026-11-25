@@ -35,7 +35,7 @@ Default output is a UTF-8 `.md` file next to the input. Existing results may be 
 | `--pages RANGE` (`--slides`, `--sheets`, `--chapters`, `--range`) | 1-based inclusive units, e.g. `1-3,5` |
 | `--sheet NAME\|NUMBER` | Only this workbook sheet, by title or 1-based number; repeatable |
 | `--json PATH` | Also write the JSON IR |
-| `--extract-images`, `--image-dir DIR` | Export embedded raster images |
+| `--extract-images`, `--image-dir DIR` | Export graphic assets as separate files |
 | `--include-images` | Inline images into HTML results as `data:` URIs (implies extraction) |
 | `--search QUERY`, `--case-sensitive`, `--limit N` | Search text, return JSON |
 | `-j`, `--jobs N` | Batch workers, 1-64, default CPU count |
@@ -71,9 +71,9 @@ Cite from a hit using `block_id` (`s2-b1`, plus `-r2c3` for a table cell), `sour
 
 ## Images
 
-`--extract-images` writes supported raster images next to the output, with converter-generated names and links relative to the output location; `--image-dir` sets the destination (a subdirectory per document in a batch).
+HTML embeds supported images and HWP 3.x vector drawings by default. `--extract-images` writes those assets next to the output and links to them using converter-generated filenames. `--image-dir` sets the destination (a subdirectory per document in a batch).
 
-`--include-images` does the same for HTML results and also embeds each image as a base64 `data:` URI in `src`, so the single `.html` file renders like the source after it is moved. The extracted file path stays next to it as `data-path`. Other formats keep plain file links.
+`--include-images` embeds the assets in the HTML and writes separate copies. The extracted file path stays next to each embed as `data-path`. Other formats keep plain file links.
 
 ## Memory and limits
 

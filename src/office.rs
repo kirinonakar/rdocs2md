@@ -7,6 +7,7 @@ use crate::{
     visibility::flag_text,
 };
 use std::collections::{HashMap, HashSet};
+mod slides;
 pub fn relationships(
     pkg: &mut Package,
     part: &str,
@@ -179,6 +180,7 @@ fn ooxml(
     main: &str,
     kind: &str,
     range: Option<&SectionRange>,
+    images: bool,
 ) -> Result<Document> {
     let mut doc = Document::new(kind);
     metadata(pkg, &mut doc, "docProps/core.xml")?;
@@ -389,6 +391,15 @@ fn ooxml(
             let slide_size = child(root, "sldSz")
                 .and_then(|n| dimensions(n, "cx", "cy"))
                 .filter(|&(w, h)| w > 0. && h > 0.);
+            let positioned_size =
+                slide_size.filter(|&(w, h)| images && w <= 190_500_000. && h <= 190_500_000.);
+            let palette = if positioned_size.is_some() {
+                slides::palette(pkg, types.get("theme")).unwrap_or_default()
+            } else {
+                slides::Palette::new()
+            };
+            let mut layouts = HashMap::new();
+            let empty_template = slides::Template::default();
             for i in section_indices(range, slides.len())? {
                 let slide = slides[i];
                 let id = slide
@@ -413,9 +424,28 @@ fn ooxml(
                 let tree = desc(x.root(), "spTree")
                     .next()
                     .ok_or("slide shape tree missing")?;
+                let template = if positioned_size.is_some()
+                    && let Some(path) = types.get("slideLayout")
+                {
+                    layouts.entry(path.clone()).or_insert_with(|| {
+                        slides::Template::read(pkg, path, &palette).unwrap_or_default()
+                    })
+                } else {
+                    &empty_template
+                };
+                let reader = slides::SlideReader {
+                    flow: &flow,
+                    template,
+                    palette: &palette,
+                };
+                let mut frames = Vec::new();
                 for shape in tree.children().filter(|c| c.is_element()) {
                     let from = sec.blocks.len();
-                    flow.blocks(shape, &mut sec.blocks)?;
+                    if positioned_size.is_some() {
+                        reader.collect(shape, slides::IDENTITY, &mut sec.blocks, &mut frames)?;
+                    } else {
+                        flow.blocks(shape, &mut sec.blocks)?;
+                    }
                     if let Some(bounds) = slide_size
                         && off_slide(shape, bounds)
                     {
@@ -426,6 +456,17 @@ fn ooxml(
                         && let Some(Block::Paragraph { heading, .. }) = sec.blocks.get_mut(from)
                     {
                         *heading = 1
+                    }
+                }
+                if let Some((w, h)) = positioned_size {
+                    let background = slides::background(x.root_element(), &palette)
+                        .or_else(|| template.background.clone());
+                    if !frames.is_empty() || background.is_some() {
+                        sec.slide_layout = Some(SlideLayout {
+                            size: [w / 9525., h / 9525.],
+                            background,
+                            frames,
+                        });
                     }
                 }
                 if let Some(p) = types.get("notesSlide") {
@@ -807,7 +848,7 @@ pub fn package(data: &[u8], images: bool, range: Option<&SectionRange>) -> Resul
             } else {
                 return Err("unsupported Office content type".into());
             };
-            ooxml(&mut pkg, main, kind, range)?
+            ooxml(&mut pkg, main, kind, range, images)?
         }
         _ => return Err("unrecognized ZIP document structure".into()),
     };

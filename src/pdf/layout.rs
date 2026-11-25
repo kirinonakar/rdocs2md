@@ -1,5 +1,5 @@
-use crate::model::{Block, Cell, Properties, Run, Section, push_run};
 use super::math::{Glyph, Script, Segment, to_latex};
+use crate::model::{Block, Cell, Properties, Run, Section, push_run};
 use std::{collections::BTreeMap, ops::Range};
 
 pub(super) struct Fragment {
@@ -1255,6 +1255,16 @@ fn grid_tables(
                 let cell_right = x_edges[end_column];
                 let cell_top = y_edges[row];
                 let cell_bottom = y_edges[end_row];
+                crate::formatting::points(
+                    &mut cell.properties,
+                    "width",
+                    Some(f64::from(cell_right - cell_left)),
+                );
+                crate::formatting::points(
+                    &mut cell.properties,
+                    "height",
+                    Some(f64::from(cell_top - cell_bottom)),
+                );
                 if let Some(border) =
                     horizontal_edge(&component_horizontal, cell_top, cell_left, cell_right)
                 {
@@ -2065,10 +2075,8 @@ fn reflow(items: Vec<Item>, out: &mut Vec<Block>) {
                         properties.insert("last_y_pt".into(), y.to_string());
                         properties.insert("x_pt".into(), left.to_string());
                         properties.insert("w_pt".into(), (end - left).max(0.).to_string());
-                        properties.insert(
-                            "h_pt".into(),
-                            (top - row_y + row_size).max(0.).to_string(),
-                        );
+                        properties
+                            .insert("h_pt".into(), (top - row_y + row_size).max(0.).to_string());
                     }
                     bounds = Some((left, top, end));
                     previous = Some(LineInfo {

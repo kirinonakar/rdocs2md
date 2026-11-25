@@ -27,7 +27,7 @@ Example: rdocs2md "report.pdf" -o "report.md"
   --slides, --sheets, --chapters, --range   Aliases for --pages
   --sheet NAME|NUMBER      Select workbook sheets by title or 1-based number (repeatable; xls, xlsx, ods)
   --json PATH              Also save JSON IR to a file, or a directory for multiple inputs
-  --extract-images         Extract supported embedded raster images
+  --extract-images         Save embedded images as separate files (HTML embeds them by default)
   --image-dir DIRECTORY    Select image destination (implies extraction)
   --include-images         Inline images into HTML results (implies extraction)
   -r, --recursive          Scan subfolders for directory and wildcard inputs
@@ -208,7 +208,8 @@ fn convert(
 ) -> Result<Completed> {
     // Workers run this closure on their own thread, so the budget is per input.
     let _budget = rdocs2md::limits::start(a.timeout);
-    let d = load_sheets(input, a.images, a.range.as_deref(), &a.sheets)?;
+    let images = a.images || (a.query.is_none() && a.format == "html");
+    let d = load_sheets(input, images, a.range.as_deref(), &a.sheets)?;
     if let Some(query) = &a.query {
         let result = query.find(&d);
         let mut emit = if multi {
@@ -241,7 +242,7 @@ fn convert(
         };
         links = output::extract(&d, &dir, base)?;
         if a.include_images && a.format == "html" {
-            links = output::inline(&d, &links);
+            links = output::inline(&d, &links)?;
         }
     }
     let text = render(&d, &a.format, &a.mode, &links)?;

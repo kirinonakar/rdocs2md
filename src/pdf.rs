@@ -635,7 +635,11 @@ fn unpack(
                     let byte = line[bit / 8];
                     let shift = 8 - bpc - bit % 8;
                     let value = u16::from((byte >> shift) & (max as u8));
-                    out.push(if scale { (value * 255 / max) as u8 } else { value as u8 });
+                    out.push(if scale {
+                        (value * 255 / max) as u8
+                    } else {
+                        value as u8
+                    });
                     bit += bpc;
                 }
             }
@@ -1470,6 +1474,22 @@ impl PageReader<'_> {
                                     discretionary_hyphen: false,
                                     runs: vec![Run {
                                         image: Some(name),
+                                        image_geometry: {
+                                            let [a, b, c, d, _, _] = ctm.0;
+                                            let width = f64::from(a.hypot(b)) * self.user_unit;
+                                            let height = f64::from(c.hypot(d)) * self.user_unit;
+                                            (width > 0.
+                                                && width <= 10000.
+                                                && height > 0.
+                                                && height <= 10000.)
+                                                .then_some(ImageGeometry {
+                                                    width: Some(width),
+                                                    height: Some(height),
+                                                    rotation: f64::from(-b.atan2(a)).to_degrees(),
+                                                    flip_y: a * d - b * c < 0.,
+                                                    ..ImageGeometry::default()
+                                                })
+                                        },
                                         ..Run::default()
                                     }],
                                 });
@@ -1521,8 +1541,12 @@ pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<
             // Leave a marker where extraction stopped: warnings travel outside the
             // body, so a reader of the body alone would not see the gap.
             let mut skipped = Section::new("page", String::new()).indexed(idx);
-            skipped.properties.insert("page".into(), (idx + 1).to_string());
-            skipped.properties.insert("skipped".into(), "time_limit".into());
+            skipped
+                .properties
+                .insert("page".into(), (idx + 1).to_string());
+            skipped
+                .properties
+                .insert("skipped".into(), "time_limit".into());
             doc.sections.push(skipped);
             break;
         }
@@ -1740,7 +1764,9 @@ fn page_outlines(pdf: &Pdf, pages: &[lopdf::ObjectId]) -> HashMap<usize, Vec<(u8
         pages.iter().enumerate().map(|(i, id)| (*id, i)).collect();
     for entry in outlines(pdf) {
         if let Some(&page) = index.get(&entry.page) {
-            map.entry(page).or_default().push((entry.level, entry.title));
+            map.entry(page)
+                .or_default()
+                .push((entry.level, entry.title));
         }
     }
     map
@@ -1763,9 +1789,7 @@ fn apply_outlines(sec: &mut Section, entries: &[(u8, String)]) {
         let mut partial = None;
         for (index, block) in sec.blocks.iter().enumerate().skip(cursor) {
             let Block::Paragraph {
-                heading: 0,
-                runs,
-                ..
+                heading: 0, runs, ..
             } = block
             else {
                 continue;

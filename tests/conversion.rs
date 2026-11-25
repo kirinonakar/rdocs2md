@@ -703,6 +703,143 @@ fn html_hwpx_keeps_referenced_cell_border_fill_and_alignment() {
 }
 
 #[test]
+fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
+    fn short(buffer: &mut [u8], offset: usize, value: u16) {
+        buffer[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn drawing(kind: u16, order: i32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for value in [24i32, order, 1, -10, -10, 800, 600, 88] {
+            payload.extend(value.to_le_bytes());
+        }
+        let mut shape = [0u8; 88];
+        short(&mut shape, 0, kind);
+        for (offset, value) in [(12, 780i32), (16, 580), (60, 20), (64, 0x00_00_ff)] {
+            shape[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        payload.extend(shape);
+        if kind == 1 {
+            payload.extend([4, 0, 0, 0, 0, 0, 0, 0]);
+        } else {
+            payload.extend([0; 4]);
+        }
+        payload.extend([0; 4]);
+        payload
+    }
+
+    let mut input = b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05".to_vec();
+    input.resize(30 + 128 + 1008 + 16, 0);
+    short(&mut input, 30 + 6, 21000);
+    short(&mut input, 30 + 8, 15000);
+    short(&mut input, 30 + 14, 2000);
+    let mut paragraph = [0u8; 43 + 14];
+    paragraph[0] = 1;
+    short(&mut paragraph, 1, 18);
+    short(&mut paragraph, 3, 1);
+    short(&mut paragraph, 12, 250);
+    short(&mut paragraph, 43 + 6, 400);
+    input.extend(paragraph);
+    for (kind, order, x) in [(1, 4, 900), (3, 2, 800)] {
+        input.extend([11, 0, 0, 0, 0, 0, 11, 0]);
+        let payload = drawing(kind, order);
+        let mut picture = [0u8; 348];
+        picture[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        picture[8] = 3;
+        picture[74] = 3;
+        short(&mut picture, 62, x);
+        short(&mut picture, 64, 1000);
+        input.extend(picture);
+        input.extend(payload);
+        input.extend([0; 43]);
+    }
+    for unit in [9, 450, 0, 9]
+        .into_iter()
+        .chain("Label".encode_utf16())
+        .chain([13])
+    {
+        input.extend(unit.to_le_bytes());
+    }
+    input.extend([0; 43]);
+
+    let doc = convert(&input, true).unwrap();
+    let first = std::str::from_utf8(&doc.assets["hwp3/drawing/1"]).unwrap();
+    let second = std::str::from_utf8(&doc.assets["hwp3/drawing/2"]).unwrap();
+    assert!(
+        first.contains("<line")
+            && second.contains("<ellipse")
+            && second.contains("fill=\"#ff0000\"")
+    );
+    let html = render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+    assert!(html.contains("viewBox=\"0 0 15000 21000\""));
+    assert_eq!(html.matches("href=\"data:image/svg+xml;base64,").count(), 2);
+    assert!(html.find("<image x=\"2790\"").unwrap() < html.find("<image x=\"2890\"").unwrap());
+    assert!(html.contains("width:450px\"></span>Label"));
+    assert_eq!(html.matches("Label").count(), 1);
+    assert!(!html.contains("[그림]"));
+    assert!(
+        serde_json::to_string(&convert(&input, false).unwrap())
+            .unwrap()
+            .contains("[그림][그림]")
+    );
+}
+
+#[test]
+fn html_docx_table_widths_follow_the_source_grid_across_rowspans() {
+    let doc = convert(&package(&[
+        ("[Content_Types].xml", "<Types><Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/></Types>"),
+        ("_rels/.rels", "<Relationships><Relationship Id='r' Type='rel/officeDocument' Target='word/document.xml'/></Relationships>"),
+        ("word/document.xml", "<document><body><tbl><tblGrid><gridCol w='900'/><gridCol w='2700'/></tblGrid><tr><trPr><trHeight val='520'/></trPr><tc><tcPr><vMerge val='restart'/></tcPr><p><r><t>A</t></r></p></tc><tc><p><r><t>B</t></r></p></tc></tr><tr><tc><tcPr><vMerge/></tcPr><p/></tc><tc><p><r><t>C</t></r></p></tc></tr></tbl></body></document>"),
+    ]), false).unwrap();
+    let html = render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+    for value in [
+        "width:180.0000pt;table-layout:fixed",
+        "width:25.00000%",
+        "width:75.00000%",
+        "rowspan=\"2\"",
+        "height:26pt;",
+    ] {
+        assert!(html.contains(value), "{value} in {html}");
+    }
+}
+
+#[test]
+fn html_pptx_keeps_layer_order_theme_fill_and_group_positions() {
+    let input = package(&[
+        (
+            "[Content_Types].xml",
+            "<Types><Override PartName='/ppt/presentation.xml' ContentType='application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml'/></Types>",
+        ),
+        (
+            "_rels/.rels",
+            "<Relationships><Relationship Id='r' Type='rel/officeDocument' Target='ppt/presentation.xml'/></Relationships>",
+        ),
+        (
+            "ppt/presentation.xml",
+            "<presentation xmlns:r='urn:relationships'><sldIdLst><sldId r:id='A'/></sldIdLst><sldSz cx='9525000' cy='4762500'/></presentation>",
+        ),
+        (
+            "ppt/_rels/presentation.xml.rels",
+            "<Relationships><Relationship Id='A' Type='rel/slide' Target='slides/slide1.xml'/><Relationship Id='B' Type='rel/theme' Target='theme/theme1.xml'/></Relationships>",
+        ),
+        (
+            "ppt/slides/slide1.xml",
+            "<sld><cSld><spTree><grpSp><grpSpPr><xfrm><off x='952500' y='476250'/><ext cx='1905000' cy='1905000'/><chOff x='0' y='0'/><chExt cx='952500' cy='952500'/></xfrm></grpSpPr><sp><spPr><xfrm><off x='95250' y='95250'/><ext cx='476250' cy='476250'/></xfrm><prstGeom prst='ellipse'/><solidFill><schemeClr val='accent1'/></solidFill></spPr></sp><sp><spPr><xfrm><off x='190500' y='190500'/><ext cx='666750' cy='476250'/></xfrm></spPr><txBody><p><r><t>Front label</t></r></p></txBody></sp></grpSp></spTree></cSld></sld>",
+        ),
+        (
+            "ppt/theme/theme1.xml",
+            "<theme><themeElements><clrScheme><accent1><srgbClr val='224466'/></accent1></clrScheme></themeElements></theme>",
+        ),
+    ]);
+    let doc = convert(&input, true).unwrap();
+    let html = render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+    assert!(html.contains("viewBox=\"0 0 1000 500\""));
+    assert!(html.contains("matrix(2.000000 0.000000 0.000000 2.000000 120.000000 70.000000)"));
+    assert!(html.find("fill=\"#224466\"").unwrap() < html.find("Front label").unwrap());
+    assert_eq!(html.matches("Front label").count(), 1);
+    assert!(md(&doc).contains("Front label"));
+}
+
+#[test]
 fn hwpx_bold_labels_keep_literal_angle_brackets_in_markdown() {
     let doc = convert(
         &package(&[
@@ -940,7 +1077,10 @@ fn xlsx_csv_selects_sheets_and_quotes_fields() {
     ]);
     let d = convert(&data, false).unwrap();
     let all = render(&d, "csv", "hybrid", &Properties::new()).unwrap();
-    assert!(all.starts_with("# Sheet: 매출\n이름,\"값, 단위\"\n"), "{all}");
+    assert!(
+        all.starts_with("# Sheet: 매출\n이름,\"값, 단위\"\n"),
+        "{all}"
+    );
     assert!(all.ends_with("# Sheet: Summary\n42\n"), "{all}");
     let d = convert_sheets(&data, false, None, &["summary".into()]).unwrap();
     assert_eq!(d.sections.len(), 1);
@@ -966,7 +1106,8 @@ fn pdf_outline_titles_become_markdown_headings() {
 
     let mut pdf = Pdf::with_version("1.4");
     let tree = pdf.new_object_id();
-    let font = pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
+    let font =
+        pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
     let resources = dictionary! {"Font"=>dictionary! {"F"=>font}};
     let content = "BT /F 16 Tf 1 0 0 1 30 180 Tm (Chapter One) Tj ET\n\
                    BT /F 10 Tf 1 0 0 1 30 150 Tm (First body paragraph.) Tj ET\n\
@@ -980,8 +1121,10 @@ fn pdf_outline_titles_become_markdown_headings() {
     let parent = pdf.new_object_id();
     pdf.objects.insert(child, dictionary! {"Title"=>Object::string_literal("Section A"),"Dest"=>vec![Object::Reference(page).into(),"XYZ".into(),0.into(),100.into(),0.into()]}.into());
     pdf.objects.insert(parent, dictionary! {"Title"=>Object::string_literal("Chapter One"),"Dest"=>vec![Object::Reference(page).into(),"XYZ".into(),0.into(),180.into(),0.into()],"First"=>Object::Reference(child)}.into());
-    let outlines = pdf.add_object(dictionary! {"Type"=>"Outlines","First"=>Object::Reference(parent)});
-    let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree,"Outlines"=>outlines});
+    let outlines =
+        pdf.add_object(dictionary! {"Type"=>"Outlines","First"=>Object::Reference(parent)});
+    let catalog =
+        pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree,"Outlines"=>outlines});
     pdf.trailer.set("Root", catalog);
     let mut bytes = Vec::new();
     pdf.save_to(&mut bytes).unwrap();
@@ -998,7 +1141,8 @@ fn pdf_raster_images_are_exported_as_png() {
 
     let mut pdf = Pdf::with_version("1.4");
     let tree = pdf.new_object_id();
-    let font = pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
+    let font =
+        pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     // 2x2 DeviceRGB samples: red, green, blue, white.
     encoder
@@ -1006,8 +1150,12 @@ fn pdf_raster_images_are_exported_as_png() {
         .unwrap();
     let data = encoder.finish().unwrap();
     let image = pdf.add_object(Stream::new(dictionary! {"Type"=>"XObject","Subtype"=>"Image","Width"=>2,"Height"=>2,"ColorSpace"=>"DeviceRGB","BitsPerComponent"=>8,"Filter"=>"FlateDecode"}, data));
-    let resources = dictionary! {"Font"=>dictionary! {"F"=>font},"XObject"=>dictionary! {"Im"=>image}};
-    let stream = pdf.add_object(Stream::new(dictionary! {}, b"q 10 0 0 10 30 150 cm /Im Do Q".to_vec()));
+    let resources =
+        dictionary! {"Font"=>dictionary! {"F"=>font},"XObject"=>dictionary! {"Im"=>image}};
+    let stream = pdf.add_object(Stream::new(
+        dictionary! {},
+        b"q 10 0 0 10 30 150 cm /Im Do Q".to_vec(),
+    ));
     let page = pdf.add_object(dictionary! {"Type"=>"Page","Parent"=>tree,"Contents"=>stream,"Resources"=>resources,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]});
     pdf.objects.insert(tree, dictionary! {"Type"=>"Pages","Kids"=>vec![Object::Reference(page)],"Count"=>1,"MediaBox"=>vec![0.into(),0.into(),320.into(),220.into()]}.into());
     let catalog = pdf.add_object(dictionary! {"Type"=>"Catalog","Pages"=>tree});
@@ -1104,17 +1252,38 @@ fn pdf_indexed_images_keep_their_palette_indices() {
 #[test]
 fn docx_comments_and_tracked_deletions_are_reported() {
     let data = package(&[
-        ("[Content_Types].xml", "<Types><Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/></Types>"),
-        ("_rels/.rels", "<Relationships><Relationship Id='r1' Target='word/document.xml' Type='rel/officeDocument'/></Relationships>"),
-        ("word/_rels/document.xml.rels", "<Relationships><Relationship Id='C' Target='comments.xml' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'/></Relationships>"),
-        ("word/comments.xml", "<comments><comment id='1' author='Kim' date='2024-01-02T03:04:05Z'><p><r><t>Please revise this paragraph.</t></r></p></comment></comments>"),
-        ("word/document.xml", "<document><body><p><r><t>Kept text</t></r><del><r><delText>Removed text</delText></r></del><commentRangeStart id='1'/><r><t>Reviewed text</t></r><commentRangeEnd id='1'/></p><sectPr/></body></document>"),
+        (
+            "[Content_Types].xml",
+            "<Types><Override PartName='/word/document.xml' ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/></Types>",
+        ),
+        (
+            "_rels/.rels",
+            "<Relationships><Relationship Id='r1' Target='word/document.xml' Type='rel/officeDocument'/></Relationships>",
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            "<Relationships><Relationship Id='C' Target='comments.xml' Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments'/></Relationships>",
+        ),
+        (
+            "word/comments.xml",
+            "<comments><comment id='1' author='Kim' date='2024-01-02T03:04:05Z'><p><r><t>Please revise this paragraph.</t></r></p></comment></comments>",
+        ),
+        (
+            "word/document.xml",
+            "<document><body><p><r><t>Kept text</t></r><del><r><delText>Removed text</delText></r></del><commentRangeStart id='1'/><r><t>Reviewed text</t></r><commentRangeEnd id='1'/></p><sectPr/></body></document>",
+        ),
     ]);
     let d = convert(&data, false).unwrap();
     let s = md(&d);
-    assert!(s.contains("Kept text") && s.contains("Reviewed text"), "{s}");
+    assert!(
+        s.contains("Kept text") && s.contains("Reviewed text"),
+        "{s}"
+    );
     assert!(!s.contains("Removed text"), "{s}");
-    assert!(d.sections.iter().any(|s| s.kind == "comments"), "comments section");
+    assert!(
+        d.sections.iter().any(|s| s.kind == "comments"),
+        "comments section"
+    );
     assert!(s.contains("Please revise this paragraph."), "{s}");
     assert!(s.contains("Kim"), "{s}");
     assert!(

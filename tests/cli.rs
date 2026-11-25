@@ -118,12 +118,20 @@ fn include_images_inlines_html_pictures_with_paths() {
         String::from_utf8_lossy(&result.stderr)
     );
     let html = fs::read_to_string(d.path("pic.html")).unwrap();
-    assert!(html.contains("src=\"data:image/gif;base64,R0lGOD"), "{html}");
+    assert!(
+        html.contains("src=\"data:image/gif;base64,R0lGOD"),
+        "{html}"
+    );
     assert!(
         html.contains("data-path=\"pic_images/image-1.gif\""),
         "{html}"
     );
     assert!(d.path("pic_images/image-1.gif").is_file());
+    let result = d.run(&["pic.rtf", "--format", "html", "--stdout"]);
+    assert!(result.status.success());
+    let inline = String::from_utf8(result.stdout).unwrap();
+    assert!(inline.contains("src=\"data:image/gif;base64,R0lGOD"));
+    assert!(!inline.contains("data-path="));
 }
 
 #[test]
@@ -144,7 +152,10 @@ fn csv_and_sheet_options_require_a_workbook() {
         "{}",
         String::from_utf8_lossy(&sheet.stderr)
     );
-    assert_eq!(work.run(&["note.rtf", "--format", "tsv"]).status.code(), Some(2));
+    assert_eq!(
+        work.run(&["note.rtf", "--format", "tsv"]).status.code(),
+        Some(2)
+    );
 }
 
 #[test]
@@ -223,7 +234,10 @@ fn parallel_batch_keeps_input_order() {
         .collect();
     assert_eq!(lines.len(), names.len());
     for (i, line) in lines.iter().enumerate() {
-        assert!(line["input"].as_str().unwrap().ends_with(names[i]), "{line}");
+        assert!(
+            line["input"].as_str().unwrap().ends_with(names[i]),
+            "{line}"
+        );
         assert!(
             line["content"]
                 .as_str()

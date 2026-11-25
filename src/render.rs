@@ -1,5 +1,5 @@
 use crate::{formatting, model::*, output};
-use std::fmt::Write;
+use std::{borrow::Cow, collections::HashSet, fmt::Write, ops::Range};
 pub fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -41,52 +41,225 @@ fn potential_markup(tail: &str) -> bool {
 /// without backslashes. Font changes split one annotation into several runs, so
 /// the rule only escapes a pair that is complete inside the same text fragment.
 fn link_brackets(text: &str) -> Vec<usize> {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut escaped = Vec::new();
-    for (i, (start, c)) in chars.iter().enumerate() {
-        if *c != '[' {
-            continue;
-        }
-        let Some(j) = (i + 1..chars.len()).find(|&j| chars[j].1 == ']') else {
-            continue;
-        };
-        if matches!(chars.get(j + 1).map(|(_, c)| *c), Some('(') | Some('[')) {
-            escaped.push(*start);
-            escaped.push(chars[j].0);
+    let mut openings = Vec::new();
+    for (i, bracket) in text.match_indices(['[', ']']) {
+        if bracket == "[" {
+            openings.push(i);
+        } else {
+            if !openings.is_empty() && matches!(text.as_bytes().get(i + 1), Some(b'(' | b'[')) {
+                escaped.append(&mut openings);
+                escaped.push(i);
+            }
+            openings.clear();
         }
     }
     escaped
 }
 
-fn markdown(s: &str) -> String {
-    let mut out = String::new();
-    for line in s.split_inclusive('\n') {
-        let mut margin = true;
-        let link = link_brackets(line);
-        for (i, c) in line.char_indices() {
-            match c {
-                '&' => out.push_str("&amp;"),
-                '<' if potential_markup(&line[i + 1..]) => out.push_str("\\<"),
-                // `>` is never escaped: font changes often start a run with the
-                // closing bracket of `<보기>` or with the arrow of `고개 > 고개`,
-                // and both are plain text.
-                '[' | ']' if !link.contains(&i) => out.push(c),
-                '\\' | '*' | '_' | '[' | ']' | '|' | '~' | '\u{60}' => {
-                    out.push('\\');
-                    out.push(c)
-                }
-                '#' | '+' | '-' if margin => {
-                    out.push('\\');
-                    out.push(c)
-                }
-                _ => out.push(c),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MarkdownContext {
+    Block,
+    Heading,
+    Table,
+}
+
+fn block_marker(line: &str) -> bool {
+    let line = line.trim_end_matches([' ', '\t', '\r', '\n']);
+    let Some(marker) = line.chars().next() else {
+        return false;
+    };
+    let rest = &line[marker.len_utf8()..];
+    let list = rest.is_empty() || rest.starts_with([' ', '\t']);
+    let rule = || {
+        line.chars().filter(|&c| c == marker).count() >= 3
+            && rest.chars().all(|c| c == marker || matches!(c, ' ' | '\t'))
+    };
+    match marker {
+        '-' => list || rest.chars().all(|c| c == '-') || rule(),
+        '*' => list || rule(),
+        '+' => list,
+        '_' => rule(),
+        '#' => {
+            let tail = rest.trim_start_matches('#');
+            rest.len() - tail.len() < 6 && (tail.is_empty() || tail.starts_with([' ', '\t']))
+        }
+        '~' => rest.starts_with("~~"),
+        '`' => rest.starts_with("``") && !rest.trim_start_matches('`').contains('`'),
+        _ => false,
+    }
+}
+
+/// Mark literal delimiter runs that could open emphasis, strikethrough or code.
+/// An underscore cannot open after a letter or digit or close before one.
+fn inline_delimiters(
+    text: &str,
+    markup_edges: &[usize],
+    styled_stars: bool,
+    styled_tildes: bool,
+) -> Vec<Range<usize>> {
+    let mut escaped = Vec::new();
+    let mut chars = text.char_indices().rev().peekable();
+    let mut after = ' ';
+    let mut closers = [false; 4];
+    let mut code_lengths = HashSet::new();
+    while let Some((mut start, marker)) = chars.next() {
+        if !matches!(marker, '*' | '_' | '~' | '`') {
+            after = marker;
+            continue;
+        }
+        let end = start + 1;
+        while chars.peek().is_some_and(|&(_, c)| c == marker)
+            && markup_edges.binary_search(&start).is_err()
+        {
+            start = chars.next().unwrap().0;
+        }
+        // Generated formatting separates literal characters at the run boundary.
+        let left_edge = markup_edges.binary_search(&start).is_ok();
+        let right_edge = markup_edges.binary_search(&end).is_ok();
+        let before = if left_edge {
+            '!'
+        } else {
+            chars.peek().map_or(' ', |&(_, c)| c)
+        };
+        let next = if right_edge { '!' } else { after };
+        let length = end - start;
+        let escape = match marker {
+            '`' => !code_lengths.insert(length),
+            '~' if length > 2 => styled_tildes && (left_edge || right_edge),
+            _ => {
+                let index = match marker {
+                    '*' => 0,
+                    '_' => 1,
+                    _ => 1 + length,
+                };
+                let opens = !next.is_whitespace() && (marker != '_' || !before.is_alphanumeric());
+                let closes = !before.is_whitespace() && (marker != '_' || !next.is_alphanumeric());
+                let generated = (marker == '*' && styled_stars) || (marker == '~' && styled_tildes);
+                let escape = (opens && closers[index]) || (generated && (opens || closes));
+                closers[index] |= closes;
+                escape
             }
-            if !c.is_whitespace() {
-                margin = false
+        };
+        if escape {
+            escaped.push(start..end);
+        }
+        after = marker;
+    }
+    escaped
+}
+
+struct MarkdownEscaper<'a> {
+    source: &'a str,
+    delimiters: Vec<Range<usize>>,
+    context: MarkdownContext,
+    heading_hash: Option<usize>,
+}
+
+impl<'a> MarkdownEscaper<'a> {
+    fn new(source: &'a str, context: MarkdownContext, runs: &[Run]) -> Self {
+        let mut markup_edges = Vec::new();
+        let mut offset = 0;
+        for run in runs {
+            let plain = markdown_plain(run);
+            if !plain {
+                markup_edges.push(offset);
+            }
+            offset += run.text.len();
+            if !plain {
+                markup_edges.push(offset);
             }
         }
+        let heading_hash = if context == MarkdownContext::Heading {
+            let line = source
+                .split('\n')
+                .next()
+                .unwrap()
+                .trim_end_matches([' ', '\t', '\r']);
+            let prefix = line.trim_end_matches('#');
+            (prefix.len() < line.len() && (prefix.is_empty() || prefix.ends_with([' ', '\t'])))
+                .then_some(prefix.len())
+        } else {
+            None
+        };
+        Self {
+            source,
+            delimiters: inline_delimiters(
+                source,
+                &markup_edges,
+                runs.iter().any(|r| r.style.bold || r.style.italic),
+                runs.iter().any(|r| r.style.strike),
+            ),
+            context,
+            heading_hash,
+        }
     }
-    out
+
+    fn escape(&mut self, range: Range<usize>, starts_line: bool) -> String {
+        let mut out = String::with_capacity(range.len());
+        let mut offset = range.start;
+        for (n, line) in self.source[range].split_inclusive('\n').enumerate() {
+            let mut block = None;
+            let mut table_pipe = None;
+            if (n > 0 || starts_line)
+                && self.context != MarkdownContext::Table
+                && (self.context != MarkdownContext::Heading || n > 0)
+                && line
+                    .trim_start_matches([' ', '\t'])
+                    .starts_with(['-', '+', '*', '_', '#', '~', '`', '|', ':'])
+            {
+                let full_line = self.source[offset..].split('\n').next().unwrap();
+                let trimmed = full_line.trim_start_matches([' ', '\t']);
+                if block_marker(trimmed) {
+                    block = Some(full_line.len() - trimmed.len());
+                }
+                if full_line.contains('-')
+                    && full_line
+                        .bytes()
+                        .all(|b| matches!(b, b'|' | b'-' | b':' | b' ' | b'\t' | b'\r'))
+                {
+                    table_pipe = full_line.find('|');
+                }
+            }
+            let link = link_brackets(line);
+            for (i, c) in line.char_indices() {
+                while self
+                    .delimiters
+                    .last()
+                    .is_some_and(|range| range.end <= offset + i)
+                {
+                    self.delimiters.pop();
+                }
+                let inline = self
+                    .delimiters
+                    .last()
+                    .is_some_and(|range| range.contains(&(offset + i)));
+                let escape = inline
+                    || block == Some(i)
+                    || match c {
+                        '<' => potential_markup(&line[i + 1..]),
+                        '[' | ']' => link.binary_search(&i).is_ok(),
+                        '|' => self.context == MarkdownContext::Table || table_pipe == Some(i),
+                        '#' => self.heading_hash == Some(offset + i),
+                        '\\' => line
+                            .as_bytes()
+                            .get(i + 1)
+                            .is_none_or(|b| b.is_ascii_punctuation() || matches!(b, b'\r' | b'\n')),
+                        _ => false,
+                    };
+                if escape {
+                    out.push('\\');
+                }
+                if c == '&' {
+                    out.push_str("&amp;");
+                } else {
+                    out.push(c);
+                }
+            }
+            offset += line.len();
+        }
+        out
+    }
 }
 
 fn pdf_font_size(runs: &[Run]) -> f32 {
@@ -131,13 +304,87 @@ fn uri(s: &str) -> String {
         .replace('>', "%3E")
         .replace('"', "%22")
 }
-fn runs(items: &[Run], html: bool, links: &Properties) -> String {
-    let mut out = String::new();
-    for r in items {
-        let mut t = if html {
-            escape(&r.text).replace('\n', "<br>")
+
+fn html_image(alt: &str, src: &str, path: &str, layout: &ImageGeometry) -> String {
+    let mut style = String::new();
+    if let Some(w) = layout.width {
+        let _ = write!(style, "width:{w:.4}pt;");
+    }
+    if let Some(h) = layout.height {
+        if let Some(w) = layout.width {
+            let _ = write!(style, "aspect-ratio:{w:.4}/{h:.4};");
         } else {
-            markdown(&r.text).replace('\n', "  \n")
+            let _ = write!(style, "height:{h:.4}pt;");
+        }
+    }
+    if layout.rotation != 0. || layout.flip_x || layout.flip_y {
+        let _ = write!(
+            style,
+            "transform:rotate({:.4}deg) scale({},{});",
+            layout.rotation,
+            if layout.flip_x { -1 } else { 1 },
+            if layout.flip_y { -1 } else { 1 }
+        );
+    }
+    let [left, top, right, bottom] = layout.crop;
+    let (x, y) = (1. - left - right, 1. - top - bottom);
+    if layout.width.is_some()
+        && layout.height.is_some()
+        && layout.crop != [0.; 4]
+        && x >= 0.001
+        && y >= 0.001
+    {
+        format!(
+            "<span class=\"source-crop\" style=\"{style}\"><img alt=\"{alt}\" src=\"{src}\"{path} style=\"left:{:.5}%;top:{:.5}%;width:{:.5}%;height:{:.5}%\"></span>",
+            -100. * left / x,
+            -100. * top / y,
+            100. / x,
+            100. / y
+        )
+    } else {
+        format!("<img alt=\"{alt}\" src=\"{src}\"{path} style=\"{style}\">")
+    }
+}
+
+fn markdown_plain(run: &Run) -> bool {
+    !run.style.bold
+        && !run.style.italic
+        && !run.style.strike
+        && !run.style.underline
+        && run.style.script.is_none()
+        && run.link.is_none()
+        && run.image.is_none()
+        && run.latex.is_none()
+        && run.mathml.is_none()
+}
+
+fn runs(
+    items: &[Run],
+    context: Option<MarkdownContext>,
+    links: &Properties,
+    geometry: bool,
+) -> String {
+    let html = context.is_none();
+    let source = context.map(|_| match items {
+        [r] => Cow::Borrowed(r.text.as_str()),
+        _ => Cow::Owned(items.iter().map(|r| r.text.as_str()).collect::<String>()),
+    });
+    let mut markdown = context
+        .zip(source.as_deref())
+        .map(|(context, source)| MarkdownEscaper::new(source, context, items));
+    let mut out = String::new();
+    let mut at_margin = true;
+    let mut offset = 0;
+    for group in items.chunk_by(|a, b| !html && markdown_plain(a) && markdown_plain(b)) {
+        let r = &group[0];
+        let mut t = match &mut markdown {
+            None => escape(&r.text).replace('\n', "<br>"),
+            Some(escape) => {
+                let end = offset + group.iter().map(|r| r.text.len()).sum::<usize>();
+                let text = escape.escape(offset..end, at_margin);
+                offset = end;
+                text.replace('\n', "  \n")
+            }
         };
         if let Some(latex) = r
             .latex
@@ -151,21 +398,24 @@ fn runs(items: &[Run], html: bool, links: &Properties) -> String {
             };
         }
         if let Some(img) = &r.image
-            && let Some(link) = links.get(img)
+            && let Some(src) = links
+                .get(&output::inline_key(img))
+                .or_else(|| links.get(img))
         {
+            let alt = r.image_alt.as_deref().unwrap_or(&r.text);
             // An inlined image keeps the extracted file path as `data-path`, so
             // the result still shows where the file itself was written.
-            let inlined = links.get(&output::inline_key(img));
-            let src = inlined.unwrap_or(link);
-            let path = if inlined.is_some() {
+            let path = if let Some(link) = links.get(img).filter(|link| *link != src) {
                 format!(" data-path=\"{}\"", escape(&uri(link)))
             } else {
                 String::new()
             };
-            t = if let Some(layout) = &r.image_layout {
+            t = if let Some(geometry) = r.image_geometry.as_ref().filter(|_| geometry) {
+                html_image(&escape(alt), &escape(&uri(src)), &path, geometry)
+            } else if let Some(layout) = &r.image_layout {
                 format!(
                     "<img alt=\"{}\" src=\"{}\"{path} style=\"width:{}pt;height:{}pt;transform:rotate({}deg)\">",
-                    escape(&r.text),
+                    escape(alt),
                     escape(&uri(src)),
                     f64::from(layout.width) / 100.,
                     f64::from(layout.height) / 100.,
@@ -174,7 +424,7 @@ fn runs(items: &[Run], html: bool, links: &Properties) -> String {
             } else if html {
                 format!(
                     "<img alt=\"{}\" src=\"{}\"{path}>",
-                    escape(&r.text),
+                    escape(alt),
                     escape(&uri(src))
                 )
             } else {
@@ -237,10 +487,176 @@ fn runs(items: &[Run], html: bool, links: &Properties) -> String {
                 t = format!("<span style=\"{css}\">{t}</span>")
             }
         }
+        if !html {
+            if let Some((_, tail)) = t.rsplit_once('\n') {
+                at_margin = tail.bytes().all(|b| matches!(b, b' ' | b'\t'));
+            } else {
+                at_margin &= t.bytes().all(|b| matches!(b, b' ' | b'\t'));
+            }
+        }
         out += &t;
     }
     out
 }
+fn hwp3_page(out: &mut String, paper: [i32; 2], page: &Hwp3Page, links: &Properties) -> Result<()> {
+    let [w, h] = paper;
+    writeln!(
+        out,
+        "<svg class=\"source-page\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w} {h}\" style=\"width:{}pt\" aria-label=\"Page {}\">",
+        f64::from(w) / 25.,
+        page.number + 1
+    )?;
+    for graphic in &page.graphics {
+        let file = links.get(&graphic.asset);
+        let embedded = links.get(&output::inline_key(&graphic.asset));
+        let Some(src) = embedded.or(file) else {
+            continue;
+        };
+        let [x, y, w, h] = graphic.rect;
+        write!(
+            out,
+            "<image x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" href=\"{}\"",
+            escape(&uri(src))
+        )?;
+        if let Some(path) = file.filter(|_| embedded.is_some()) {
+            write!(out, " data-path=\"{}\"", escape(&uri(path)))?;
+        }
+        out.push_str("/>\n");
+        if out.len() > EXPANSION_LIMIT {
+            return Err("rendered document exceeds output limit".into());
+        }
+    }
+    for line in &page.lines {
+        if line.parts.iter().all(|p| match p {
+            Hwp3Text::Text(t) => t.trim().is_empty(),
+            Hwp3Text::Tab(_) => true,
+        }) {
+            continue;
+        }
+        let Hwp3Line { x, y, size, parts } = line;
+        let width = (w - x).max(1);
+        let height = i32::from(*size) * 2;
+        write!(
+            out,
+            "<foreignObject x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\"><div xmlns=\"http://www.w3.org/1999/xhtml\" class=\"source-line\" style=\"font-size:{size}px\">"
+        )?;
+        for part in parts {
+            match part {
+                Hwp3Text::Text(value) => out.push_str(&escape(value)),
+                Hwp3Text::Tab(width) => write!(
+                    out,
+                    "<span style=\"display:inline-block;width:{width}px\"></span>"
+                )?,
+            }
+        }
+        out.push_str("</div></foreignObject>\n");
+    }
+    out.push_str("</svg>\n");
+    Ok(())
+}
+
+fn pptx_slide(
+    out: &mut String,
+    slide: &SlideLayout,
+    blocks: &[Block],
+    links: &Properties,
+) -> Result<()> {
+    let [width, height] = slide.size;
+    let background = slide.background.as_deref().unwrap_or("#ffffff");
+    writeln!(
+        out,
+        "<svg class=\"source-page source-slide\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width} {height}\" style=\"width:{width}px;background:{background}\">"
+    )?;
+    for frame in &slide.frames {
+        let [a, b, c, d, e, f] = frame.transform;
+        let [w, h] = frame.size;
+        writeln!(
+            out,
+            "<g transform=\"matrix({a:.6} {b:.6} {c:.6} {d:.6} {e:.6} {f:.6})\">"
+        )?;
+        if let Some(shape) = &frame.shape {
+            pptx_shape(out, shape, w, h)?;
+        }
+        let content = &blocks[frame.blocks.clone()];
+        if !content.is_empty() && w > 0. && h > 0. {
+            let SlideText {
+                size,
+                padding: [l, t, r, b],
+                vertical,
+            } = frame.text;
+            writeln!(
+                out,
+                "<foreignObject width=\"{w}\" height=\"{h}\" overflow=\"visible\"><div xmlns=\"http://www.w3.org/1999/xhtml\" class=\"source-frame\" style=\"font-size:{size}px;padding:{t}px {r}px {b}px {l}px;justify-content:{vertical}\">"
+            )?;
+            for block in content {
+                match block {
+                    Block::Paragraph {
+                        runs: items,
+                        properties,
+                        heading,
+                        list,
+                        ..
+                    } => {
+                        let css = paragraph_css(properties, true, None)?;
+                        let elem = if *heading > 0 { "h2" } else { "p" };
+                        let marker = match list {
+                            Some(l) if l.ordered => "1. ",
+                            Some(_) => "• ",
+                            None => "",
+                        };
+                        let text = runs(items, None, links, true);
+                        writeln!(
+                            out,
+                            "<{elem}{} style=\"{css}\">{marker}{text}</{elem}>",
+                            direction(properties)
+                        )?;
+                    }
+                    Block::Table { rows } => html_table(out, rows, links, true)?,
+                }
+            }
+            out.push_str("</div></foreignObject>\n");
+        }
+        out.push_str("</g>\n");
+        if out.len() > EXPANSION_LIMIT {
+            return Err("rendered document exceeds output limit".into());
+        }
+    }
+    out.push_str("</svg>\n");
+    Ok(())
+}
+
+fn pptx_shape(out: &mut String, shape: &SlideShape, w: f64, h: f64) -> Result<()> {
+    let (x, y) = (w / 2., h / 2.);
+    let attrs = match shape.kind.as_str() {
+        "rect" => format!("<rect width=\"{w}\" height=\"{h}\""),
+        "roundRect" => format!(
+            "<rect width=\"{w}\" height=\"{h}\" rx=\"{}\"",
+            w.min(h) / 6.
+        ),
+        "ellipse" => format!("<ellipse cx=\"{x}\" cy=\"{y}\" rx=\"{x}\" ry=\"{y}\""),
+        "line" => format!("<line x2=\"{w}\" y2=\"{h}\""),
+        "triangle" => format!("<polygon points=\"{x},0 {w},{h} 0,{h}\""),
+        "rtTriangle" => format!("<polygon points=\"0,0 {w},{h} 0,{h}\""),
+        "diamond" => format!("<polygon points=\"{x},0 {w},{y} {x},{h} 0,{y}\""),
+        "chevron" => {
+            let s = w.min(h) / 2.;
+            format!(
+                "<polygon points=\"0,0 {},0 {w},{y} {},{h} 0,{h} {s},{y}\"",
+                w - s,
+                w - s
+            )
+        }
+        _ => return Ok(()),
+    };
+    let fill = shape.fill.as_deref().unwrap_or("none");
+    write!(out, "{attrs} fill=\"{fill}\"")?;
+    if let Some((color, width)) = &shape.stroke {
+        write!(out, " stroke=\"{color}\" stroke-width=\"{width}\"")?;
+    }
+    out.push_str("/>\n");
+    Ok(())
+}
+
 fn cell_attributes(out: &mut String, props: &Properties) -> Result<()> {
     let mut css = Properties::new();
     for (key, value) in props {
@@ -307,6 +723,62 @@ fn direction(props: &Properties) -> &'static str {
     }
 }
 
+fn table_widths(rows: &[Vec<Cell>]) -> Option<Vec<f64>> {
+    if !rows
+        .iter()
+        .flatten()
+        .any(|cell| cell.properties.contains_key("width"))
+    {
+        return None;
+    }
+    let mut columns: Vec<(usize, f64)> = Vec::new();
+    let mut visited = 0;
+    for (y, row) in rows.iter().enumerate() {
+        let mut x = 0;
+        for cell in row {
+            while columns.get(x).is_some_and(|&(end, _)| end > y) {
+                x += 1;
+                visited += 1;
+                if visited > CELL_LIMIT * 2 {
+                    return None;
+                }
+            }
+            let span = cell.colspan.unwrap_or(1);
+            let end = x.checked_add(span)?;
+            if span == 0 || end > 16384 {
+                return None;
+            }
+            visited = visited.saturating_add(span);
+            if visited > CELL_LIMIT * 2 {
+                return None;
+            }
+            if columns.len() < end {
+                columns.resize(end, (0, 0.));
+            }
+            for column in &mut columns[x..end] {
+                if column.0 > y {
+                    return None;
+                }
+                column.0 = y.saturating_add(cell.rowspan.unwrap_or(1));
+            }
+            if span == 1
+                && let Some(width) = cell
+                    .properties
+                    .get("width")
+                    .and_then(|v| formatting::length_in_points(v))
+                    .filter(|v| *v > 0. && *v <= 10000.)
+            {
+                columns[x].1 = columns[x].1.max(width);
+            }
+            x = end;
+        }
+    }
+    columns
+        .iter()
+        .all(|&(_, width)| width > 0.)
+        .then(|| columns.into_iter().map(|(_, width)| width).collect())
+}
+
 fn html_table(
     out: &mut String,
     rows: &[Vec<Cell>],
@@ -319,11 +791,24 @@ fn html_table(
                 .iter()
                 .any(|key| c.properties.contains_key(*key))
         });
-    out.push_str(if source_borders {
-        "<table class=\"source-borders\">\n"
+    out.push_str("<table");
+    if source_borders {
+        out.push_str(" class=\"source-borders\"");
+    }
+    let widths = styled.then(|| table_widths(rows)).flatten();
+    if let Some(widths) = widths.filter(|v| !v.is_empty()) {
+        let total = widths.iter().sum::<f64>();
+        writeln!(
+            out,
+            " style=\"width:{total:.4}pt;table-layout:fixed\"><colgroup>"
+        )?;
+        for width in widths {
+            writeln!(out, "<col style=\"width:{:.5}%\">", width / total * 100.)?;
+        }
+        out.push_str("</colgroup>\n");
     } else {
-        "<table>\n"
-    });
+        out.push_str(">\n");
+    }
     for row in rows {
         out.push_str("<tr>");
         for c in row {
@@ -338,7 +823,7 @@ fn html_table(
                 cell_attributes(out, &c.properties)?;
             }
             out.push('>');
-            out.push_str(&runs(&c.runs, true, links));
+            out.push_str(&runs(&c.runs, None, links, styled));
             for b in &c.blocks {
                 match b {
                     Block::Paragraph {
@@ -357,11 +842,11 @@ fn html_table(
                             out,
                             "<{elem}{} style=\"{css}\">{}</{elem}>",
                             direction(properties),
-                            runs(items, true, links)
+                            runs(items, None, links, true)
                         )?;
                     }
                     Block::Paragraph { runs: items, .. } => {
-                        writeln!(out, "<p>{}</p>", runs(items, true, links))?
+                        writeln!(out, "<p>{}</p>", runs(items, None, links, false))?
                     }
                     Block::Table { rows } => html_table(out, rows, links, styled)?,
                 }
@@ -473,18 +958,31 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
     if !html && format != "md" {
         return Err("format must be md, html, json or csv".into());
     }
+    let embedded;
+    let links = if html && links.is_empty() && !doc.assets.is_empty() {
+        embedded = output::inline(doc, links)?;
+        &embedded
+    } else {
+        links
+    };
     let mut out = String::new();
     if html {
         out.push_str(concat!(
             "<!doctype html>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<style>\n",
             "article { box-sizing: border-box; max-width: 76rem; margin-inline: auto; padding: 1.25rem; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 16px; line-height: 1.5; overflow-wrap: break-word; print-color-adjust: exact; -webkit-print-color-adjust: exact; }\n",
-            "article span[style*=\"font-size\"] { zoom: 1.2; }\n",
             "article table { border-collapse: collapse; max-width: 100%; margin-block: 0.5em; font: inherit; }\n",
-            "article td, article th { border: 1px solid #a0a0a0; padding: 0.3em 0.5em; vertical-align: top; white-space: pre-wrap; }\n",
+            "article td, article th { box-sizing: border-box; border: 1px solid #a0a0a0; padding: 0.3em 0.5em; vertical-align: top; white-space: pre-wrap; overflow-wrap: anywhere; }\n",
             "article .source-borders > tbody > tr > :is(td, th) { border: none; }\n",
             "article td > :first-child { margin-top: 0; }\n",
             "article td > :last-child { margin-bottom: 0; }\n",
-            "article img { max-width: 100%; }\n</style>\n<article>\n",
+            "article img { max-width: 100%; }\n",
+            "article .source-crop { position: relative; display: inline-block; max-width: 100%; overflow: hidden; vertical-align: middle; }\n",
+            "article .source-crop > img { position: absolute; max-width: none; }\n",
+            "article .source-page { display: block; max-width: 100%; height: auto; background: white; margin-block: 0 1em; break-inside: avoid; }\n",
+            "article .source-line { font-family: Batang, 'Malgun Gothic', serif; line-height: 1; white-space: pre; }\n",
+            "article .source-frame { box-sizing: border-box; display: flex; flex-direction: column; height: 100%; line-height: 1.13; }\n",
+            "article .source-frame > :is(p, h2, table) { font: inherit; margin: 0; }\n",
+            "article .source-frame > p > :is(img, .source-crop) { vertical-align: top; }\n</style>\n<article>\n",
         ));
     }
     let mut next_slide_number = 0;
@@ -538,9 +1036,20 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             if html {
                 writeln!(out, "<h1>{}</h1>", escape(&s.title))?
             } else {
-                writeln!(out, "# {}\n", markdown(&s.title))?
+                let title = MarkdownEscaper::new(&s.title, MarkdownContext::Heading, &[])
+                    .escape(0..s.title.len(), true);
+                writeln!(out, "# {title}\n")?
             }
         }
+        let slide = s.slide_layout.as_ref().filter(|_| html);
+        if let Some(slide) = slide {
+            pptx_slide(&mut out, slide, &s.blocks, links)?;
+        }
+        let mut placed_frames = slide
+            .into_iter()
+            .flat_map(|slide| &slide.frames)
+            .map(|frame| &frame.blocks)
+            .peekable();
         let left = s
             .blocks
             .iter()
@@ -555,7 +1064,42 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             .unwrap_or(0.);
         let mut html_list = None;
         let mut in_list = false;
-        for block in &s.blocks {
+        let mut pages = s
+            .hwp3_layout
+            .as_ref()
+            .filter(|_| html)
+            .into_iter()
+            .flat_map(|layout| layout.pages.iter().map(|page| (layout.paper, page)))
+            .peekable();
+        let mut replaced = s
+            .hwp3_layout
+            .as_ref()
+            .filter(|_| html)
+            .into_iter()
+            .flat_map(|layout| layout.pages.iter())
+            .flat_map(|page| &page.replaced_blocks)
+            .peekable();
+        for (index, block) in s.blocks.iter().enumerate() {
+            while pages
+                .peek()
+                .is_some_and(|(_, page)| page.first_block <= index)
+            {
+                let (paper, page) = pages.next().unwrap();
+                hwp3_page(&mut out, paper, page, links)?;
+            }
+            while replaced.peek().is_some_and(|range| range.end <= index) {
+                replaced.next();
+            }
+            while placed_frames.peek().is_some_and(|range| range.end <= index) {
+                placed_frames.next();
+            }
+            if replaced.peek().is_some_and(|range| range.contains(&index))
+                || placed_frames
+                    .peek()
+                    .is_some_and(|range| range.contains(&index))
+            {
+                continue;
+            }
             if matches!(doc.format.as_str(), "pdf" | "docx" | "hwpx")
                 && let Block::Paragraph {
                     runs, properties, ..
@@ -564,9 +1108,10 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                 && runs.iter().all(|r| {
                     r.text.trim().is_empty()
                         && r.mathml.is_none()
-                        && r.image
-                            .as_ref()
-                            .is_none_or(|image| !links.contains_key(image))
+                        && r.image.as_ref().is_none_or(|image| {
+                            !links.contains_key(image)
+                                && !links.contains_key(&output::inline_key(image))
+                        })
                 })
             {
                 continue;
@@ -604,7 +1149,12 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                         || (mode == "hybrid"
                             && (properties.contains_key("dir")
                                 || properties.contains_key("writing-mode")));
-                    let val = runs(items, use_html, links);
+                    let context = if *heading > 0 && list.is_none() {
+                        MarkdownContext::Heading
+                    } else {
+                        MarkdownContext::Block
+                    };
+                    let val = runs(items, (!use_html).then_some(context), links, html);
                     if use_html {
                         previous_pdf_line = None;
                         let elem = if *heading > 0 {
@@ -691,7 +1241,9 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                             for j in 0..width {
                                 let t = row
                                     .get(j)
-                                    .map(|c| runs(&c.runs, false, links))
+                                    .map(|c| {
+                                        runs(&c.runs, Some(MarkdownContext::Table), links, false)
+                                    })
                                     .unwrap_or_default()
                                     .replace("  \n", "<br>");
                                 write!(out, " {t} |")?;
@@ -712,6 +1264,12 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         if let Some(old) = html_list {
             writeln!(out, "</{old}>")?
         }
+        for (paper, page) in pages {
+            hwp3_page(&mut out, paper, page, links)?;
+        }
+        if out.len() > EXPANSION_LIMIT {
+            return Err("rendered document exceeds output limit".into());
+        }
     }
     if html {
         out.push_str("</article>\n")
@@ -721,8 +1279,79 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{markdown, render};
+    use super::{MarkdownContext, MarkdownEscaper, render};
     use crate::model::*;
+
+    fn markdown(text: &str) -> String {
+        MarkdownEscaper::new(text, MarkdownContext::Block, &[]).escape(0..text.len(), true)
+    }
+
+    #[test]
+    fn markdown_keeps_literal_punctuation_readable() {
+        for text in [
+            "-10도",
+            "+3%",
+            "#태그",
+            "--option",
+            "_prefix",
+            "report_2026_final.pdf, 이름_부분, _prefix",
+            r"C:\Users\name\test_file.txt",
+            "2 * 3 | 10 ~ 20 | ` 하나",
+        ] {
+            assert_eq!(markdown(text), text);
+        }
+        assert_eq!(
+            markdown("- 항목\n+ 항목\n# 제목\n---\n___\n~~~\n```"),
+            "\\- 항목\n\\+ 항목\n\\# 제목\n\\---\n\\___\n\\~~~\n\\```"
+        );
+        assert_eq!(
+            markdown("_강조_ *강조* ~~취소~~ `코드`"),
+            "\\_강조_ \\*강조* \\~\\~취소~~ \\`코드`"
+        );
+        assert_eq!(markdown("A | B\n---|---"), "A | B\n---\\|---");
+    }
+
+    #[test]
+    fn markdown_uses_paragraph_and_table_context_for_runs() {
+        let mut doc = Document::new("docx");
+        let mut section = Section::new("section", "");
+        section.title = "- 제목 #".into();
+        let mut filename = Run::text("_");
+        filename.style.font = Some("another font".into());
+        let mut bold = Run::text("값 ");
+        bold.style.bold = true;
+        section.blocks.push(Block::flow(vec![
+            bold,
+            Run::text("- 항목 | 2 * 3 | report"),
+            filename,
+            Run::text("id\n"),
+            Run::text("-"),
+            Run::text(" 새 줄"),
+        ]));
+        let mut bold = Run::text("10");
+        bold.style.bold = true;
+        section.blocks.push(Block::flow(vec![Run::text("-"), bold]));
+        let mut bold = Run::text("가운데");
+        bold.style.bold = true;
+        section.blocks.push(Block::flow(vec![
+            Run::text("_앞 "),
+            bold,
+            Run::text(" 뒤_"),
+        ]));
+        section.blocks.push(Block::Table {
+            rows: vec![vec![Cell::text("- 항목 | report_id")]],
+        });
+        doc.sections.push(section);
+
+        assert_eq!(
+            render(&doc, "md", "hybrid", &Properties::new()).unwrap(),
+            concat!(
+                "# - 제목 \\#\n\n**값** - 항목 | 2 * 3 | report_id  \n\\- 새 줄\n\n",
+                "-**10**\n\n\\_앞 **가운데** 뒤_\n\n",
+                "| - 항목 \\| report_id |\n| --- |\n\n",
+            ),
+        );
+    }
 
     #[test]
     fn missing_pages_leave_a_marker_in_the_body() {
@@ -733,7 +1362,9 @@ mod tests {
         failed.paragraph("Partial page");
         let mut skipped = Section::new("page", "").indexed(1);
         skipped.properties.insert("page".into(), "2".into());
-        skipped.properties.insert("skipped".into(), "time_limit".into());
+        skipped
+            .properties
+            .insert("skipped".into(), "time_limit".into());
         doc.sections.push(failed);
         doc.sections.push(skipped);
         let out = render(&doc, "md", "hybrid", &Properties::new()).unwrap();

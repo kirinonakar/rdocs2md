@@ -287,6 +287,7 @@ impl Flow<'_> {
                     };
                 st.image = target;
                 st.text = attr(n, "alt").unwrap_or("").into();
+                st.image_geometry = self.image_geometry(n);
                 push_run(out, st);
                 return Ok(());
             }
@@ -305,6 +306,89 @@ impl Flow<'_> {
         }
         Ok(())
     }
+    fn image_geometry(&self, n: N) -> Option<ImageGeometry> {
+        let mut geometry = ImageGeometry::default();
+        match self.kind {
+            "docx" | "pptx" => {
+                let picture = n.ancestors().find(|p| tag(*p) == "pic")?;
+                let transform = child(picture, "spPr").and_then(|s| child(s, "xfrm"));
+                let frame = picture
+                    .ancestors()
+                    .find(|p| matches!(tag(*p), "inline" | "anchor"));
+                let extent = frame
+                    .and_then(|p| child(p, "extent"))
+                    .or_else(|| transform.and_then(|p| child(p, "ext")));
+                geometry.width = formatting::units(extent.and_then(|p| attr(p, "cx")), 12700.);
+                geometry.height = formatting::units(extent.and_then(|p| attr(p, "cy")), 12700.);
+                if let Some(xfrm) = transform {
+                    geometry.rotation = formatting::units(attr(xfrm, "rot"), 60000.)
+                        .filter(|v| v.is_finite())
+                        .unwrap_or_default()
+                        .rem_euclid(360.);
+                    geometry.flip_x = matches!(attr(xfrm, "flipH"), Some("1" | "true"));
+                    geometry.flip_y = matches!(attr(xfrm, "flipV"), Some("1" | "true"));
+                }
+                if let Some(rect) = n.parent().and_then(|p| child(p, "srcRect")) {
+                    geometry.crop = ["l", "t", "r", "b"].map(|k| {
+                        formatting::units(attr(rect, k), 100000.)
+                            .filter(|v| (-1. ..1.).contains(v))
+                            .unwrap_or_default()
+                    });
+                }
+            }
+            "hwpx" => {
+                let picture = n.ancestors().find(|p| tag(*p) == "pic")?;
+                let size = child(picture, "curSz")
+                    .filter(|p| {
+                        ["width", "height"]
+                            .iter()
+                            .all(|k| formatting::units(attr(*p, k), 100.).is_some_and(|v| v > 0.))
+                    })
+                    .or_else(|| {
+                        child(picture, "sz").filter(|p| {
+                            matches!(attr(*p, "widthRelTo"), Some("ABSOLUTE") | None)
+                                && matches!(attr(*p, "heightRelTo"), Some("ABSOLUTE") | None)
+                        })
+                    })
+                    .or_else(|| child(picture, "orgSz"))?;
+                geometry.width = formatting::units(attr(size, "width"), 100.);
+                geometry.height = formatting::units(attr(size, "height"), 100.);
+                geometry.rotation = child(picture, "rotationInfo")
+                    .and_then(|p| formatting::units(attr(p, "angle"), 1.))
+                    .filter(|v| v.is_finite())
+                    .unwrap_or_default()
+                    .rem_euclid(360.);
+                if let Some(flip) = child(picture, "flip") {
+                    geometry.flip_x = matches!(attr(flip, "horizontal"), Some("1" | "true"));
+                    geometry.flip_y = matches!(attr(flip, "vertical"), Some("1" | "true"));
+                }
+            }
+            "odt" | "odp" | "ods" => {
+                let frame = n.ancestors().find(|p| tag(*p) == "frame")?;
+                geometry.width = attr(frame, "width").and_then(formatting::length_in_points);
+                geometry.height = attr(frame, "height").and_then(formatting::length_in_points);
+            }
+            "epub" => {
+                let dimension = |key| {
+                    self.css(n)
+                        .split(';')
+                        .filter_map(|d| d.split_once(':'))
+                        .filter(|(k, _)| k.trim() == key)
+                        .filter_map(|(_, v)| formatting::length_in_points(v))
+                        .next_back()
+                        .or_else(|| formatting::units(attr(n, key), 4. / 3.))
+                };
+                geometry.width = dimension("width");
+                geometry.height = dimension("height");
+            }
+            _ => return None,
+        }
+        let valid = |v: &f64| *v > 0. && *v <= 10000.;
+        geometry.width = geometry.width.filter(valid);
+        geometry.height = geometry.height.filter(valid);
+        (geometry.width.is_some() || geometry.height.is_some()).then_some(geometry)
+    }
+
     pub fn runs(&self, n: N) -> Result<Vec<Run>> {
         let mut out = Vec::new();
         self.inline(n, &Run::default(), &mut out)?;
@@ -627,6 +711,20 @@ impl Flow<'_> {
         let mut cells = 0usize;
         let mut weight = 0usize;
         let word = (self.kind == "docx").then(|| word_table_format(n, self.rules));
+        let grid_unit = match self.kind {
+            "docx" => 20.,
+            "pptx" => 12700.,
+            _ => 0.,
+        };
+        let grid: Vec<_> = child(n, "tblGrid")
+            .into_iter()
+            .flat_map(|grid| grid.children())
+            .filter(|n| tag(*n) == "gridCol")
+            .take(16384)
+            .map(|column| {
+                formatting::units(attr(column, "w"), grid_unit).filter(|w| *w > 0. && *w <= 10000.)
+            })
+            .collect();
         let mut positions = Vec::new();
         let mut columns = 0;
         for row in n.descendants().skip(1).filter(|v| {
@@ -646,6 +744,17 @@ impl Flow<'_> {
             let mut bytes = 0usize;
             let mut column = 0usize;
             let mut starts = Vec::new();
+            let row_height = match self.kind {
+                "docx" => child(row, "trPr")
+                    .and_then(|p| child(p, "trHeight"))
+                    .filter(|n| attr(*n, "hRule") != Some("auto"))
+                    .and_then(|n| formatting::units(attr(n, "val"), 20.)),
+                "pptx" => formatting::units(attr(row, "h"), 12700.),
+                _ => None,
+            }
+            .filter(|height| *height > 0.);
+            let physical_grid = self.kind == "pptx"
+                && row.children().filter(|n| tag(*n) == "tc").count() == grid.len();
             for node in row.children().filter(|v| {
                 matches!(
                     tag(*v),
@@ -662,6 +771,18 @@ impl Flow<'_> {
                     continue;
                 }
                 let mut c = self.cell(node)?;
+                if grid_unit > 0. {
+                    let span = c.colspan.unwrap_or(1).min(16384);
+                    if !c.properties.contains_key("width")
+                        && let Some(widths) = grid.get(column..column + span)
+                        && let Some(width) = widths.iter().copied().sum::<Option<f64>>()
+                    {
+                        formatting::points(&mut c.properties, "width", Some(width));
+                    }
+                    if c.rowspan.is_none() {
+                        formatting::points(&mut c.properties, "height", row_height);
+                    }
+                }
                 if self.kind == "hwpx"
                     && let Some(margins) = child(node, "cellMargin")
                         .filter(|_| attr(node, "hasMargin") != Some("0"))
@@ -711,9 +832,19 @@ impl Flow<'_> {
                 if self.kind == "pptx"
                     && ["hMerge", "vMerge"]
                         .iter()
-                        .any(|key| attr(node, key) == Some("1"))
+                        .any(|key| matches!(attr(node, key), Some("1" | "true")))
                 {
+                    if physical_grid {
+                        column += 1;
+                    }
                     continue;
+                }
+                if self.kind == "pptx" {
+                    column += if physical_grid {
+                        1
+                    } else {
+                        c.colspan.unwrap_or(1).min(16384)
+                    };
                 }
                 let cost = if repeat > 1 || count > 1 {
                     serde_json::to_vec(&c)?.len() + 256 * (1 + c.runs.len())
