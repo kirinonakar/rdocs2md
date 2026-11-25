@@ -962,12 +962,18 @@ fn html_table(
     };
     if let Some(widths) = widths.filter(|v| !v.is_empty()) {
         let total = widths.iter().sum::<f64>();
+        let layout = if hwp { "auto" } else { "fixed" };
         writeln!(
             out,
-            " style=\"width:{total:.4}pt;table-layout:fixed\"><colgroup>"
+            " style=\"width:{total:.4}pt;table-layout:{layout}\"><colgroup>"
         )?;
         for width in widths {
-            writeln!(out, "<col style=\"width:{:.5}%\">", width / total * 100.)?;
+            let (width, unit) = if hwp {
+                (width, "pt")
+            } else {
+                (width / total * 100., "%")
+            };
+            writeln!(out, "<col style=\"width:{width:.5}{unit}\">")?;
         }
         out.push_str("</colgroup>\n");
     } else {
@@ -1230,6 +1236,9 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             "article .source-borders > tbody > tr > :is(td, th) { border: none; }\n",
             "article td > :first-child { margin-top: 0; }\n",
             "article td > :last-child { margin-bottom: 0; }\n",
+            "article .hwp-table-scroll { overflow-x: auto; }\n",
+            "article table.hwp-table { max-width: none; }\n",
+            "article .hwp-table > tbody > tr > td { word-break: keep-all; overflow-wrap: break-word; }\n",
             "article .hwp-table > tbody > tr > td > p { margin-block: 0; }\n",
             "article img { max-width: 100%; }\n",
             "article .source-crop { position: relative; display: inline-block; max-width: 100%; overflow: hidden; vertical-align: middle; }\n",
@@ -1559,7 +1568,14 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                             || cell.blocks.iter().any(|b| matches!(b, Block::Table { .. }))
                     });
                     if html || needs_html || rows.len().saturating_mul(width) > CELL_LIMIT {
+                        let scrollable = table_style == TableStyle::Hwp5;
+                        if scrollable {
+                            out.push_str("<div class=\"hwp-table-scroll\">\n");
+                        }
                         html_table(&mut out, rows, links, table_style)?;
+                        if scrollable {
+                            out.push_str("\n</div>");
+                        }
                         // A blank line ends the Markdown HTML block, so only
                         // add one after the outermost table.
                         out.push('\n');

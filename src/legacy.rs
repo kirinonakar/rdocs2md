@@ -265,7 +265,7 @@ impl HwpFormatting {
         styles
     }
 
-    fn cell(&self, data: &[u8]) -> Result<Properties> {
+    fn cell(&self, data: &[u8], table_padding: [Option<u16>; 4]) -> Result<Properties> {
         let id = usize::from(u16le(data, 32)?);
         let mut props = if id == 0 && !self.borders.is_empty() {
             formatting::BORDERS
@@ -293,17 +293,23 @@ impl HwpFormatting {
             _ => "",
         };
         formatting::box_property(&mut props, "vertical-align", align);
-        for (key, offset) in [
-            ("padding-left", 24),
-            ("padding-right", 26),
-            ("padding-top", 28),
-            ("padding-bottom", 30),
-        ] {
-            formatting::points(
-                &mut props,
-                key,
-                Some(f64::from(u16le(data, offset)?) / 100.),
-            );
+        for (i, key) in [
+            "padding-left",
+            "padding-right",
+            "padding-top",
+            "padding-bottom",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let padding = u16le(data, 24 + i * 2)?;
+            // A cell can inherit the table padding on individual sides.
+            let padding = if padding == u16::MAX {
+                table_padding[i]
+            } else {
+                Some(padding)
+            };
+            formatting::points(&mut props, key, padding.map(|v| f64::from(v) / 100.));
         }
         Ok(props)
     }
@@ -322,6 +328,7 @@ fn hwp_table<'a>(
     let child_level = level + 1;
     let mut grid = Vec::new();
     let mut columns = 0;
+    let mut table_padding = [None; 4];
     let mut current = None;
     let mut trailing = Vec::new();
     while let Some(record) = records.next_if(|r| r.as_ref().map_or(true, |r| r.level > level)) {
@@ -332,6 +339,8 @@ fn hwp_table<'a>(
                     current = None;
                     let rows = u16le(record.data, 4)? as usize;
                     columns = u16le(record.data, 6)? as usize;
+                    table_padding = [10, 12, 14, 16]
+                        .map(|offset| u16le(record.data, offset).ok().filter(|&v| v != u16::MAX));
                     if rows * columns > CELL_LIMIT {
                         return Err("HWP table too large".into());
                     }
@@ -366,7 +375,7 @@ fn hwp_table<'a>(
                     grid[index] = Some(Cell {
                         colspan: (colspan > 1).then_some(colspan),
                         rowspan: (rowspan > 1).then_some(rowspan),
-                        properties: styles.cell(record.data)?,
+                        properties: styles.cell(record.data, table_padding)?,
                         ..Cell::default()
                     });
                     current = Some(index);

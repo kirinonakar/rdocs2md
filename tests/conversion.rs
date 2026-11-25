@@ -535,19 +535,25 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
         out.extend_from_slice(&header.to_le_bytes());
         out.extend_from_slice(data);
     }
-    fn table(out: &mut Vec<u8>, level: u32, rows: u16, columns: u16) {
+    fn table(out: &mut Vec<u8>, level: u32, rows: u16, columns: u16, padding: [u16; 4]) {
         record(out, 71, level, b" lbt");
-        let mut data = [0; 8];
+        let mut data = [0; 18];
         data[4..6].copy_from_slice(&rows.to_le_bytes());
         data[6..8].copy_from_slice(&columns.to_le_bytes());
+        for (field, value) in data[10..18].chunks_exact_mut(2).zip(padding) {
+            field.copy_from_slice(&value.to_le_bytes());
+        }
         record(out, 77, level + 1, &data);
     }
-    fn cell(out: &mut Vec<u8>, level: u32, address: [u16; 4]) {
+    fn cell(out: &mut Vec<u8>, level: u32, address: [u16; 4], padding: [u16; 4]) {
         let mut data = vec![1, 0, 0, 0, 0, 0, 5, 0];
         data.extend(address.into_iter().flat_map(u16::to_le_bytes));
         data.resize(47, 0);
         data[16..20].copy_from_slice(&6000_u32.to_le_bytes());
         data[20..24].copy_from_slice(&71573_u32.to_le_bytes());
+        for (field, value) in data[24..32].chunks_exact_mut(2).zip(padding) {
+            field.copy_from_slice(&value.to_le_bytes());
+        }
         data[32..34].copy_from_slice(&1_u16.to_le_bytes());
         record(out, 72, level, &data);
     }
@@ -568,19 +574,19 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     }
     let mut raw = Vec::new();
     paragraph(&mut raw, 0, "Before");
-    table(&mut raw, 1, 2, 3);
-    cell(&mut raw, 2, [0, 0, 1, 2]);
+    table(&mut raw, 1, 2, 3, [510, 425, 141, 283]);
+    cell(&mut raw, 2, [0, 0, 1, 2], [u16::MAX, 0, 75, u16::MAX]);
     paragraph(&mut raw, 2, "1");
-    cell(&mut raw, 2, [1, 0, 2, 1]);
+    cell(&mut raw, 2, [1, 0, 2, 1], [0; 4]);
     paragraph(&mut raw, 2, "Question and answer");
-    cell(&mut raw, 2, [1, 1, 1, 1]);
+    cell(&mut raw, 2, [1, 1, 1, 1], [0; 4]);
     paragraph(&mut raw, 2, "Question");
-    cell(&mut raw, 2, [2, 1, 1, 1]);
+    cell(&mut raw, 2, [2, 1, 1, 1], [0; 4]);
     paragraph(&mut raw, 2, "Answer");
-    table(&mut raw, 3, 2, 4);
-    cell(&mut raw, 4, [0, 0, 3, 2]);
+    table(&mut raw, 3, 2, 4, [200, 220, 240, 260]);
+    cell(&mut raw, 4, [0, 0, 3, 2], [u16::MAX; 4]);
     paragraph(&mut raw, 4, "Nested answer");
-    cell(&mut raw, 4, [3, 0, 1, 1]);
+    cell(&mut raw, 4, [3, 0, 1, 1], [0; 4]);
     let mut shape = [0; 50];
     shape[..8].copy_from_slice(b"cip$cip$");
     shape[28..32].copy_from_slice(&950_u32.to_le_bytes());
@@ -590,7 +596,7 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     let mut picture = [0; 73];
     picture[71..73].copy_from_slice(&1_u16.to_le_bytes());
     record(&mut raw, 85, 7, &picture);
-    cell(&mut raw, 4, [3, 1, 1, 1]);
+    cell(&mut raw, 4, [3, 1, 1, 1], [0; 4]);
     paragraph(&mut raw, 4, "Nested detail");
     paragraph(&mut raw, 2, "Answer continued");
     paragraph(&mut raw, 0, "After");
@@ -667,14 +673,19 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
         "background-color:#F2E5C4;",
         "width:60pt;",
         "rowspan=\"2\"",
-        "width:120.0000pt;table-layout:fixed\"><colgroup>",
-        "<col style=\"width:50.00000%\">",
-        "<col style=\"width:16.66667%\">",
+        "width:120.0000pt;table-layout:auto\"><colgroup>",
+        "<col style=\"width:60.00000pt\">",
+        "<col style=\"width:20.00000pt\">",
+        "word-break: keep-all; overflow-wrap: break-word;",
+        "padding-bottom:2.83pt;padding-left:5.1pt;padding-right:0pt;padding-top:0.75pt;",
+        "padding-bottom:2.6pt;padding-left:2pt;padding-right:2.2pt;padding-top:2.4pt;",
         "<p style=\"text-align:center;\">Answer continued</p>",
         "font-size:12pt;color:#112233;\">Af</span><span style=\"font-size:9pt;color:#112233;\">ter</span>",
     ] {
         assert!(html.contains(expected), "missing {expected} in {html}");
     }
+    assert_eq!(html.matches("<div class=\"hwp-table-scroll\">").count(), 1);
+    assert!(!html.contains("655.35pt"));
     assert!(!html.contains("height:715.73pt;"));
     let Block::Table { rows } = &doc.sections[0].blocks[1] else {
         panic!("expected HWP table");
