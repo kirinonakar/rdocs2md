@@ -639,7 +639,7 @@ fn pptx_slide(
                             direction(properties)
                         )?;
                     }
-                    Block::Table { rows } => html_table(out, rows, links, true)?,
+                    Block::Table { rows } => html_table(out, rows, links, TableStyle::Html)?,
                 }
             }
             out.push_str("</div></foreignObject>\n");
@@ -685,10 +685,12 @@ fn pptx_shape(out: &mut String, shape: &SlideShape, w: f64, h: f64) -> Result<()
     Ok(())
 }
 
-fn cell_attributes(out: &mut String, props: &Properties) -> Result<()> {
+fn cell_attributes(out: &mut String, props: &Properties, content_height: bool) -> Result<()> {
     let mut css = Properties::new();
     for (key, value) in props {
-        if key != "border" {
+        // HWP cell heights come from the paginated layout. In HTML a row
+        // should grow with the text and nested tables inside it.
+        if key != "border" && !(content_height && key == "height") {
             formatting::box_property(&mut css, key, value);
         }
     }
@@ -759,6 +761,13 @@ fn direction(props: &Properties) -> &'static str {
     }
 }
 
+fn cell_width(cell: &Cell) -> Option<f64> {
+    cell.properties
+        .get("width")
+        .and_then(|v| formatting::length_in_points(v))
+        .filter(|v| *v > 0. && *v <= 10000.)
+}
+
 fn table_widths(rows: &[Vec<Cell>]) -> Option<Vec<f64>> {
     if !rows
         .iter()
@@ -798,11 +807,7 @@ fn table_widths(rows: &[Vec<Cell>]) -> Option<Vec<f64>> {
                 column.0 = y.saturating_add(cell.rowspan.unwrap_or(1));
             }
             if span == 1
-                && let Some(width) = cell
-                    .properties
-                    .get("width")
-                    .and_then(|v| formatting::length_in_points(v))
-                    .filter(|v| *v > 0. && *v <= 10000.)
+                && let Some(width) = cell_width(cell)
             {
                 columns[x].1 = columns[x].1.max(width);
             }
@@ -813,6 +818,66 @@ fn table_widths(rows: &[Vec<Cell>]) -> Option<Vec<f64>> {
         .iter()
         .all(|&(_, width)| width > 0.)
         .then(|| columns.into_iter().map(|(_, width)| width).collect())
+}
+
+fn hwp_merged_widths(rows: &[Vec<Cell>]) -> Option<Vec<f64>> {
+    let columns = rows.first()?.iter().try_fold(0usize, |total, cell| {
+        total.checked_add(cell.colspan.unwrap_or(1))
+    })?;
+    if columns == 0 || columns > 16384 || rows.len().saturating_mul(columns) > CELL_LIMIT {
+        return None;
+    }
+
+    // Record the right edge of each cell in rows with usable widths. A cell
+    // spanning multiple rows still contributes its width on each of those rows.
+    let mut edges = vec![None; columns + 1];
+    edges[0] = Some(0.);
+    let mut spans = vec![(0, 0, None); columns];
+    for (y, row) in rows.iter().enumerate() {
+        let mut cells = row.iter();
+        let mut x = 0;
+        let mut right = Some(0.);
+        while x < columns {
+            let span = &mut spans[x];
+            if span.0 <= y {
+                let cell = cells.next()?;
+                *span = (
+                    y.saturating_add(cell.rowspan.unwrap_or(1)),
+                    x.checked_add(cell.colspan.unwrap_or(1))?,
+                    cell_width(cell),
+                );
+            }
+            let (_, end, width) = *span;
+            if end <= x || end > columns {
+                return None;
+            }
+            x = end;
+            right = right.zip(width).map(|(left, width)| left + width);
+            edges[x] = edges[x].or(right);
+        }
+        if cells.next().is_some() {
+            return None;
+        }
+    }
+    edges[columns]?;
+
+    // An edge may be internal to a merged cell in every row. Divide the width
+    // evenly between known edges so the merged cell keeps its source width.
+    let mut widths = Vec::with_capacity(columns);
+    let mut left_column = 0;
+    let mut left = 0.;
+    for (column, right) in edges.into_iter().enumerate().skip(1) {
+        if let Some(right) = right {
+            if right <= left {
+                return None;
+            }
+            let width = (right - left) / (column - left_column) as f64;
+            widths.resize(column, width);
+            left_column = column;
+            left = right;
+        }
+    }
+    Some(widths)
 }
 
 fn markdown_cell(out: &mut String, cell: &Cell, links: &Properties) {
@@ -862,12 +927,21 @@ fn table_inline(out: &mut String, text: &str) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableStyle {
+    Markdown,
+    Html,
+    Hwp5,
+}
+
 fn html_table(
     out: &mut String,
     rows: &[Vec<Cell>],
     links: &Properties,
-    styled: bool,
+    style: TableStyle,
 ) -> Result<()> {
+    let styled = style != TableStyle::Markdown;
+    let hwp = style == TableStyle::Hwp5;
     let source_borders = styled
         && rows.iter().flatten().any(|c| {
             formatting::BORDERS
@@ -875,10 +949,17 @@ fn html_table(
                 .any(|key| c.properties.contains_key(*key))
         });
     out.push_str("<table");
-    if source_borders {
-        out.push_str(" class=\"source-borders\"");
+    match (source_borders, hwp) {
+        (true, true) => out.push_str(" class=\"source-borders hwp-table\""),
+        (true, false) => out.push_str(" class=\"source-borders\""),
+        (false, true) => out.push_str(" class=\"hwp-table\""),
+        (false, false) => {}
     }
-    let widths = styled.then(|| table_widths(rows)).flatten();
+    let widths = if styled {
+        table_widths(rows).or_else(|| if hwp { hwp_merged_widths(rows) } else { None })
+    } else {
+        None
+    };
     if let Some(widths) = widths.filter(|v| !v.is_empty()) {
         let total = widths.iter().sum::<f64>();
         writeln!(
@@ -903,7 +984,7 @@ fn html_table(
                 write!(out, " rowspan=\"{n}\"")?
             }
             if styled {
-                cell_attributes(out, &c.properties)?;
+                cell_attributes(out, &c.properties, hwp)?;
             }
             out.push('>');
             out.push_str(&runs(&c.runs, None, links, styled));
@@ -931,7 +1012,7 @@ fn html_table(
                     Block::Paragraph { runs: items, .. } => {
                         writeln!(out, "<p>{}</p>", runs(items, None, links, false))?
                     }
-                    Block::Table { rows } => html_table(out, rows, links, styled)?,
+                    Block::Table { rows } => html_table(out, rows, links, style)?,
                 }
             }
             out.push_str("</td>");
@@ -1149,6 +1230,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             "article .source-borders > tbody > tr > :is(td, th) { border: none; }\n",
             "article td > :first-child { margin-top: 0; }\n",
             "article td > :last-child { margin-bottom: 0; }\n",
+            "article .hwp-table > tbody > tr > td > p { margin-block: 0; }\n",
             "article img { max-width: 100%; }\n",
             "article .source-crop { position: relative; display: inline-block; max-width: 100%; overflow: hidden; vertical-align: middle; }\n",
             "article .source-crop > img { position: absolute; max-width: none; }\n",
@@ -1162,6 +1244,13 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
     let mut next_slide_number = 0;
     for (i, s) in doc.sections.iter().enumerate() {
         let hwp3 = doc.format == "hwp" && s.source == "document";
+        let table_style = if !html {
+            TableStyle::Markdown
+        } else if doc.format == "hwp" && !hwp3 {
+            TableStyle::Hwp5
+        } else {
+            TableStyle::Html
+        };
         let mut blank_lines = 0;
         let mut previous_pdf_line: Option<(f32, f32)> = None;
         let slide_number = if s.kind == "slide" {
@@ -1470,7 +1559,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                             || cell.blocks.iter().any(|b| matches!(b, Block::Table { .. }))
                     });
                     if html || needs_html || rows.len().saturating_mul(width) > CELL_LIMIT {
-                        html_table(&mut out, rows, links, html)?;
+                        html_table(&mut out, rows, links, table_style)?;
                         // A blank line ends the Markdown HTML block, so only
                         // add one after the outermost table.
                         out.push('\n');

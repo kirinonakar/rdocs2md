@@ -547,6 +547,7 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
         data.extend(address.into_iter().flat_map(u16::to_le_bytes));
         data.resize(47, 0);
         data[16..20].copy_from_slice(&6000_u32.to_le_bytes());
+        data[20..24].copy_from_slice(&71573_u32.to_le_bytes());
         data[32..34].copy_from_slice(&1_u16.to_le_bytes());
         record(out, 72, level, &data);
     }
@@ -576,10 +577,10 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     paragraph(&mut raw, 2, "Question");
     cell(&mut raw, 2, [2, 1, 1, 1]);
     paragraph(&mut raw, 2, "Answer");
-    table(&mut raw, 3, 1, 2);
-    cell(&mut raw, 4, [0, 0, 1, 1]);
+    table(&mut raw, 3, 2, 4);
+    cell(&mut raw, 4, [0, 0, 3, 2]);
     paragraph(&mut raw, 4, "Nested answer");
-    cell(&mut raw, 4, [1, 0, 1, 1]);
+    cell(&mut raw, 4, [3, 0, 1, 1]);
     let mut shape = [0; 50];
     shape[..8].copy_from_slice(b"cip$cip$");
     shape[28..32].copy_from_slice(&950_u32.to_le_bytes());
@@ -589,6 +590,8 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     let mut picture = [0; 73];
     picture[71..73].copy_from_slice(&1_u16.to_le_bytes());
     record(&mut raw, 85, 7, &picture);
+    cell(&mut raw, 4, [3, 1, 1, 1]);
+    paragraph(&mut raw, 4, "Nested detail");
     paragraph(&mut raw, 2, "Answer continued");
     paragraph(&mut raw, 0, "After");
     let mut file = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
@@ -645,7 +648,7 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     let text = md(&doc);
     assert!(text.contains("<td rowspan=\"2\">1</td><td colspan=\"2\">Question and answer</td>"));
     assert!(text.contains("<td>Question</td><td><p>Answer</p>\n<table>"));
-    assert!(text.contains("<td>Nested answer</td>"));
+    assert!(text.contains("<td colspan=\"3\" rowspan=\"2\">Nested answer</td>"));
     assert!(text.contains("</table>\n<p>Answer continued</p>\n</td>"));
     assert_eq!(text.matches("\n\n").count(), 4);
     assert!(text.starts_with("Before\n\n<table>") && text.ends_with("After\n\n"));
@@ -664,11 +667,19 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
         "background-color:#F2E5C4;",
         "width:60pt;",
         "rowspan=\"2\"",
+        "width:120.0000pt;table-layout:fixed\"><colgroup>",
+        "<col style=\"width:50.00000%\">",
+        "<col style=\"width:16.66667%\">",
         "<p style=\"text-align:center;\">Answer continued</p>",
         "font-size:12pt;color:#112233;\">Af</span><span style=\"font-size:9pt;color:#112233;\">ter</span>",
     ] {
         assert!(html.contains(expected), "missing {expected} in {html}");
     }
+    assert!(!html.contains("height:715.73pt;"));
+    let Block::Table { rows } = &doc.sections[0].blocks[1] else {
+        panic!("expected HWP table");
+    };
+    assert_eq!(rows[0][0].properties["height"], "715.73pt");
 }
 
 #[test]
