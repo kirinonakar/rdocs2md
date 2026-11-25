@@ -815,6 +815,53 @@ fn table_widths(rows: &[Vec<Cell>]) -> Option<Vec<f64>> {
         .then(|| columns.into_iter().map(|(_, width)| width).collect())
 }
 
+fn markdown_cell(out: &mut String, cell: &Cell, links: &Properties) {
+    let paragraphs =
+        std::iter::once(cell.runs.as_slice()).chain(cell.blocks.iter().filter_map(|block| {
+            match block {
+                Block::Paragraph { runs, .. } => Some(runs.as_slice()),
+                Block::Table { .. } => None,
+            }
+        }));
+    let start = out.len();
+    for items in paragraphs.filter(|items| !items.is_empty()) {
+        let text = runs(items, Some(MarkdownContext::Table), links, false);
+        let text = text.trim_matches([' ', '\t', '\n', '\r']);
+        if text.is_empty() {
+            continue;
+        }
+        if out.len() > start {
+            out.push_str("<br>");
+        }
+        // Each Markdown table row occupies one source line. The text renderer's
+        // hard-break spaces and any preceding CR are removed at the boundary.
+        let lines = text
+            .lines()
+            .flat_map(|line| line.trim_end_matches([' ', '\t', '\r']).split('\r'));
+        for (index, line) in lines.enumerate() {
+            if index > 0 {
+                out.push_str("<br>");
+            }
+            table_inline(out, line.trim_start_matches([' ', '\t']));
+        }
+    }
+}
+
+fn table_inline(out: &mut String, text: &str) {
+    // Literal text is already escaped by the Markdown escaper. Pipes generated
+    // in inline content, such as link destinations, also need protection.
+    for fragment in text.split_inclusive('|') {
+        if let Some(content) = fragment.strip_suffix('|')
+            && content.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 0
+        {
+            out.push_str(content);
+            out.push_str("\\|");
+        } else {
+            out.push_str(fragment);
+        }
+    }
+}
+
 fn html_table(
     out: &mut String,
     rows: &[Vec<Cell>],
@@ -996,6 +1043,16 @@ fn markdown_bullet(blocks: &[Block], index: usize, runs: &[Run]) -> Option<usize
         .then_some(prefix)
 }
 
+fn markdown_blank_lines(out: &mut String, count: usize) {
+    if count > 0 {
+        // The newline ending the last content line is separate from the
+        // blank lines. Paragraph and table separators can already supply one.
+        let existing = out.bytes().rev().take_while(|&b| b == b'\n').count();
+        let needed = count + usize::from(!out.is_empty());
+        out.extend(std::iter::repeat_n('\n', needed.saturating_sub(existing)));
+    }
+}
+
 pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> Result<String> {
     if !matches!(mode, "semantic" | "layout" | "hybrid") {
         return Err("mode must be semantic, layout or hybrid".into());
@@ -1048,6 +1105,8 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
     }
     let mut next_slide_number = 0;
     for (i, s) in doc.sections.iter().enumerate() {
+        let hwp3 = doc.format == "hwp" && s.source == "document";
+        let mut blank_lines = 0;
         let mut previous_pdf_line: Option<(f32, f32)> = None;
         let slide_number = if s.kind == "slide" {
             next_slide_number += 1;
@@ -1178,6 +1237,22 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             {
                 continue;
             }
+            let source_blank = hwp3
+                && matches!(block, Block::Paragraph {
+                    heading: 0, list: None, runs, properties
+                } if !properties.contains_key("anchor") && runs.iter().all(|run| {
+                    run.text.trim().is_empty()
+                        && run.image.is_none()
+                        && run.latex.is_none()
+                        && run.mathml.is_none()
+                }));
+            if source_blank && !html && mode != "layout" {
+                blank_lines += 1;
+                in_list = false;
+                list_indents.clear();
+                continue;
+            }
+            markdown_blank_lines(&mut out, std::mem::take(&mut blank_lines));
             let list_type = if html
                 && let Block::Paragraph {
                     list: Some(list), ..
@@ -1192,7 +1267,12 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                     writeln!(out, "</{old}>")?
                 }
                 if let Some(new) = list_type {
-                    writeln!(out, "<{new}>")?
+                    let attrs = if hwp3 {
+                        " style=\"margin-block:0\""
+                    } else {
+                        ""
+                    };
+                    writeln!(out, "<{new}{attrs}>")?
                 }
                 html_list = list_type;
             }
@@ -1245,7 +1325,11 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                     } else {
                         MarkdownContext::Block
                     };
-                    let val = runs(items, (!use_html).then_some(context), links, html);
+                    let val = if source_blank {
+                        "<br>".into()
+                    } else {
+                        runs(items, (!use_html).then_some(context), links, html)
+                    };
                     if !html && in_list && list.is_none() {
                         out.push('\n');
                     }
@@ -1311,23 +1395,21 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                 }
                 Block::Table { rows } => {
                     previous_pdf_line = None;
-                    if !html && in_list {
-                        out.push('\n');
-                    }
                     in_list = false;
                     list_indents.clear();
                     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
                     if width == 0 {
                         continue;
                     }
-                    let merged = rows.iter().flatten().any(|c| {
-                        c.colspan.is_some() || c.rowspan.is_some() || !c.blocks.is_empty()
+                    if !html && !out.is_empty() && !out.ends_with("\n\n") {
+                        out.push('\n');
+                    }
+                    let needs_html = rows.iter().flatten().any(|cell| {
+                        cell.colspan.is_some_and(|span| span != 1)
+                            || cell.rowspan.is_some_and(|span| span != 1)
+                            || cell.blocks.iter().any(|b| matches!(b, Block::Table { .. }))
                     });
-                    if html
-                        || mode == "layout"
-                        || merged
-                        || rows.len().saturating_mul(width) > CELL_LIMIT
-                    {
+                    if html || needs_html || rows.len().saturating_mul(width) > CELL_LIMIT {
                         html_table(&mut out, rows, links, html)?;
                         // A blank line ends the Markdown HTML block, so only
                         // add one after the outermost table.
@@ -1336,14 +1418,11 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                         for (n, row) in rows.iter().enumerate() {
                             out.push('|');
                             for j in 0..width {
-                                let t = row
-                                    .get(j)
-                                    .map(|c| {
-                                        runs(&c.runs, Some(MarkdownContext::Table), links, false)
-                                    })
-                                    .unwrap_or_default()
-                                    .replace("  \n", "<br>");
-                                write!(out, " {t} |")?;
+                                out.push(' ');
+                                if let Some(cell) = row.get(j) {
+                                    markdown_cell(&mut out, cell, links);
+                                }
+                                out.push_str(" |");
                             }
                             out.push('\n');
                             if n == 0 {
@@ -1361,6 +1440,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         if let Some(old) = html_list {
             writeln!(out, "</{old}>")?
         }
+        markdown_blank_lines(&mut out, blank_lines);
         for (paper, page) in pages {
             hwp3_page(&mut out, paper, page, links)?;
         }
@@ -1448,6 +1528,47 @@ mod tests {
                 "| - 항목 \\| report_id |\n| --- |\n\n",
             ),
         );
+    }
+
+    #[test]
+    fn markdown_tables_keep_single_line_rows_and_preserve_nested_tables() {
+        let mut doc = Document::new("epub");
+        let mut section = Section::new("section", "");
+        let mut link = Run::text("Link | label");
+        link.link = Some("https://example.org/?q=a|b".into());
+        section.blocks.push(Block::Table {
+            rows: vec![
+                vec![Cell::text("Header"), Cell::text("Notes")],
+                vec![Cell {
+                    runs: vec![link],
+                    blocks: vec![Block::text("First\r\nSecond")],
+                    ..Cell::default()
+                }],
+            ],
+        });
+        section.blocks.push(Block::Table {
+            rows: vec![vec![Cell {
+                blocks: vec![
+                    Block::text("Outer"),
+                    Block::Table {
+                        rows: vec![vec![Cell::text("Inner")]],
+                    },
+                ],
+                ..Cell::default()
+            }]],
+        });
+        doc.sections.push(section);
+
+        let md = render(&doc, "md", "hybrid", &Properties::new()).unwrap();
+        assert!(
+            md.starts_with(concat!(
+                "| Header | Notes |\n| --- | --- |\n",
+                "| [Link \\| label](<https://example.org/?q=a\\|b>)<br>First<br>Second |  |\n\n"
+            )),
+            "{md}"
+        );
+        assert_eq!(md.matches("<table>").count(), 2);
+        assert!(md.contains("<p>Outer</p>\n<table>\n<tr><td>Inner</td></tr>"));
     }
 
     #[test]

@@ -84,7 +84,7 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
         ..ParseState::default()
     };
     let mut section = Section::new("section", "document");
-    section.blocks = paragraph_list(&mut cursor, 0, &mut state, false)?;
+    section.blocks = paragraph_list(&mut cursor, 0, &mut state)?;
     classify_paragraphs(&mut section.blocks);
     section.hwp3_layout = state.layout(section.blocks.len());
     if section.hwp3_layout.is_none() {
@@ -240,16 +240,12 @@ fn paragraph_list<'a>(
     cursor: &mut Cursor<'a>,
     depth: usize,
     state: &mut ParseState,
-    in_cell: bool,
 ) -> Result<Vec<Block>> {
     if depth > MAX_NESTING {
         return Err("HWP 3.0 object nesting limit exceeded".into());
     }
     let mut blocks = Vec::new();
-    let mut shape = ParagraphShape {
-        data: None,
-        in_cell,
-    };
+    let mut shape = ParagraphShape { data: None };
     loop {
         state.nodes += 1;
         if state.nodes > NODE_LIMIT {
@@ -420,7 +416,7 @@ fn parse_paragraph<'a>(
                 } else {
                     None
                 };
-                let captions = paragraph_list(cursor, depth + 1, state, false)?;
+                let captions = paragraph_list(cursor, depth + 1, state)?;
                 if let Some((key, [dx, dy, width, height], order)) = graphic {
                     if replaces
                         && captions.is_empty()
@@ -572,6 +568,16 @@ fn parse_paragraph<'a>(
         }
     }
     paragraph.flush(&mut out);
+    if depth == 0 && line_count > 0 && char_count == 1 && out.is_empty() {
+        // A paragraph containing only its terminator can still occupy a source
+        // line. An empty fragment after a table or picture does not.
+        out.push(Block::Paragraph {
+            heading: 0,
+            list: None,
+            runs: Vec::new(),
+            properties: paragraph.properties,
+        });
+    }
     if positioned {
         if replaces && !graphics.is_empty() {
             state
@@ -605,7 +611,7 @@ fn append_nested(
     out: &mut Vec<Block>,
     paragraph: &mut ParagraphText,
 ) -> Result<()> {
-    let nested = paragraph_list(cursor, depth + 1, state, false)?;
+    let nested = paragraph_list(cursor, depth + 1, state)?;
     if !nested.is_empty() {
         paragraph.flush(out);
         out.extend(nested);
@@ -634,9 +640,9 @@ fn parse_box(
     }
     let mut contents = Vec::with_capacity(cell_count);
     for _ in 0..cell_count {
-        contents.push(paragraph_list(cursor, depth + 1, state, kind == 0)?);
+        contents.push(paragraph_list(cursor, depth + 1, state)?);
     }
-    let captions = paragraph_list(cursor, depth + 1, state, false)?;
+    let captions = paragraph_list(cursor, depth + 1, state)?;
 
     if kind == 0 && cell_count > 0 {
         let table = table_from_cells(&cells, contents)?;
@@ -800,7 +806,6 @@ fn table_grid(metadata: &[&[u8]]) -> Option<(usize, usize, Vec<CellLocation>)> {
 
 struct ParagraphShape<'a> {
     data: Option<&'a [u8]>,
-    in_cell: bool,
 }
 
 impl ParagraphShape<'_> {
@@ -820,26 +825,20 @@ impl ParagraphShape<'_> {
 
     fn properties(&self, size: u16) -> Properties {
         let mut props = Properties::new();
-        if self.in_cell {
-            for (key, offset) in [("margin-top", 183), ("margin-bottom", 8)] {
-                crate::formatting::points(
-                    &mut props,
-                    key,
-                    Some(f64::from(self.value(offset)) / 25.),
-                );
-            }
-            if let Some(size) = font_size(size) {
-                props.insert("font-size".into(), size);
-            }
-            let leading = self.value(6);
-            if leading > 0 {
-                let height = if leading & 0x8000 != 0 {
-                    format!("{}pt", f64::from(leading & 0x7fff) / 25.)
-                } else {
-                    format!("{leading}%")
-                };
-                props.insert("line-height".into(), height);
-            }
+        for (key, offset) in [("margin-top", 183), ("margin-bottom", 8)] {
+            crate::formatting::points(&mut props, key, Some(f64::from(self.value(offset)) / 25.));
+        }
+        if let Some(size) = font_size(size) {
+            props.insert("font-size".into(), size);
+        }
+        let leading = self.value(6);
+        if leading > 0 {
+            let height = if leading & 0x8000 != 0 {
+                format!("{}pt", f64::from(leading & 0x7fff) / 25.)
+            } else {
+                format!("{leading}%")
+            };
+            props.insert("line-height".into(), height);
         }
         props
     }

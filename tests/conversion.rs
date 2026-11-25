@@ -723,6 +723,7 @@ fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
         header[3..5].copy_from_slice(&(starts.len() as u16).to_le_bytes());
         header[5] = u8::from(!changes.is_empty());
         header[12..43].copy_from_slice(&shape(flags));
+        header[49..51].copy_from_slice(&160u16.to_le_bytes());
         out.extend(header);
         for start in starts {
             out.extend(start.to_le_bytes());
@@ -759,6 +760,10 @@ fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
     paragraph(&mut hwp, &units("unwrapped"), &[0, 2], 275, 0, &[]);
     paragraph(&mut hwp, &units("real   spacing"), &[0], 275, 0, &[]);
     paragraph(&mut hwp, &units("pad    ded"), &[0, 5], 275, 0, &[]);
+    paragraph(&mut hwp, &[], &[0], 275, 0, &[]);
+    paragraph(&mut hwp, &units(" "), &[0], 275, 0, &[]);
+    paragraph(&mut hwp, &units("List follows"), &[0], 275, 0, &[]);
+    paragraph(&mut hwp, &units(" "), &[0], 275, 0, &[]);
     let bullet = [0x343c]
         .into_iter()
         .chain(units(" Item"))
@@ -773,7 +778,7 @@ fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
     table[92..94].copy_from_slice(&2500u16.to_le_bytes());
     table[94..96].copy_from_slice(&1200u16.to_le_bytes());
     hwp.extend(table);
-    paragraph(&mut hwp, &units("First line"), &[0], 225, 0, &[]);
+    paragraph(&mut hwp, &units("First | line"), &[0], 225, 0, &[]);
     paragraph(&mut hwp, &units("Second line"), &[0], 225, 2, &[]);
     hwp.extend([0; 43 * 2]);
     hwp.extend(13u16.to_le_bytes());
@@ -788,19 +793,30 @@ fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
         "pad<br>ded",
         "unwrapped",
         "real   spacing",
-        "</span></p><p style=\"margin-top:0pt;margin-bottom:0pt;font-size:9pt;\"",
+        "</span></p><p style=\"margin-top:0pt;margin-bottom:0pt;line-height:160%;font-size:9pt;\"",
         "<strong>Second line</strong></span></p></td>",
+        "<ul style=\"margin-block:0\">",
     ] {
         assert!(html.contains(content), "missing {content} in {html}");
     }
+    let blank = "<p style=\"white-space:pre-wrap;margin-top:0pt;margin-bottom:0pt;line-height:160%;font-size:11pt;\"><br></p>";
+    assert_eq!(html.matches(blank).count(), 3, "{html}");
     let text = md(&doc);
     for content in [
         "# **Main heading**",
         "## **Smaller heading**",
         "Read **bold** and <u>underlined</u>",
+        "pad  \nded\n\n\nList follows\n\n- **Item**",
         "- **Item**  \n  continuation\n- Item",
     ] {
         assert!(text.contains(content), "missing {content} in {text}");
+    }
+    for mode in ["semantic", "hybrid", "layout"] {
+        let text = render(&doc, "md", mode, &Properties::new()).unwrap();
+        assert!(
+            text.contains("| First \\| line<br>**Second line** |\n| --- |"),
+            "{text}"
+        );
     }
 }
 
