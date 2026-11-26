@@ -40,6 +40,18 @@ fn potential_markup(tail: &str) -> bool {
     true
 }
 
+/// A semicolon-terminated character reference could be decoded by Markdown.
+fn potential_entity(tail: &str) -> bool {
+    let (body, valid_char, min_len): (&str, fn(char) -> bool, usize) = match tail.as_bytes() {
+        [b'#', b'x' | b'X', ..] => (&tail[2..], |c| c.is_ascii_hexdigit(), 1),
+        [b'#', ..] => (&tail[1..], |c| c.is_ascii_digit(), 1),
+        [first, ..] if first.is_ascii_alphabetic() => (tail, |c| c.is_ascii_alphanumeric(), 2),
+        _ => return false,
+    };
+    let rest = body.trim_start_matches(valid_char);
+    body.len() - rest.len() >= min_len && rest.starts_with(';')
+}
+
 /// Byte offsets of the brackets that must stay escaped because they start a
 /// Markdown link (`[text](target)` or `[text][label]`).
 ///
@@ -256,7 +268,7 @@ impl<'a> MarkdownEscaper<'a> {
                 if escape {
                     out.push('\\');
                 }
-                if c == '&' {
+                if c == '&' && potential_entity(&line[i + 1..]) {
                     out.push_str("&amp;");
                 } else {
                     out.push(c);
@@ -1658,6 +1670,8 @@ mod tests {
             "report_2026_final.pdf, 이름_부분, _prefix",
             r"C:\Users\name\test_file.txt",
             "2 * 3 | 10 ~ 20 | ` 하나",
+            "Lt.toe ulcer & rest pain",
+            "R&D; AT&T, A && B",
         ] {
             assert_eq!(markdown(text), text);
         }
@@ -1670,6 +1684,10 @@ mod tests {
             "\\_강조_ \\*강조* \\~\\~취소~~ \\`코드`"
         );
         assert_eq!(markdown("A | B\n---|---"), "A | B\n---\\|---");
+        assert_eq!(
+            markdown("&copy; &#38; &#x26;"),
+            "&amp;copy; &amp;#38; &amp;#x26;"
+        );
     }
 
     #[test]
