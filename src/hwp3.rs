@@ -1057,19 +1057,23 @@ fn hnc_char(code: u16) -> Option<char> {
             // with the kana rows skipped in the last group.
             let offset = code - 0x3400;
             let row = offset / 96 + if offset / 96 == 9 { 0xa3 } else { 0xa1 };
-            let bytes = [row as u8, (offset % 96 + 0xa0) as u8];
-            let text =
-                encoding_rs::EUC_KR.decode_without_bom_handling_and_without_replacement(&bytes)?;
-            text.chars().next()
+            euc_kr_char([row as u8, (offset % 96 + 0xa0) as u8])
         }
-        0x420f => Some('軍'),
-        0x4216 => Some('弓'),
-        0x4584 => Some('名'),
-        0x4872 => Some('聖'),
-        0x4ad5 => Some('領'),
+        0x4000..=0x5317 => {
+            // HNC level-1 Hanja flatten the 52 KS X 1001 rows of 94 characters.
+            let offset = code - 0x4000;
+            euc_kr_char([(0xca + offset / 94) as u8, (0xa1 + offset % 94) as u8])
+        }
         _ if code & 0x8000 != 0 => kssm_char(code),
         _ => char::from_u32(u32::from(code)).filter(|ch| !ch.is_control()),
     }
+}
+
+fn euc_kr_char(bytes: [u8; 2]) -> Option<char> {
+    encoding_rs::EUC_KR
+        .decode_without_bom_handling_and_without_replacement(&bytes)?
+        .chars()
+        .next()
 }
 
 fn kssm_char(code: u16) -> Option<char> {
@@ -1092,4 +1096,26 @@ fn kssm_char(code: u16) -> Option<char> {
     };
     let offset = (initial_index * 21 + medial_index) * 28 + final_index;
     char::from_u32(0xac00 + offset as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hnc_char;
+
+    #[test]
+    fn decodes_hnc_hanja_as_ks_x_1001_characters() {
+        for (code, expected) in [
+            (0x4000, '伽'),
+            (0x405d, '龕'),
+            (0x405e, '匣'),
+            (0x420f, '軍'),
+            (0x47c4, '殺'),
+            (0x4ad5, '領'),
+            (0x4cac, '人'),
+            (0x4cf3, '者'),
+            (0x5317, '詰'),
+        ] {
+            assert_eq!(hnc_char(code), Some(expected), "HNC {code:#06x}");
+        }
+    }
 }
