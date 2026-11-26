@@ -799,6 +799,84 @@ fn html_hwpx_keeps_referenced_cell_border_fill_and_alignment() {
 }
 
 #[test]
+fn hwp2_reads_kana_and_styled_table_cells() {
+    fn paragraph(out: &mut Vec<u8>, count: u16, has_styles: bool, reuse_shape: bool) {
+        let mut header = [0u8; 37];
+        header[0] = u8::from(reuse_shape);
+        header[1..3].copy_from_slice(&count.to_le_bytes());
+        header[3] = 1;
+        header[5] = u8::from(has_styles);
+        header[12..14].copy_from_slice(&250u16.to_le_bytes());
+        out.extend(header);
+        if !reuse_shape {
+            out.extend([0; 187]);
+        }
+        out.extend([0; 14]);
+    }
+
+    let mut hwp = b"HWP Document File V2.00 \x1a\x01\x02\x03\x04\x05".to_vec();
+    hwp.resize(30 + 128 + 1008, 0);
+    hwp.extend(1u16.to_le_bytes());
+    hwp.extend([0; 40 + 4 * 2]);
+    hwp.extend(1u16.to_le_bytes());
+    hwp.extend([0; 20 + 25 + 187]);
+
+    let title: Vec<_> = "    Kana ".encode_utf16().chain([0x1f53, 13]).collect();
+    paragraph(&mut hwp, title.len() as u16, false, false);
+    hwp.extend(title.into_iter().flat_map(u16::to_le_bytes));
+
+    paragraph(&mut hwp, 5, false, true);
+    hwp.extend([10u16, 0, 0, 10].into_iter().flat_map(u16::to_le_bytes));
+    let mut table = [0u8; 84 + 2 * 27];
+    table[80] = 2;
+    for (index, cell) in table[84..].chunks_exact_mut(27).enumerate() {
+        cell[4..6].copy_from_slice(&(500 * index as u16).to_le_bytes());
+        cell[8..10].copy_from_slice(&500u16.to_le_bytes());
+        cell[10..12].copy_from_slice(&300u16.to_le_bytes());
+    }
+    hwp.extend(table);
+
+    paragraph(&mut hwp, 4, true, false);
+    let mut style = [0u8; 25];
+    style[..2].copy_from_slice(&300u16.to_le_bytes());
+    style[18] = 4;
+    style[20] = 2;
+    hwp.push(0);
+    hwp.extend(style);
+    hwp.extend([1, 1, 1]);
+    hwp.extend(
+        [0x1f02u16, 0x1f62, 0x4000, 13]
+            .into_iter()
+            .flat_map(u16::to_le_bytes),
+    );
+    hwp.extend([0; 37]);
+
+    paragraph(&mut hwp, 3, false, false);
+    hwp.extend(
+        [0x8861u16, 0x8741, 13]
+            .into_iter()
+            .flat_map(u16::to_le_bytes),
+    );
+    hwp.extend([0; 37 * 2]);
+    hwp.extend(13u16.to_le_bytes());
+    hwp.extend([0; 37]);
+
+    let doc = convert(&hwp, false).unwrap();
+    assert!(md(&doc).starts_with("Kana ん\n\n"));
+    let Block::Table { rows } = &doc.sections[0].blocks[1] else {
+        panic!("expected HWP 2.00 table");
+    };
+    assert_eq!((rows.len(), rows[0].len()), (1, 2));
+    let Block::Paragraph { runs, .. } = &rows[0][0].blocks[0] else {
+        panic!("expected a styled cell paragraph");
+    };
+    assert_eq!(runs[0].text, "あア伽");
+    assert!(runs[0].style.bold);
+    assert_eq!(runs[0].style.color.as_deref(), Some("#ff0000"));
+    assert!(md(&doc).contains("| **あア伽** | 가ㅠ |"));
+}
+
+#[test]
 fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
     fn paragraph(
         out: &mut Vec<u8>,

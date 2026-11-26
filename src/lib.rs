@@ -120,8 +120,8 @@ pub const FORMATS: &[(&str, &str, &str)] = &[
     ),
     (
         "hwp",
-        "HWP 3.x KSSM text, tables, vector drawings as SVG, and positioned HTML pages; HWP 5 BodyText, Unicode paragraphs, tables and embedded raster pictures",
-        "HWP 3.x legacy picture encodings, advanced drawing effects and typography are partial; HWP 5 distribution-protected files and general vector drawings are unsupported",
+        "HWP 2.00 text and tables; HWP 3.x text, tables, vector drawings as SVG and positioned HTML pages; HWP 5 BodyText, Unicode paragraphs, tables and embedded raster pictures",
+        "Legacy HWP picture encodings, advanced drawing effects and typography are partial; HWP 5 distribution-protected files and general vector drawings are unsupported",
     ),
     (
         "hwpx",

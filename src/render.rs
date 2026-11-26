@@ -1553,6 +1553,14 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                             previous_pdf_line = pdf_last_baseline(properties).map(|y| (y, size));
                         } else {
                             previous_pdf_line = None;
+                            // HWP can use leading spaces for alignment. Four or more
+                            // would turn the paragraph into a Markdown code block.
+                            let val =
+                                if doc.format == "hwp" && heading == 0 && val.starts_with("    ") {
+                                    val.trim_start_matches(' ')
+                                } else {
+                                    &val
+                                };
                             writeln!(out, "{val}\n")?
                         }
                     }

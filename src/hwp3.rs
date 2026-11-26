@@ -8,36 +8,49 @@ use std::{borrow::Cow, io::Read};
 mod drawing;
 pub(crate) use drawing::SVG_START as GENERATED_SVG_START;
 
-const SIGNATURE: &[u8; 30] = b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05";
+const SIGNATURE_2: &[u8; 30] = b"HWP Document File V2.00 \x1a\x01\x02\x03\x04\x05";
+const SIGNATURE_3: &[u8; 30] = b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05";
 const DOCUMENT_INFO_SIZE: usize = 128;
 const DOCUMENT_SUMMARY_SIZE: usize = 1008;
-const FONT_GROUPS: usize = 7;
 const FONT_NAME_SIZE: usize = 40;
-const STYLE_SIZE: usize = 238;
+const STYLE_NAME_SIZE: usize = 20;
+const PARAGRAPH_SHAPE_SIZE: usize = 187;
 const MAX_NESTING: usize = 32;
 const NODE_LIMIT: usize = 1_500_000;
 
 pub fn matches(data: &[u8]) -> bool {
-    data.starts_with(SIGNATURE)
+    font_groups(data).is_some()
+}
+
+fn font_groups(data: &[u8]) -> Option<usize> {
+    if data.starts_with(SIGNATURE_2) {
+        Some(5)
+    } else if data.starts_with(SIGNATURE_3) {
+        Some(7)
+    } else {
+        None
+    }
 }
 
 pub fn parse(data: &[u8], images: bool) -> Result<Document> {
-    if !matches(data) {
-        return Err("expected HWP 3.0 signature".into());
-    }
-    let fixed_end = SIGNATURE.len() + DOCUMENT_INFO_SIZE + DOCUMENT_SUMMARY_SIZE;
+    let font_groups = font_groups(data).ok_or("expected HWP 2.00 or 3.00 signature")?;
+    // Font, width and spacing each use one byte per language group.
+    let char_shape_size = 10 + 3 * font_groups;
+    let style_size = STYLE_NAME_SIZE + char_shape_size + PARAGRAPH_SHAPE_SIZE;
+    let signature_size = SIGNATURE_3.len();
+    let fixed_end = signature_size + DOCUMENT_INFO_SIZE + DOCUMENT_SUMMARY_SIZE;
     let info = data
-        .get(SIGNATURE.len()..SIGNATURE.len() + DOCUMENT_INFO_SIZE)
-        .ok_or("truncated HWP 3.0 document info")?;
+        .get(signature_size..signature_size + DOCUMENT_INFO_SIZE)
+        .ok_or("truncated HWP document info")?;
     if read_u16_at(info, 96)? != 0 {
-        return Err("password-protected HWP 3.0 is unsupported".into());
+        return Err("password-protected HWP is unsupported".into());
     }
     let info_blocks_size = usize::from(read_u16_at(info, 126)?);
     let body_start = fixed_end
         .checked_add(info_blocks_size)
-        .ok_or("HWP 3.0 offset overflow")?;
+        .ok_or("HWP offset overflow")?;
     if body_start > data.len() {
-        return Err("truncated HWP 3.0 info blocks".into());
+        return Err("truncated HWP info blocks".into());
     }
 
     let body = if info[124] != 0 {
@@ -46,7 +59,7 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
             .take(EXPANSION_LIMIT as u64 + 1)
             .read_to_end(&mut decoded)?;
         if decoded.len() > EXPANSION_LIMIT {
-            return Err("HWP 3.0 expansion limit exceeded".into());
+            return Err("HWP expansion limit exceeded".into());
         }
         Cow::Owned(decoded)
     } else {
@@ -54,23 +67,23 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
     };
 
     let mut cursor = Cursor::new(&body);
-    for _ in 0..FONT_GROUPS {
+    for _ in 0..font_groups {
         let count = usize::from(cursor.u16()?);
         cursor.skip(
             count
                 .checked_mul(FONT_NAME_SIZE)
-                .ok_or("HWP 3.0 font table overflow")?,
+                .ok_or("HWP font table overflow")?,
         )?;
     }
     let style_count = usize::from(cursor.u16()?);
     cursor.skip(
         style_count
-            .checked_mul(STYLE_SIZE)
-            .ok_or("HWP 3.0 style table overflow")?,
+            .checked_mul(style_size)
+            .ok_or("HWP style table overflow")?,
     )?;
 
     let mut doc = Document::new("hwp");
-    if let Some(summary) = data.get(SIGNATURE.len() + DOCUMENT_INFO_SIZE..fixed_end)
+    if let Some(summary) = data.get(signature_size + DOCUMENT_INFO_SIZE..fixed_end)
         && let Some(title_bytes) = summary.get(..112)
     {
         let title = decode_hchar_array(title_bytes);
@@ -79,6 +92,7 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
         }
     }
     let mut state = ParseState {
+        char_shape_size,
         images,
         paper: if images { Paper::read(info) } else { None },
         ..ParseState::default()
@@ -121,6 +135,7 @@ impl Paper {
 
 #[derive(Default)]
 struct ParseState {
+    char_shape_size: usize,
     nodes: usize,
     images: bool,
     asset_bytes: usize,
@@ -202,11 +217,8 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(len).ok_or("HWP 3.0 offset overflow")?;
-        let value = self
-            .data
-            .get(self.pos..end)
-            .ok_or("truncated HWP 3.0 body")?;
+        let end = self.pos.checked_add(len).ok_or("HWP offset overflow")?;
+        let value = self.data.get(self.pos..end).ok_or("truncated HWP body")?;
         self.pos = end;
         Ok(value)
     }
@@ -231,7 +243,7 @@ impl<'a> Cursor<'a> {
 fn read_u16_at(data: &[u8], offset: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(
         data.get(offset..offset + 2)
-            .ok_or("truncated HWP 3.0 field")?
+            .ok_or("truncated HWP field")?
             .try_into()?,
     ))
 }
@@ -242,14 +254,14 @@ fn paragraph_list<'a>(
     state: &mut ParseState,
 ) -> Result<Vec<Block>> {
     if depth > MAX_NESTING {
-        return Err("HWP 3.0 object nesting limit exceeded".into());
+        return Err("HWP object nesting limit exceeded".into());
     }
     let mut blocks = Vec::new();
     let mut shape = ParagraphShape { data: None };
     loop {
         state.nodes += 1;
         if state.nodes > NODE_LIMIT {
-            return Err("HWP 3.0 paragraph limit exceeded".into());
+            return Err("HWP paragraph limit exceeded".into());
         }
         let Some(mut paragraph) = parse_paragraph(cursor, depth, state, blocks.len(), &mut shape)?
         else {
@@ -272,7 +284,7 @@ fn parse_paragraph<'a>(
     let has_char_shapes = cursor.u8()? != 0;
     let flags = cursor.u8()?;
     cursor.skip(4 + 1)?;
-    let default_shape = cursor.take(31)?;
+    let default_shape = cursor.take(state.char_shape_size)?;
     if char_count == 0 {
         return Ok(None);
     }
@@ -285,12 +297,12 @@ fn parse_paragraph<'a>(
         false
     };
     if previous_shape == 0 {
-        shape.data = Some(cursor.take(187)?);
+        shape.data = Some(cursor.take(PARAGRAPH_SHAPE_SIZE)?);
     }
     let line_info = cursor.take(
         line_count
             .checked_mul(14)
-            .ok_or("HWP 3.0 line table overflow")?,
+            .ok_or("HWP line table overflow")?,
     )?;
     let line_info = line_info.as_chunks::<14>().0;
     let starts: Vec<_> = line_info
@@ -316,7 +328,7 @@ fn parse_paragraph<'a>(
     if has_char_shapes {
         for index in 0..char_count {
             if cursor.u8()? != 1 {
-                changes.push((index, cursor.take(31)?));
+                changes.push((index, cursor.take(state.char_shape_size)?));
             }
         }
     }
@@ -562,7 +574,7 @@ fn parse_paragraph<'a>(
             _ => paragraph.text.push(hnc_char(code).unwrap_or('\u{fffd}')),
         }
         if consumed > char_count {
-            return Err("invalid HWP 3.0 control character length".into());
+            return Err("invalid HWP control character length".into());
         }
         if replaces && code != 9 && (code == 32 || paragraph.text.len() > text_start) {
             let value = if code == 32 {
@@ -619,7 +631,7 @@ fn parse_paragraph<'a>(
 fn skip_reserved(cursor: &mut Cursor<'_>, code: u16) -> Result<()> {
     let size = usize::try_from(cursor.u32()?)?;
     if cursor.u16()? != code {
-        return Err("invalid HWP 3.0 control character marker".into());
+        return Err("invalid HWP control character marker".into());
     }
     cursor.skip(size)
 }
@@ -646,13 +658,13 @@ fn parse_box(
     out: &mut Vec<Block>,
 ) -> Result<()> {
     if depth > MAX_NESTING {
-        return Err("HWP 3.0 object nesting limit exceeded".into());
+        return Err("HWP object nesting limit exceeded".into());
     }
     let info = cursor.take(84)?;
     let kind = info[78];
     let cell_count = usize::from(read_u16_at(info, 80)?);
     if cell_count > CELL_LIMIT {
-        return Err("HWP 3.0 table cell limit exceeded".into());
+        return Err("HWP table cell limit exceeded".into());
     }
     let mut cells = Vec::with_capacity(cell_count);
     for _ in 0..cell_count {
@@ -761,7 +773,7 @@ fn table_from_cells(metadata: &[&[u8]], contents: Vec<Vec<Block>>) -> Result<Blo
         (row_count, col_count)
     };
     if rows.saturating_mul(columns) > CELL_LIMIT {
-        return Err("HWP 3.0 table cell limit exceeded".into());
+        return Err("HWP table cell limit exceeded".into());
     }
     let mut grid = (0..rows * columns)
         .map(|_| Cell::default())
@@ -903,7 +915,8 @@ fn font_size(size: u16) -> Option<String> {
 }
 
 fn char_style(data: &[u8]) -> Style {
-    let flags = data[26];
+    let attributes = data.len() - 8;
+    let flags = data[attributes + 3];
     let palette = [
         "#0000ff", "#00ff00", "#00ffff", "#ff0000", "#ff00ff", "#ffff00", "#ffffff",
     ];
@@ -916,7 +929,7 @@ fn char_style(data: &[u8]) -> Style {
             0x40 => Some("sub".into()),
             _ => None,
         },
-        color: data[24]
+        color: data[attributes + 1]
             .checked_sub(1)
             .and_then(|index| palette.get(usize::from(index)))
             .map(|&color| color.into()),
@@ -1042,6 +1055,10 @@ fn hnc_char(code: u16) -> Option<char> {
         0x0086 => Some('„'),
         0x0087 => Some('‟'),
         0x0088..=0x00a0 => Some('\u{3000}'),
+        // HNC kana use the hiragana and katakana rows of KS X 1001.
+        0x1f01..=0x1f53 => euc_kr_char([0xaa, (code - 0x1f00 + 0xa0) as u8]),
+        0x1f61..=0x1fb6 => euc_kr_char([0xab, (code - 0x1f60 + 0xa0) as u8]),
+        0x1f00..=0x1fff => None,
         0x2f08 => Some('▪'),
         0x2f11 | 0x2f14 => Some('◦'),
         0x2f17 => Some('•'),
@@ -1077,10 +1094,33 @@ fn euc_kr_char(bytes: [u8; 2]) -> Option<char> {
 }
 
 fn kssm_char(code: u16) -> Option<char> {
+    const INITIAL_JAMO: [char; 19] = [
+        'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ',
+        'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
+    ];
+    const FINAL_JAMO: [char; 27] = [
+        'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ',
+        'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
+    ];
+
     let initial = ((code >> 10) & 0x1f) as usize;
     let medial = ((code >> 5) & 0x1f) as usize;
     let final_code = (code & 0x1f) as usize;
-    let initial_index = initial.checked_sub(2).filter(|&n| n < 19)?;
+    let final_index = match final_code {
+        1 => 0,
+        2..=17 => final_code - 1,
+        19..=29 => final_code - 2,
+        _ => return None,
+    };
+    // The empty medial field marks standalone consonants.
+    if medial == 2 {
+        return match (initial, final_index) {
+            (2..=20, 0) => Some(INITIAL_JAMO[initial - 2]),
+            (1, 1..=27) => Some(FINAL_JAMO[final_index - 1]),
+            _ => None,
+        };
+    }
+
     let medial_index = match medial {
         3..=7 => medial - 3,
         10..=15 => medial - 5,
@@ -1088,12 +1128,11 @@ fn kssm_char(code: u16) -> Option<char> {
         26..=29 => medial - 9,
         _ => return None,
     };
-    let final_index = match final_code {
-        1 => 0,
-        2..=17 => final_code - 1,
-        19..=29 => final_code - 2,
-        _ => return None,
-    };
+    if initial == 1 && final_index == 0 {
+        return char::from_u32('ㅏ' as u32 + medial_index as u32);
+    }
+
+    let initial_index = initial.checked_sub(2).filter(|&n| n < 19)?;
     let offset = (initial_index * 21 + medial_index) * 28 + final_index;
     char::from_u32(0xac00 + offset as u32)
 }
@@ -1101,6 +1140,29 @@ fn kssm_char(code: u16) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::hnc_char;
+
+    #[test]
+    fn decodes_kssm_standalone_modern_jamo() {
+        for (code, expected) in [
+            (0x8461, 'ㅏ'),
+            (0x85c1, 'ㅘ'),
+            (0x8741, 'ㅠ'),
+            (0x87a1, 'ㅣ'),
+            (0x8841, 'ㄱ'),
+            (0xac41, 'ㅅ'),
+            (0xd041, 'ㅎ'),
+            (0x8444, 'ㄳ'),
+            (0x8454, 'ㅄ'),
+            (0x845d, 'ㅎ'),
+            (0x8861, '가'),
+            (0x8862, '각'),
+        ] {
+            assert_eq!(hnc_char(code), Some(expected), "KSSM {code:#06x}");
+        }
+        for code in [0x8501, 0x8742, 0x8842, 0x8452] {
+            assert_eq!(hnc_char(code), None, "KSSM {code:#06x}");
+        }
+    }
 
     #[test]
     fn decodes_hnc_hanja_as_ks_x_1001_characters() {
