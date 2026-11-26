@@ -1136,7 +1136,7 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
     short(&mut input, 30 + 14, 2000);
     let mut paragraph = [0u8; 43 + 14];
     paragraph[0] = 1;
-    short(&mut paragraph, 1, 18);
+    short(&mut paragraph, 1, 23);
     short(&mut paragraph, 3, 1);
     short(&mut paragraph, 12, 250);
     short(&mut paragraph, 43 + 6, 400);
@@ -1156,6 +1156,7 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
     }
     for unit in [9, 450, 0, 9]
         .into_iter()
+        .chain([0x2050, 0x25c0, 0x25c8, 0x25d2, 0x25d3])
         .chain("Label".encode_utf16())
         .chain([13])
     {
@@ -1176,7 +1177,8 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
     assert!(html.contains("viewBox=\"0 0 15000 21000\""));
     assert_eq!(html.matches("href=\"data:image/svg+xml;base64,").count(), 2);
     assert!(html.find("<image x=\"2790\"").unwrap() < html.find("<image x=\"2890\"").unwrap());
-    assert!(html.contains("width:450px\"></span>Label"));
+    assert!(html.contains("width:450px\"></span>✡\u{f0088}\u{f008e}☼\u{f0091}Label"));
+    assert!(html.contains("unicode-range: U+F0088, U+F008E, U+F0091;"));
     assert_eq!(html.matches("Label").count(), 1);
     assert!(!html.contains("[그림]"));
     assert!(

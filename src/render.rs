@@ -1279,8 +1279,16 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             "article .source-line { font-family: Batang, 'Malgun Gothic', serif; line-height: 1; white-space: pre; }\n",
             "article .source-frame { box-sizing: border-box; display: flex; flex-direction: column; height: 100%; line-height: 1.13; }\n",
             "article .source-frame > :is(p, h2, table) { font: inherit; margin: 0; }\n",
-            "article .source-frame > p > :is(img, .source-crop) { vertical-align: top; }\n</style>\n<article>\n",
+            "article .source-frame > p > :is(img, .source-crop) { vertical-align: top; }\n",
         ));
+        if doc.format == "hwp" && doc.sections.iter().any(|s| s.source == "document") {
+            out.push_str(concat!(
+                "@font-face { font-family: HwpCompatibility; src: local('HCR Batang'), local('HCRBatang'), local('HCR Dotum'), local('HCRDotum'); unicode-range: U+F0088, U+F008E, U+F0091; }\n",
+                "article { font-family: HwpCompatibility, system-ui, -apple-system, 'Segoe UI', sans-serif; }\n",
+                "article .source-line { font-family: HwpCompatibility, Batang, 'Malgun Gothic', serif; }\n",
+            ));
+        }
+        out.push_str("</style>\n<article>\n");
     }
     let mut next_slide_number = 0;
     for (i, s) in doc.sections.iter().enumerate() {

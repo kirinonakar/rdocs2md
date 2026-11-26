@@ -1185,6 +1185,12 @@ fn hnc_char(code: u16) -> Option<char> {
         0x1f01..=0x1f53 => euc_kr_char([0xaa, (code - 0x1f00 + 0xa0) as u8]),
         0x1f61..=0x1fb6 => euc_kr_char([0xab, (code - 0x1f60 + 0xa0) as u8]),
         0x1f00..=0x1fff => None,
+        0x2050 => Some('✡'),
+        // These symbols use Hancom's supplementary private-use glyphs.
+        0x25c0 => Some('\u{f0088}'),
+        0x25c8 => Some('\u{f008e}'),
+        0x25d2 => Some('☼'),
+        0x25d3 => Some('\u{f0091}'),
         0x2f08 => Some('▪'),
         0x2f11 | 0x2f14 => Some('◦'),
         0x2f17 => Some('•'),
