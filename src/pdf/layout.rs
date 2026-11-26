@@ -2,6 +2,8 @@ use super::math::{Glyph, Script, Segment, to_latex};
 use crate::model::{Block, Cell, Properties, Run, Section, push_run};
 use std::{collections::BTreeMap, ops::Range};
 
+mod row_rules;
+
 pub(super) struct Fragment {
     pub x: f32,
     pub end: f32,
@@ -142,13 +144,14 @@ fn attach_raised_text(pieces: &mut [Fragment]) {
         let text = f.first_text().trim();
         let drop_cap =
             f.size >= 20. && text.chars().count() == 1 && text.starts_with(char::is_uppercase);
+        let letter_note = text.len() == 1 && text.starts_with(|c: char| c.is_ascii_lowercase());
         let note = text.len() <= 3 && !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit());
         let math_script = hyhwp_eq_font(f)
             && text.chars().count() <= 3
             && text
                 .chars()
                 .all(|c| c.is_alphanumeric() || matches!(c, '+' | '-' | '−' | '=' | '(' | ')'));
-        if !drop_cap && !note && !math_script {
+        if !drop_cap && !note && !letter_note && !math_script {
             continue;
         }
         let reach = if drop_cap {
@@ -173,9 +176,14 @@ fn attach_raised_text(pieces: &mut [Fragment]) {
                         && p.first_text().trim().len() > 3
                 } else {
                     let gap = f.x - p.end;
+                    let gap_range = if letter_note && !math_script {
+                        -p.size * 0.3..=p.size * 0.3
+                    } else {
+                        -f.size * 0.2..=f.size * 0.6
+                    };
                     let nearby = p.size >= f.size * 1.25
                         && (p.size * 0.14..=p.size * 0.65).contains(&(f.y - p.y))
-                        && (-f.size * 0.2..=f.size * 0.6).contains(&gap);
+                        && gap_range.contains(&gap);
                     if math_script && hyhwp_eq_font(p) {
                         let radical_prefix = p.first_text().starts_with('√')
                             && p.size >= f.size * 1.25
@@ -276,13 +284,25 @@ fn baseline_bands(mut fragments: Vec<Fragment>) -> Vec<Vec<Fragment>> {
     for band in &mut bands {
         band.sort_by(|a, b| a.x.total_cmp(&b.x));
         let mut lines: Vec<Fragment> = Vec::new();
-        for f in std::mem::take(band) {
+        for mut f in std::mem::take(band) {
             if let Some(prev) = lines.last_mut()
                 && prev.horizontal
                 && f.horizontal
                 && f.x - prev.end <= prev.size.min(f.size) * 0.65
             {
-                let space = f.x - prev.end > prev.size.min(f.size) * 0.13
+                let size = prev.size.min(f.size);
+                let gap = f.x - prev.end;
+                // Some PDF producers pad positioned text objects with a space
+                // even when the next object overlaps a ligature in the same word.
+                if gap < -size * 0.12
+                    && prev.last_text().ends_with(['ﬁ', 'ﬂ', 'ﬃ', 'ﬄ'])
+                    && let Some(run) = f.runs.first_mut()
+                    && let Some(rest) = run.text.strip_prefix(' ')
+                    && rest.starts_with(char::is_lowercase)
+                {
+                    run.text.remove(0);
+                }
+                let space = gap > size * 0.13
                     && !f.first_text().starts_with([',', '.', ':', ';', ')', ']'])
                     && !f.runs.first().is_some_and(|r| r.style.script.is_some());
                 prev.end = prev.end.max(f.end);
@@ -883,7 +903,7 @@ fn grid_components(
         .collect()
 }
 
-fn fragment_cell(mut fragments: Vec<Fragment>) -> Cell {
+fn fragment_cell(mut fragments: Vec<Fragment>, preserve_paragraphs: bool) -> Cell {
     fragments.sort_by(|a, b| b.y.total_cmp(&a.y).then_with(|| a.x.total_cmp(&b.x)));
     let mut lines: Vec<Vec<Fragment>> = Vec::new();
     for fragment in fragments {
@@ -905,6 +925,7 @@ fn fragment_cell(mut fragments: Vec<Fragment>) -> Cell {
     let position = coordinates(first.x, first.y);
     let mut runs = Vec::new();
     let mut previous_y = None;
+    let mut previous_size = first.size;
     let mut previous_hyphen = false;
     for mut fragment in fragments {
         clean_line(&mut fragment.runs);
@@ -917,11 +938,17 @@ fn fragment_cell(mut fragments: Vec<Fragment>) -> Cell {
                 join_runs(&mut runs, fragment.runs, false);
             } else if previous_y.is_some_and(|y: f32| (y - fragment.y).abs() <= 1.15) {
                 join_runs(&mut runs, fragment.runs, true);
+            } else if preserve_paragraphs
+                && previous_y.is_some_and(|y| y - fragment.y > previous_size * 1.4)
+            {
+                push_run(&mut runs, Run::text("\n"));
+                join_runs(&mut runs, fragment.runs, false);
             } else {
                 join_wrapped_line(&mut runs, fragment.runs, previous_hyphen);
             }
         }
         previous_y = Some(fragment.y);
+        previous_size = fragment.size;
         previous_hyphen = fragment.discretionary_hyphen;
     }
     Cell {
@@ -1244,7 +1271,7 @@ fn grid_tables(
                         fragments.append(&mut contents[row_index][column_index]);
                     }
                 }
-                let mut cell = fragment_cell(fragments);
+                let mut cell = fragment_cell(fragments, false);
                 if end_column - column > 1 {
                     cell.colspan = Some(end_column - column);
                 }
@@ -1303,6 +1330,19 @@ fn grid_tables(
     tables
 }
 
+fn horizontal_rule_lines(rules: &[HorizontalRule]) -> impl Iterator<Item = Vec<&HorizontalRule>> {
+    rules
+        .chunk_by(|a, b| (a.y - b.y).abs() <= 0.25)
+        .flat_map(|line| {
+            let mut segments: Vec<_> = line.iter().collect();
+            segments.sort_by(|a, b| a.left.total_cmp(&b.left));
+            segments
+                .chunk_by(|a, b| (a.right - b.left).abs() <= 1.)
+                .map(<[_]>::to_vec)
+                .collect::<Vec<_>>()
+        })
+}
+
 // Some PDFs draw each column's horizontal border separately. Repeated sets
 // of touching segments give us both the table bounds and the column edges.
 fn segmented_tables(
@@ -1310,16 +1350,9 @@ fn segmented_tables(
     baselines: &[f32],
     rules: &[HorizontalRule],
 ) -> Vec<Item> {
-    let mut borders = Vec::new();
-    for line in rules.chunk_by(|a, b| (a.y - b.y).abs() <= 0.25) {
-        let mut segments: Vec<_> = line.iter().collect();
-        segments.sort_by(|a, b| a.left.total_cmp(&b.left));
-        for columns in segments.chunk_by(|a, b| (a.right - b.left).abs() <= 1.) {
-            if (2..=32).contains(&columns.len()) {
-                borders.push(columns.to_vec());
-            }
-        }
-    }
+    let borders: Vec<_> = horizontal_rule_lines(rules)
+        .filter(|columns| (2..=32).contains(&columns.len()))
+        .collect();
     let mut tables = Vec::new();
     for (i, top) in borders.iter().enumerate() {
         let mut matching = borders.iter().skip(i + 1).take(64).filter(|line| {
@@ -1517,7 +1550,10 @@ fn table_row_from_band(band: &mut Vec<Fragment>, labels: [f32; 2], values: [f32;
         };
         columns[column].push(fragment);
     }
-    columns.into_iter().map(fragment_cell).collect()
+    columns
+        .into_iter()
+        .map(|f| fragment_cell(f, false))
+        .collect()
 }
 
 fn parallel_value_tables(bands: &mut [Vec<Fragment>]) -> Vec<Item> {
@@ -2328,10 +2364,11 @@ pub(super) fn layout(
     });
     math_zones(&mut pieces);
     let mut bands = baseline_bands(pieces);
-    attach_labels(&mut bands);
-    bands.retain(|band| !band.is_empty());
     rules.sort_by(|a, b| b.y.total_cmp(&a.y));
     let mut items = grid_tables(&mut bands, &rules, &verticals);
+    bands.retain(|band| !band.is_empty());
+    items.extend(row_rules::tables(&mut bands, &rules));
+    attach_labels(&mut bands);
     bands.retain(|band| !band.is_empty());
     items.extend(parallel_value_tables(&mut bands));
     bands.retain(|band| !band.is_empty());

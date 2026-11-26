@@ -196,7 +196,10 @@ fn pdf_with_pages(contents: &[&str]) -> Vec<u8> {
     let tree = pdf.new_object_id();
     let font =
         pdf.add_object(dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica"});
-    let resources = dictionary! {"Font"=>dictionary! {"F"=>font}};
+    let italic = pdf.add_object(
+        dictionary! {"Type"=>"Font","Subtype"=>"Type1","BaseFont"=>"Helvetica-Oblique"},
+    );
+    let resources = dictionary! {"Font"=>dictionary! {"F"=>font,"I"=>italic}};
     let pages: Vec<_> = contents
         .iter()
         .map(|content| {
@@ -435,6 +438,74 @@ fn pdf_segmented_rules_keep_centered_headers_and_wrapped_cells() {
     let rendered = md(&doc);
     assert!(rendered.contains("Table caption\n\n| Group | Description |\n| --- | --- |"));
     assert!(rendered.contains("Side note") && rendered.contains("Table note"));
+}
+
+#[test]
+fn pdf_recovers_rows_from_horizontal_rules_without_vertical_borders() {
+    let multi_column = "0.5 w 40 193 m 210 193 l S\n\
+        40 180 m 104 180 l 104 180 m 210 180 l S\n\
+        40 144 m 104 144 l 104 144 m 210 144 l S\n\
+        40 127 m 104 127 l 104 127 m 210 127 l S\n\
+        40 112 m 104 112 l 104 112 m 210 112 l S\n\
+        40 28 m 210 28 l S\n\
+        BT /F 9 Tf 1 0 0 1 40 198 Tm (Table 1. Results) Tj\n\
+        /I 8 Tf 1 0 0 1 40 184 Tm (Summary) Tj\n\
+        /F 8 Tf 1 0 0 1 40 170 Tm (First) Tj 1 0 0 1 104 170 Tm (An explanation that) Tj\n\
+        1 0 0 1 104 161 Tm (continues.) Tj 1 0 0 1 226 161 Tm (Adjacent prose) Tj\n\
+        1 0 0 1 104 148 Tm (Another point.) Tj\n\
+        1 0 0 1 40 135 Tm (Second) Tj 1 0 0 1 104 135 Tm (Item) Tj\n\
+        /F 5 Tf 1 0 0 1 121 138 Tm (a) Tj /F 8 Tf\n\
+        1 0 0 1 40 117 Tm (Empty cell) Tj\n\
+        1 0 0 1 40 80 Tm (Following prose) Tj ET";
+    let single_column = "0.5 w 40 192 m 210 192 l 40 177 m 210 177 l 40 153 m 210 153 l S\n\
+        40 105 m 210 105 l 40 90 m 210 90 l 40 66 m 210 66 l S\n\
+        BT /F 9 Tf 1 0 0 1 40 198 Tm (Table 2. First list) Tj\n\
+        /F 8 Tf 1 0 0 1 40 183 Tm (First line) Tj\n\
+        1 0 0 1 40 168 Tm (A wrapped) Tj 1 0 0 1 40 158 Tm (line.) Tj\n\
+        1 0 0 1 40 133 Tm (Text between the tables.) Tj\n\
+        /F 9 Tf 1 0 0 1 40 111 Tm (Table 3. Second list) Tj\n\
+        /F 8 Tf 1 0 0 1 40 96 Tm (New table) Tj\n\
+        1 0 0 1 40 81 Tm (Last entry) Tj 1 0 0 1 40 71 Tm (wraps as well.) Tj ET";
+    let doc = convert(&pdf_with_pages(&[multi_column, single_column]), false).unwrap();
+    let tables: Vec<_> = doc
+        .sections
+        .iter()
+        .flat_map(|section| &section.blocks)
+        .filter_map(|block| match block {
+            Block::Table { rows } => Some(rows),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tables.len(), 3);
+    assert_eq!(tables[0][0][0].colspan, Some(2));
+    assert_eq!(
+        cell_text(&tables[0][1]),
+        ["First", "An explanation that continues.\nAnother point."]
+    );
+    assert_eq!(cell_text(&tables[0][2]), ["Second", "Itema"]);
+    assert_eq!(
+        tables[0][2][1].runs.last().unwrap().style.script.as_deref(),
+        Some("sup")
+    );
+    assert_eq!(cell_text(&tables[0][3]), ["Empty cell", ""]);
+    assert_eq!(cell_text(&tables[1][0]), ["First line"]);
+    assert_eq!(cell_text(&tables[1][1]), ["A wrapped line."]);
+    assert_eq!(cell_text(&tables[2][0]), ["New table"]);
+    assert_eq!(cell_text(&tables[2][1]), ["Last entry wraps as well."]);
+
+    let markdown = md(&doc);
+    let html = render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+    assert!(markdown.contains("Table 1. Results\n\n<table>"));
+    assert_eq!(markdown.matches("<table>").count(), 3);
+    assert!(markdown.contains("</table>\n\nText between the tables."));
+    for text in [markdown, html] {
+        assert!(text.contains("<th colspan=\"2\"") && text.contains("<sup>a</sup>"));
+        assert!(
+            text.contains("<br>")
+                && text.contains("Adjacent prose")
+                && text.contains("Following prose")
+        );
+    }
 }
 
 #[test]

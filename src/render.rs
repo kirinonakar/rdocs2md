@@ -982,7 +982,12 @@ fn html_table(
     for row in rows {
         out.push_str("<tr>");
         for c in row {
-            out.push_str("<td");
+            let tag = if c.properties.contains_key("table_header") {
+                "th"
+            } else {
+                "td"
+            };
+            write!(out, "<{tag}")?;
             if let Some(n) = c.colspan {
                 write!(out, " colspan=\"{n}\"")?
             }
@@ -1021,7 +1026,7 @@ fn html_table(
                     Block::Table { rows } => html_table(out, rows, links, style)?,
                 }
             }
-            out.push_str("</td>");
+            write!(out, "</{tag}>")?;
         }
         out.push_str("</tr>\n")
     }
@@ -1570,6 +1575,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                     let needs_html = rows.iter().flatten().any(|cell| {
                         cell.colspan.is_some_and(|span| span != 1)
                             || cell.rowspan.is_some_and(|span| span != 1)
+                            || cell.properties.contains_key("table_headerless")
                             || cell.blocks.iter().any(|b| matches!(b, Block::Table { .. }))
                     });
                     if html || needs_html || rows.len().saturating_mul(width) > CELL_LIMIT {
