@@ -1116,6 +1116,9 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
         for (offset, value) in [(12, 780i32), (16, 580), (60, 20), (64, 0x00_00_ff)] {
             shape[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
+        if kind == 1 {
+            short(&mut shape, 48, 1);
+        }
         payload.extend(shape);
         if kind == 1 {
             payload.extend([4, 0, 0, 0, 0, 0, 0, 0]);
@@ -1165,6 +1168,7 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
     let second = std::str::from_utf8(&doc.assets["hwp3/drawing/2"]).unwrap();
     assert!(
         first.contains("<line")
+            && first.contains("marker-end=")
             && second.contains("<ellipse")
             && second.contains("fill=\"#ff0000\"")
     );
@@ -1180,6 +1184,120 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
             .unwrap()
             .contains("[그림][그림]")
     );
+}
+
+#[test]
+fn html_hwp3_restores_embedded_wmf_at_inline_box_coordinates() {
+    fn short(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn word(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn record(wmf: &mut Vec<u8>, kind: u16, data: &[u8]) {
+        wmf.extend(((data.len() / 2 + 3) as u32).to_le_bytes());
+        wmf.extend(kind.to_le_bytes());
+        wmf.extend(data);
+    }
+    fn stretch(wmf: &mut Vec<u8>, operation: u32, bpp: u16, colors_and_pixels: &[u8]) {
+        let mut bitmap = vec![0; 22 + 40];
+        word(&mut bitmap, 0, operation);
+        for (offset, value) in [(6, 1), (8, 2), (14, 100), (16, 200)] {
+            short(&mut bitmap, offset, value);
+        }
+        word(&mut bitmap, 22, 40);
+        word(&mut bitmap, 26, 2);
+        word(&mut bitmap, 30, 1);
+        short(&mut bitmap, 34, 1);
+        short(&mut bitmap, 36, bpp);
+        bitmap.extend(colors_and_pixels);
+        record(wmf, 0x0f43, &bitmap);
+    }
+    fn paragraph(input: &mut Vec<u8>, chars: u16, y: u16, x: u16, flags: (u8, u16)) {
+        let mut para = [0; 43 + 14];
+        para[0] = 1;
+        para[6] = flags.0;
+        short(&mut para, 1, chars);
+        short(&mut para, 3, 1);
+        short(&mut para, 12, 250);
+        short(&mut para, 43 + 6, y);
+        short(&mut para, 43 + 8, x);
+        short(&mut para, 43 + 12, flags.1);
+        input.extend(para);
+    }
+
+    let mut input = b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05".to_vec();
+    input.resize(30 + 128 + 1008 + 16, 0);
+    for (offset, value) in [(6, 21000), (8, 15000), (10, 1200), (14, 2000)] {
+        short(&mut input, 30 + offset, value);
+    }
+    paragraph(&mut input, 2, 0, 750, (0, 0));
+    input.extend([b'A', 0, 13, 0]);
+    paragraph(&mut input, 11, 400, 1000, (2, 0));
+    input.extend([11, 0, 0, 0, 0, 0, 11, 0]);
+    let mut picture = [0; 348];
+    picture[74] = 2;
+    picture[83..90].copy_from_slice(b"Art.WMF");
+    for (offset, value) in [
+        (18, 100),
+        (22, 200),
+        (42, 1100),
+        (44, 600),
+        (52, 1300),
+        (62, 1000),
+        (64, 400),
+    ] {
+        short(&mut picture, offset, value);
+    }
+    input.extend(picture);
+    input.extend([0; 43]);
+    for unit in "Beside".encode_utf16().chain([13]) {
+        input.extend(unit.to_le_bytes());
+    }
+    paragraph(&mut input, 2, 0, 0, (0, 0x8003));
+    input.extend([b'B', 0, 13, 0]);
+    input.extend([0; 43]);
+
+    let mut wmf = vec![0; 18];
+    short(&mut wmf, 0, 1);
+    short(&mut wmf, 2, 9);
+    short(&mut wmf, 4, 0x300);
+    stretch(
+        &mut wmf,
+        0x00ee_0086,
+        1,
+        &[0, 0, 0, 0, 255, 255, 255, 0, 0x40, 0, 0, 0],
+    );
+    stretch(&mut wmf, 0x0088_00c6, 24, &[255, 255, 255, 0, 0, 255, 0, 0]);
+    record(&mut wmf, 0, &[]);
+    let words = wmf.len() as u32 / 2;
+    word(&mut wmf, 6, words);
+    input.extend(1u32.to_le_bytes());
+    input.extend((32 + wmf.len() as u32).to_le_bytes());
+    let mut name = [0; 32];
+    name[..7].copy_from_slice(b"Art.WMF");
+    input.extend(name);
+    input.extend(wmf);
+
+    let doc = convert(&input, true).unwrap();
+    let png = &doc.assets["hwp3/picture/1"];
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(&png[16..26], &[0, 0, 0, 2, 0, 0, 0, 1, 8, 6]);
+    let len = u32::from_be_bytes(png[33..37].try_into().unwrap()) as usize;
+    let mut pixels = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::ZlibDecoder::new(&png[41..41 + len]),
+        &mut pixels,
+    )
+    .unwrap();
+    assert_eq!(pixels, [0, 255, 255, 255, 0, 255, 0, 0, 255]);
+
+    let html = render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+    assert!(html.contains("<image x=\"3100\" y=\"1800\" width=\"1100\" height=\"600\""));
+    assert!(html.contains("<foreignObject x=\"2750\" y=\"1200\""));
+    assert!(html.contains("width:1300px\"></span>Beside"));
+    assert_eq!(html.matches("<hr class=\"page-break\">").count(), 1);
+    assert!(!html.contains("[그림]"));
 }
 
 #[test]

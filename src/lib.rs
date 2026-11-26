@@ -14,6 +14,7 @@ pub mod output;
 mod package;
 pub mod parallel;
 mod pdf;
+mod raster;
 pub mod render;
 mod rtf;
 pub mod search;

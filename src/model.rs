@@ -254,6 +254,8 @@ pub(crate) struct Hwp3Line {
     pub x: i32,
     pub y: i32,
     pub size: u16,
+    pub height: u16,
+    pub word_spacing: i16,
     pub parts: Vec<Hwp3Text>,
 }
 

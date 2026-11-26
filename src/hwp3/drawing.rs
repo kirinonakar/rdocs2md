@@ -96,10 +96,14 @@ fn read_shapes(
         }
         let first = chunk(data)?;
         let second = chunk(data)?;
-        if kind != 0 && draw_shape(svg, kind, header, first, second).is_none() {
+        if kind != 0 && draw_shape(svg, *count, kind, header, first, second).is_none() {
             *partial = true;
         }
         *partial |= int(header, 68)? != 0 || flags & 0x40000 != 0;
+        if matches!(kind, 1 | 9) {
+            *partial |=
+                !(0..=3).contains(&int(header, 48)?) || !(0..=3).contains(&int(header, 52)?);
+        }
         if links & 2 != 0 {
             read_shapes(data, svg, count, partial, depth + 1)?;
         }
@@ -111,6 +115,7 @@ fn read_shapes(
 
 fn draw_shape(
     out: &mut String,
+    index: usize,
     kind: u16,
     header: &[u8],
     first: &[u8],
@@ -174,6 +179,21 @@ fn draw_shape(
             let (rx, ry) = (f64::from(w) / 2., f64::from(h) / 2.);
             format!("<ellipse cx=\"{rx}\" cy=\"{ry}\" rx=\"{rx}\" ry=\"{ry}\"/>")
         }
+        9 if flags & 0x20000 != 0 => {
+            let (x0, y0) = (f64::from(int(header, 96)?), f64::from(int(header, 100)?));
+            let (x1, y1) = (f64::from(int(header, 104)?), f64::from(int(header, 108)?));
+            let (x2, y2) = (f64::from(int(header, 112)?), f64::from(int(header, 116)?));
+            // The first and last points are the arc endpoints. The middle
+            // point gives the intersection of their tangents.
+            let k = 4. * (2_f64.sqrt() - 1.) / 3.;
+            let (ax, ay) = (x0 + k * (x1 - x0), y0 + k * (y1 - y0));
+            let (bx, by) = (x2 + k * (x1 - x2), y2 + k * (y1 - y2));
+            let mut path = format!("M {x0} {y0} C {ax} {ay} {bx} {by} {x2} {y2}");
+            if flags & 2 != 0 {
+                write!(path, " L {} {} Z", x0 + x2 - x1, y0 + y2 - y1).ok()?;
+            }
+            format!("<path d=\"{path}\"/>")
+        }
         5 | 7 | 10 => {
             let count = usize::try_from(int(first, 0)?).ok()?;
             if !(2..=LIMIT).contains(&count) {
@@ -193,6 +213,31 @@ fn draw_shape(
         }
         _ => return None,
     };
+    if matches!(kind, 1 | 9) && width > 0 && stroke != "none" {
+        for (end, style) in [("start", int(header, 52)?), ("end", int(header, 48)?)] {
+            let head = match style {
+                0 => continue,
+                1 => r#"<path d="M0 -5 10 0 0 5 Z" stroke="none"/>"#,
+                2 => r#"<path d="M1 -4 10 0 1 4" fill="none" stroke-width="1.4"/>"#,
+                3 => r#"<rect x="2" y="-4" width="8" height="8" stroke="none"/>"#,
+                _ => continue,
+            };
+            let id = format!("head-{index}-{end}");
+            let extent = width
+                * match width {
+                    0..=40 => 7,
+                    41..=60 => 6,
+                    61..=80 => 5,
+                    81..=100 => 4,
+                    _ => 3,
+                };
+            write!(
+                out,
+                "<defs><marker id=\"{id}\" viewBox=\"0 -5 11 10\" refX=\"9\" refY=\"0\" markerWidth=\"{extent}\" markerHeight=\"{extent}\" markerUnits=\"userSpaceOnUse\" orient=\"auto-start-reverse\" fill=\"{stroke}\" stroke=\"{stroke}\">{head}</marker></defs>"
+            ).ok()?;
+            write!(attributes, " marker-{end}=\"url(#{id})\"").ok()?;
+        }
+    }
     write!(out, "<g transform=\"{transform}\" {attributes}>{shape}</g>").ok()
 }
 

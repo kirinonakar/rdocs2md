@@ -6,6 +6,7 @@ use flate2::read::DeflateDecoder;
 use std::{borrow::Cow, io::Read};
 
 mod drawing;
+mod picture;
 pub(crate) use drawing::SVG_START as GENERATED_SVG_START;
 
 const SIGNATURE_2: &[u8; 30] = b"HWP Document File V2.00 \x1a\x01\x02\x03\x04\x05";
@@ -93,12 +94,14 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
     }
     let mut state = ParseState {
         char_shape_size,
+        version3: font_groups == 7,
         images,
         paper: if images { Paper::read(info) } else { None },
         ..ParseState::default()
     };
     let mut section = Section::new("section", "document");
     section.blocks = paragraph_list(&mut cursor, 0, &mut state)?;
+    state.read_embedded_pictures(&mut cursor)?;
     classify_paragraphs(&mut section.blocks);
     section.hwp3_layout = state.layout(section.blocks.len());
     if section.hwp3_layout.is_none() {
@@ -136,13 +139,17 @@ impl Paper {
 #[derive(Default)]
 struct ParseState {
     char_shape_size: usize,
+    version3: bool,
     nodes: usize,
     images: bool,
     asset_bytes: usize,
     assets: std::collections::BTreeMap<String, Vec<u8>>,
+    embedded: std::collections::BTreeMap<Vec<u8>, String>,
     partial_graphics: bool,
     paper: Option<Paper>,
     page: usize,
+    break_after: bool,
+    previous_line_y: Option<u16>,
     layout_bytes: usize,
     paragraphs: Vec<PositionedParagraph>,
     graphics: std::collections::BTreeMap<usize, Vec<Hwp3Graphic>>,
@@ -158,6 +165,11 @@ struct PositionedParagraph {
 impl ParseState {
     fn layout(&mut self, blocks: usize) -> Option<Hwp3Layout> {
         let paper = self.paper.as_ref()?.size;
+        self.graphics.retain(|_, graphics| {
+            graphics
+                .iter()
+                .any(|graphic| self.assets.contains_key(&graphic.asset))
+        });
         if self.graphics.is_empty() {
             return None;
         }
@@ -193,16 +205,73 @@ impl ParseState {
 
     fn drawing(&mut self, data: &[u8]) -> Option<(String, [i32; 4], i32)> {
         let drawing = drawing::parse(data)?;
-        if self.asset_bytes.saturating_add(drawing.svg.len()) > PART_LIMIT
-            || self.assets.len() >= 16_384
-        {
+        let key = format!("hwp3/drawing/{}", self.assets.len() + 1);
+        self.insert_asset(key.clone(), drawing.svg)?;
+        self.partial_graphics |= drawing.partial;
+        Some((key, drawing.bounds, drawing.order))
+    }
+
+    fn insert_asset(&mut self, key: String, bytes: Vec<u8>) -> Option<()> {
+        let total = self.asset_bytes.checked_add(bytes.len())?;
+        if total > PART_LIMIT || self.assets.len() >= 16_384 {
             return None;
         }
-        self.partial_graphics |= drawing.partial;
-        self.asset_bytes += drawing.svg.len();
-        let key = format!("hwp3/drawing/{}", self.assets.len() + 1);
-        self.assets.insert(key.clone(), drawing.svg);
-        Some((key, drawing.bounds, drawing.order))
+        self.asset_bytes = total;
+        self.assets.insert(key, bytes);
+        Some(())
+    }
+
+    fn embedded_picture(&mut self, header: &[u8]) -> Option<String> {
+        let name = picture::name(&header[83..99]);
+        if let Some(key) = self.embedded.get(name) {
+            return Some(key.clone());
+        }
+        if name.is_empty() || self.embedded.len() >= 16_384 {
+            return None;
+        }
+        let key = format!("hwp3/picture/{}", self.embedded.len() + 1);
+        self.embedded.insert(name.to_vec(), key.clone());
+        Some(key)
+    }
+
+    fn read_embedded_pictures(&mut self, cursor: &mut Cursor<'_>) -> Result<()> {
+        if self.embedded.is_empty() {
+            return Ok(());
+        }
+        // The end of the main paragraph list is followed by length-prefixed
+        // info blocks. Pictures are looked up only within this document.
+        while let Ok(kind) = cursor.u32() {
+            if kind == 0 {
+                break;
+            }
+            crate::limits::check_request()?;
+            let Ok(bytes) = cursor.u32().and_then(|len| cursor.take(len as usize)) else {
+                break;
+            };
+            if kind != 1 || bytes.len() <= 32 {
+                continue;
+            }
+            let Some(key) = self.embedded.get(picture::name(&bytes[..16])) else {
+                continue;
+            };
+            let data = &bytes[32..];
+            if self.assets.contains_key(key) || data.len() > PART_LIMIT - self.asset_bytes {
+                continue;
+            }
+            let raster = if image_ext(data).is_some() {
+                Some(data.to_vec())
+            } else {
+                picture::wmf_raster(data)
+            };
+            if let Some(raster) = raster {
+                self.insert_asset(key.clone(), raster);
+            }
+        }
+        self.partial_graphics |= self
+            .embedded
+            .values()
+            .any(|key| !self.assets.contains_key(key));
+        Ok(())
     }
 }
 
@@ -311,8 +380,23 @@ fn parse_paragraph<'a>(
         .collect();
     let mut page_breaks = Vec::new();
     if depth == 0 {
-        if flags & 2 != 0 {
+        let first_y = line_info
+            .first()
+            .map(|line| u16::from_le_bytes([line[6], line[7]]));
+        // HWP 3 can store a page break on the final paragraph of the old page.
+        // A cached Y that is still on that page distinguishes it from the
+        // boundary on the first line of the new page.
+        let explicit_break = flags & 2 != 0;
+        let break_after = state.version3
+            && explicit_break
+            && flags & 4 == 0
+            && first_y.is_some_and(|y| y > 0 && state.previous_line_y.is_none_or(|prev| y >= prev));
+        if state.break_after || explicit_break && !break_after {
             page_breaks.push(0);
+        }
+        state.break_after = break_after;
+        if let Some(line) = line_info.last() {
+            state.previous_line_y = Some(u16::from_le_bytes([line[6], line[7]]));
         }
         page_breaks.extend(line_info.iter().zip(&starts).filter_map(|(line, &start)| {
             let flags = u16::from_le_bytes([line[12], line[13]]);
@@ -346,14 +430,23 @@ fn parse_paragraph<'a>(
     if positioned {
         let paper = state.paper.as_ref().unwrap();
         for (i, line) in line_info.iter().enumerate() {
+            let size = if (25..=10000).contains(&default_size) {
+                default_size
+            } else {
+                250
+            };
+            let source_x = i32::from(read_u16_at(line, 8)? as i16);
+            let x = if source_x != 0 {
+                source_x
+            } else {
+                shape.left() + if i == 0 { shape.indent() } else { 0 }
+            };
             lines.push(Hwp3Line {
-                x: paper.left + shape.left() + if i == 0 { shape.indent() } else { 0 },
+                x: paper.left + x,
                 y: paper.top + i32::from(read_u16_at(line, 6)?),
-                size: if (25..=10000).contains(&default_size) {
-                    default_size
-                } else {
-                    250
-                },
+                size,
+                height: read_u16_at(line, 4)?.max(size),
+                word_spacing: read_u16_at(line, 2)? as i16,
                 parts: Vec::new(),
             });
         }
@@ -437,8 +530,21 @@ fn parse_paragraph<'a>(
                 let header = cursor.take(348)?;
                 let size = u32::from_le_bytes(header[..4].try_into()?) as usize;
                 let extra = cursor.take(size)?;
-                let graphic = if state.images && header[74] == 3 {
-                    state.drawing(extra)
+                let box_size = [
+                    i32::from(read_u16_at(header, 42)?),
+                    i32::from(read_u16_at(header, 44)?),
+                ];
+                let graphic = if state.images {
+                    match header[74] {
+                        2 => state.embedded_picture(header).map(|key| {
+                            let [width, height] = box_size;
+                            let order =
+                                i32::MIN + i32::from(u16::from_le_bytes([header[72], header[73]]));
+                            (key, [0, 0, width, height], order)
+                        }),
+                        3 => state.drawing(extra),
+                        _ => None,
+                    }
                 } else {
                     None
                 };
@@ -446,17 +552,37 @@ fn parse_paragraph<'a>(
                 if let Some((key, [dx, dy, width, height], order)) = graphic {
                     if replaces
                         && captions.is_empty()
-                        && matches!(header[8], 2 | 3)
+                        && header[8] <= 3
+                        && width > 0
+                        && height > 0
                         && usize::from(read_u16_at(header, 66)?) == paragraph_page
                     {
                         let paper = state.paper.as_ref().unwrap();
-                        let x = paper.left + i32::from(read_u16_at(header, 62)? as i16) + dx;
-                        let y = paper.top + i32::from(read_u16_at(header, 64)? as i16) + dy;
-                        graphics.push(Hwp3Graphic {
-                            asset: key.clone(),
-                            rect: [x, y, width, height],
-                            order,
-                        });
+                        let x = paper.left
+                            + i32::from(read_u16_at(header, 62)? as i16)
+                            + i32::from(read_u16_at(header, 18)? as i16)
+                            + i32::from(read_u16_at(header, 26)? as i16)
+                            + dx;
+                        let y = paper.top
+                            + i32::from(read_u16_at(header, 64)? as i16)
+                            + i32::from(read_u16_at(header, 22)? as i16)
+                            + i32::from(read_u16_at(header, 30)? as i16)
+                            + dy;
+                        if x < paper.size[0] && y < paper.size[1] && x + width > 0 && y + height > 0
+                        {
+                            graphics.push(Hwp3Graphic {
+                                asset: key.clone(),
+                                rect: [x, y, width, height],
+                                order,
+                            });
+                            if header[8] == 0 {
+                                lines[line]
+                                    .parts
+                                    .push(Hwp3Text::Tab(read_u16_at(header, 52)?));
+                            }
+                        } else {
+                            replaces = false;
+                        }
                     } else {
                         replaces = false;
                     }
@@ -466,8 +592,8 @@ fn parse_paragraph<'a>(
                         image: Some(key),
                         image_alt: Some(String::new()),
                         image_geometry: Some(ImageGeometry {
-                            width: Some(f64::from(width) / 25.),
-                            height: Some(f64::from(height) / 25.),
+                            width: (width > 0).then(|| f64::from(width) / 25.),
+                            height: (height > 0).then(|| f64::from(height) / 25.),
                             ..ImageGeometry::default()
                         }),
                         ..Run::default()

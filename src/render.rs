@@ -538,13 +538,18 @@ fn hwp3_page(out: &mut String, paper: [i32; 2], page: &Hwp3Page, links: &Propert
     for graphic in &page.graphics {
         let file = links.get(&graphic.asset);
         let embedded = links.get(&output::inline_key(&graphic.asset));
+        let [x, y, w, h] = graphic.rect;
         let Some(src) = embedded.or(file) else {
+            writeln!(
+                out,
+                "<text x=\"{x}\" y=\"{}\" font-size=\"250\">[그림]</text>",
+                y + 250
+            )?;
             continue;
         };
-        let [x, y, w, h] = graphic.rect;
         write!(
             out,
-            "<image x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" href=\"{}\"",
+            "<image x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" preserveAspectRatio=\"none\" href=\"{}\"",
             escape(&uri(src))
         )?;
         if let Some(path) = file.filter(|_| embedded.is_some()) {
@@ -562,12 +567,19 @@ fn hwp3_page(out: &mut String, paper: [i32; 2], page: &Hwp3Page, links: &Propert
         }) {
             continue;
         }
-        let Hwp3Line { x, y, size, parts } = line;
+        let Hwp3Line {
+            x,
+            y,
+            size,
+            height,
+            word_spacing,
+            parts,
+        } = line;
         let width = (w - x).max(1);
-        let height = i32::from(*size) * 2;
+        let viewport_height = i32::from(*height) + i32::from(*size);
         write!(
             out,
-            "<foreignObject x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\"><div xmlns=\"http://www.w3.org/1999/xhtml\" class=\"source-line\" style=\"font-size:{size}px\">"
+            "<foreignObject x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{viewport_height}\"><div xmlns=\"http://www.w3.org/1999/xhtml\" class=\"source-line\" style=\"font-size:{size}px;line-height:{height}px;word-spacing:{word_spacing}px\">"
         )?;
         for part in parts {
             match part {

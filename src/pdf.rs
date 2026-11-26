@@ -1,6 +1,6 @@
 use crate::{model::*, visibility::TINY_POINTS};
 use lopdf::{Document as Pdf, LoadOptions, Object, content::Content};
-use std::{collections::HashMap, io::Write};
+use std::collections::HashMap;
 #[derive(Clone, Copy)]
 struct Matrix([f32; 6]);
 impl Matrix {
@@ -684,38 +684,6 @@ fn apply_decode(
     }
 }
 
-fn png(width: usize, height: usize, channels: usize, pixels: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(pixels.len() / 2 + 1024);
-    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-    let mut header = Vec::with_capacity(13);
-    header.extend_from_slice(&(width as u32).to_be_bytes());
-    header.extend_from_slice(&(height as u32).to_be_bytes());
-    header.extend_from_slice(&[8, if channels == 1 { 0 } else { 2 }, 0, 0, 0]);
-    png_chunk(&mut out, b"IHDR", &header);
-    let stride = width * channels;
-    let mut rows = Vec::with_capacity((stride + 1) * height);
-    for line in pixels.chunks_exact(stride) {
-        rows.push(0);
-        rows.extend_from_slice(line);
-    }
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&rows)?;
-    let data = encoder.finish()?;
-    png_chunk(&mut out, b"IDAT", &data);
-    png_chunk(&mut out, b"IEND", &[]);
-    Ok(out)
-}
-
-fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    let mut crc = flate2::Crc::new();
-    crc.update(kind);
-    crc.update(data);
-    out.extend_from_slice(kind);
-    out.extend_from_slice(data);
-    out.extend_from_slice(&crc.sum().to_be_bytes());
-}
-
 fn raster(pdf: &Pdf, stream: &lopdf::Stream) -> Result<Option<Vec<u8>>> {
     // Already encoded images (JPEG, PNG) pass through unchanged.
     if image_ext(&stream.content).is_some() {
@@ -800,7 +768,7 @@ fn raster(pdf: &Pdf, stream: &lopdf::Stream) -> Result<Option<Vec<u8>>> {
             (3, colors)
         }
     };
-    png(width, height, out_channels, &colors).map(Some)
+    crate::raster::png(width, height, out_channels, &colors).map(Some)
 }
 fn annotations(pdf: &Pdf, id: lopdf::ObjectId, fragments: &mut [Fragment]) -> Result<()> {
     let list = pdf.get_page_annotations(id)?;
