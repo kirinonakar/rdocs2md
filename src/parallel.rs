@@ -4,7 +4,11 @@
 //! several workers while results are still reported in input order.
 use std::{
     collections::BTreeMap,
-    sync::{Mutex, mpsc},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
 };
 
 pub const MAX_JOBS: usize = 64;
@@ -115,6 +119,49 @@ where
     });
 }
 
+/// Report small results as they finish. Workers claim the next input without
+/// waiting for earlier inputs, and the sink gets each original index.
+pub(crate) fn unordered<T, R, F, S>(items: &[T], jobs: usize, work: F, mut sink: S)
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> Option<R> + Sync,
+    S: FnMut(usize, R),
+{
+    if items.is_empty() {
+        return;
+    }
+    let workers = jobs.clamp(1, items.len());
+    if workers == 1 {
+        for (index, item) in items.iter().enumerate() {
+            let Some(result) = work(item) else { break };
+            sink(index, result);
+        }
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    let (send, receive) = mpsc::sync_channel(workers);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let (next, work, send) = (&next, &work, send.clone());
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else { break };
+                    let Some(result) = work(item) else { break };
+                    if send.send((index, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(send);
+        for (index, result) in receive {
+            sink(index, result);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +207,32 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::Relaxed), items.len());
         assert_eq!(reported, items.len());
+    }
+
+    #[test]
+    fn unordered_reassigns_a_worker_while_the_first_input_is_running() {
+        let (later_started, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        let mut results = BTreeMap::new();
+        unordered(
+            &[0, 1, 2, 3],
+            2,
+            |item| {
+                if *item == 0 {
+                    wait.lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                } else if *item == 2 {
+                    later_started.send(()).unwrap();
+                }
+                Some(*item * 2)
+            },
+            |index, result| {
+                results.insert(index, result);
+            },
+        );
+        assert_eq!(results, BTreeMap::from([(0, 0), (1, 2), (2, 4), (3, 6)]));
     }
 
     #[test]

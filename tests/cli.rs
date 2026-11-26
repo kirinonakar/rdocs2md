@@ -426,6 +426,14 @@ fn mcp_advertises_and_renders_output_formats() {
             15,
             json!({"path":"pic.rtf","format":"html","include_images":true,"image_dir":"saved-images"}),
         ),
+        request(
+            16,
+            "tools/call",
+            json!({"name":"search_documents","arguments":{
+                "paths":["docs/**/*.rtf","docs/sub/copy.rtf","sample.rtf","../*.rtf"],
+                "query":"second","range":"2","recursive":true,"limit":1
+            },"_meta":{"progressToken":"batch-search"}}),
+        ),
     ] {
         writeln!(stdin, "{message}").unwrap();
     }
@@ -438,8 +446,31 @@ fn mcp_advertises_and_renders_output_formats() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(replies.len(), 15);
-    let result = |id: usize| &replies[id - 1]["result"];
+    let progress: Vec<_> = replies
+        .iter()
+        .filter(|reply| reply["method"] == "notifications/progress")
+        .collect();
+    assert!(progress.len() >= 2);
+    assert!(progress.windows(2).all(|pair| {
+        pair[0]["params"]["progress"].as_u64() < pair[1]["params"]["progress"].as_u64()
+    }));
+    assert_eq!(
+        progress[0]["params"],
+        json!({"progressToken":"batch-search","progress":0})
+    );
+    assert_eq!(
+        progress.last().unwrap()["params"],
+        json!({"progressToken":"batch-search","progress":3,"total":3})
+    );
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|reply| reply.get("id").is_some())
+            .count(),
+        16
+    );
+    let reply = |id: usize| replies.iter().find(|reply| reply["id"] == id).unwrap();
+    let result = |id: usize| &reply(id)["result"];
     let content = |id| result(id)["content"][0]["text"].as_str().unwrap();
     for tool in result(2)["tools"].as_array().unwrap() {
         let schema = &tool["inputSchema"];
@@ -482,7 +513,7 @@ fn mcp_advertises_and_renders_output_formats() {
     assert_eq!(document["sections"][0]["index"], 2);
     // Range extraction is text-only as well.
     assert!(result(5).get("structuredContent").is_none());
-    assert_eq!(replies[5]["error"]["code"], -32602);
+    assert_eq!(reply(6)["error"]["code"], -32602);
     assert_eq!(result(7)["isError"], true);
     assert!(content(7).contains("new .json file"));
     assert!(!work.path("wrong.md").exists());
@@ -495,7 +526,7 @@ fn mcp_advertises_and_renders_output_formats() {
     assert_eq!(search["matches"][0]["source_section_index"], 2);
     assert_eq!(search["matches"][0]["block_id"], "s2-b1");
     assert!(result(9).get("structuredContent").is_none());
-    assert_eq!(replies[9]["error"]["code"], -32602);
+    assert_eq!(reply(10)["error"]["code"], -32602);
     assert_eq!(result(11)["isError"], false);
     let batch: Value = serde_json::from_str(content(11)).unwrap();
     assert_eq!(batch["succeeded"], 2, "{batch}");
@@ -522,8 +553,29 @@ fn mcp_advertises_and_renders_output_formats() {
     assert!(content(15).contains("src=\"data:image/gif;base64,R0lGOD"));
     assert!(content(15).contains("data-path=\"saved-images/image-1.gif\""));
     assert!(work.path("saved-images/image-1.gif").is_file());
+    let batch_search: Value = serde_json::from_str(content(16)).unwrap();
+    assert_eq!(batch_search["succeeded"], 2);
+    assert_eq!(batch_search["failed"], 2);
+    assert_eq!(batch_search["truncated"], true);
+    let files = batch_search["results"].as_array().unwrap();
+    assert!(files.iter().any(|file| {
+        file["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("outside the MCP root"))
+    }));
+    let matched: Vec<_> = files
+        .iter()
+        .filter(|file| file.get("result").is_some())
+        .collect();
+    assert!(matched[0]["input"].as_str().unwrap().ends_with("copy.rtf"));
+    assert_eq!(
+        matched[0]["result"]["matches"][0]["source_section_index"],
+        2
+    );
+    assert_eq!(matched[1]["result"]["matches"], json!([]));
+    assert_eq!(matched[1]["result"]["truncated"], true);
     // No tool returns structuredContent, so no result is sent twice.
-    for id in 1..=15 {
+    for id in 1..=16 {
         assert!(result(id).get("structuredContent").is_none(), "id {id}");
     }
 }

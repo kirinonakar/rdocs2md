@@ -48,6 +48,7 @@ fn publish_new(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::hard_link(from, to)
 }
 pub fn save(path: &Path, bytes: &[u8], exclusive: bool) -> Result<()> {
+    crate::limits::check_request()?;
     let tmp = parent(path).join(format!(
         ".rdocs2md-{}-{}.tmp",
         std::process::id(),
@@ -58,6 +59,7 @@ pub fn save(path: &Path, bytes: &[u8], exclusive: bool) -> Result<()> {
         file.write_all(bytes)?;
         file.flush()?;
         drop(file);
+        crate::limits::check_request()?;
         if exclusive {
             publish_new(&tmp, path)?;
         } else {
@@ -91,11 +93,13 @@ fn relative(from: &Path, to: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 pub fn extract(d: &Document, dir: &Path, base: &Path) -> Result<Properties> {
+    crate::limits::check_request()?;
     fs::create_dir_all(dir)?;
     let dir = dir.canonicalize()?;
     let base = base.canonicalize()?;
     let mut links = Properties::new();
     for (i, key) in image_sources(d).iter().enumerate() {
+        crate::limits::check_request()?;
         let Some(b) = d.assets.get(key) else { continue };
         let Some(ext) = asset_ext(key, b) else {
             continue;

@@ -22,6 +22,7 @@ async def check():
                 assert {t.name for t in tools.tools} == {
                     "list_supported_formats", "inspect_document", "convert_document",
                     "extract_document_range", "convert_documents", "search_document",
+                    "search_documents",
                 }
                 async def call(name, args):
                     res = await client.call_tool(name, args)

@@ -18,13 +18,14 @@ Open the folder that contains the executable in PowerShell and run it.
 .\rdocs2md.exe "data.epub" --format html --extract-images -o "data.html"
 .\rdocs2md.exe "document.doc" "data.ods" "reports/**/*.pdf" --recursive --out-dir "converted"
 .\rdocs2md.exe "report.pdf" --search "revenue" --pages 2-5 --limit 10
+.\rdocs2md.exe "reports/**/*.pdf" --search "total revenue" --recursive --limit 100
 .\rdocs2md.exe "book.xlsx" --format csv --sheet "Summary" -o "Summary.csv"
 .\rdocs2md.exe --help
 ```
 
 The default output is a `.md` file with the same name next to the input. The CLI may replace an existing result file, and a destination that resolves to an input file is rejected. `--stdout` writes one document, or one JSON line per successful file for a batch, while diagnostics go to stderr. Exit codes are `0` for success, `1` when a conversion or batch fails (each failed input is reported and the rest still run), and `2` for an invalid option.
 
-`rdocs2md --help` lists every option. The [agent skill](skills/rdocs2md/SKILL.md) is the CLI reference: option defaults, batch and wildcard rules, range units, mode selection, image extraction, and search result fields.
+`rdocs2md --help` lists every CLI option. The agent skill is a compact CLI reference. [Agent skill](skills/rdocs2md/SKILL.md)
 
 ## MCP setup
 
@@ -47,7 +48,7 @@ To process local documents outside the root as well, set `args` in the MCP confi
 "args": ["mcp", "--root", "C:\\docu_path", "--allow-outside-root"]
 ```
 
-The server discloses the resolved root instead of only naming a scope: every path argument in `tools/list` starts with `MCP root: <path>`, and `initialize` returns the same text in `instructions` for clients that forward it to the model. An agent can therefore send root-relative paths without discovering the working directory of the server process, and only `--allow-outside-root` widens which paths are accepted. When the agent workspace root is not the MCP root, those descriptions and `instructions` tell the agent to send absolute paths under `MCP root`, so root-relative paths are used only when the two coincide.
+The server advertises the resolved root in `initialize.instructions` and once in the description of each tool that accepts paths. Use absolute paths when the client workspace and MCP root differ. Paths must stay within the root unless the server started with `--allow-outside-root`.
 
 | Tool | Example input |
 |---|---|
@@ -56,14 +57,19 @@ The server discloses the resolved root instead of only naming a scope: every pat
 | `convert_document` | `{"path":"data.epub","format":"html","mode":"hybrid","extract_images":true,"output_path":"data.html"}` |
 | `extract_document_range` | `{"path":"report.pdf","range":"2-5,8","format":"json"}` |
 | `search_document` | `{"path":"report.pdf","query":"revenue","range":"2-5","limit":10}` |
+| `search_documents` | `{"paths":["reports/**/*.pdf","contracts/*.hwp"],"query":"contract value","recursive":true,"limit":100}` |
 | `convert_documents` | `{"paths":["reports/*.pdf","data"],"recursive":true,"output_dir":"converted","format":"json"}` |
 | `convert_document` (CSV) | `{"path":"book.xlsx","format":"csv","sheet":"Summary","output_path":"Summary.csv"}` |
 
 All conversion tools accept `format` (`md`, `html`, `json`, or `csv`, default `md`), `mode`, `range`, `sheet`, `extract_images`, `image_dir`, and `include_images`. HTML embeds supported graphic assets by default. Use `extract_images` or `image_dir` to save separate image files and link to them. Combine either option with `include_images` to embed the images as well and record the file paths in `data-path`. The equivalent CLI flags are `--extract-images`, `--image-dir`, and `--include-images`. `sheet` takes a workbook sheet title or a 1-based sheet number, so `"2"` selects the second sheet. `convert_document` and `extract_document_range` accept an optional `output_path` with an extension that matches `format`. `convert_documents` requires `output_dir`, keeps existing result files, and reports `succeeded` and `failed` counts with each `output_path` or `error`. The `jobs` and `max_inflight_bytes` options behave as in the CLI. The parent of a new output or image directory must already exist, and extracted images go to a per-document folder next to the converted file or under `image_dir`.
 
-`search_document` and `--search` match literal text within a paragraph or table cell, including text divided across formatting runs, and return snippets with up to 60 characters of context per side plus the source section, page, block id, and an Excel cell address or PDF coordinates for citation. The [skill](skills/rdocs2md/SKILL.md#search) documents every field.
+`search_document`, `search_documents`, and `--search` match literal text within a paragraph or table cell, including text divided across formatting runs. Hits include up to 60 characters of context per side and the source section, page, block ID, and any available cell address or coordinates. `search_documents` accepts files, directories, and wildcard patterns. Its `limit` applies across the request. The report includes per-file `result` or `error` entries and sets `truncated` when matches or results were omitted. The CLI prints JSON Lines for batch searches and applies `--limit` per file. [Search result fields](skills/rdocs2md/SKILL.md#search)
 
-The server handles line-delimited JSON-RPC 2.0: `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`, negotiating 2024-11-05, 2025-03-26, 2025-06-18, or 2025-11-25. The inline result limit is 512 KiB for the whole reply, including metadata and JSON escaping, so large conversions should use `output_path` or `range`; `omitted_results` counts batch entries dropped from a report. No tool returns `structuredContent`: reports, search hits, and summaries arrive once in the text block, and warnings are added as a second text block for clients that read only text. The server caches the most recently parsed documents for `inspect_document`, `search_document`, and conversions without images (8 entries, 128 MiB), dropping a cached version as soon as its size or modification time changes. Closing the input stream ends the session. [MCP lifecycle specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+The line-delimited JSON-RPC server negotiates MCP 2024-11-05, 2025-03-26, 2025-06-18, or 2025-11-25. `ping` and `tools/list` can respond while a document is processing. Clients can send `notifications/cancelled` for a pending document request and request `notifications/progress` through `params._meta.progressToken`. Batch progress counts completed files after input expansion. [MCP lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) · [Cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation) · [Progress](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress)
+
+`timeout_seconds` defaults to 300 and covers queue time and all work for the call. Set it to `0` to disable the deadline. The server returns a timeout error at the deadline. Parsing and file writes stop at checkpoints, so an external decoder may still occupy the worker until it returns. Files already published remain on disk.
+
+The inline result limit is 512 KiB including JSON escaping. Use `output_path` or `range` for large conversions. `omitted_results` counts batch entries left out of a report. Reports, search hits, and summaries use a text block. Inline conversion warnings use a second text block. The server caches recently parsed documents for inspection, search and single-document conversions without images, up to 8 entries and 128 MiB. File size and modification time are checked on reuse. A cached complete PDF can serve requests for individual page ranges. Closing the input stream ends the session.
 
 ## Visibility and PDF image warnings
 
@@ -73,7 +79,7 @@ A PDF page with pictures and no extracted text is marked `ocr_needed_for_image_t
 
 ## Agent skill
 
-[`skills/rdocs2md/SKILL.md`](skills/rdocs2md/SKILL.md) is the CLI reference written for coding agents and assumes `rdocs2md` is on `PATH`. Copy the `skills/rdocs2md` folder into your agent's skill directory and restart the agent. The skill stays CLI-only and does not duplicate the MCP tool schemas; connect the MCP server as described above when structured tool calls are preferred.
+Copy `skills/rdocs2md` into your agent's skill directory and restart the agent. The skill covers CLI options, scoped conversion, batch search, and citing hits. [Agent skill](skills/rdocs2md/SKILL.md)
 
 ## Per-format implementation status
 

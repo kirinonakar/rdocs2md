@@ -991,7 +991,10 @@ impl PageReader<'_> {
         let mut marked_spans = Vec::new();
 
         let mut moved = true;
-        for op in Content::decode_iter(bytes) {
+        for (index, op) in Content::decode_iter(bytes).enumerate() {
+            if index % 256 == 0 {
+                crate::limits::check_request()?;
+            }
             let op = op?;
             let args = &op.operands;
             let num = |i: usize| {
@@ -1509,6 +1512,7 @@ impl PageReader<'_> {
 pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<Document> {
     let mut pdf =
         Pdf::load_mem_with_options(data, LoadOptions::with_max_decompressed_size(PART_LIMIT))?;
+    crate::limits::check_request()?;
     // An encrypted PDF that opens with the empty password only carries permission
     // restrictions (an owner password with no user password), so decrypt it and
     // convert its content. A document that demands a real user password stays refused.
@@ -1533,9 +1537,11 @@ pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<
     if pages.len() > 32768 {
         return Err("PDF page limit exceeded".into());
     }
+    crate::limits::check_request()?;
     let outlines = page_outlines(&pdf, &pages);
     let mut total = 0usize;
     for idx in section_indices(range, pages.len())? {
+        crate::limits::check_request()?;
         if crate::limits::expired() {
             doc.warn("The time limit was reached, so the remaining PDF pages were skipped. Raise or remove the timeout to convert them.");
             // Leave a marker where extraction stopped: warnings travel outside the
@@ -1557,6 +1563,7 @@ pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<
         sec.properties.insert("page".into(), (idx + 1).to_string());
         // One malformed page or operator must not discard the whole document:
         // keep whatever was extracted and report the failure as a warning.
+        let document_warnings = std::mem::take(&mut doc.warnings);
         if let Err(e) = read_page(&pdf, &mut doc, &mut total, id, images, &mut sec) {
             doc.warn(&format!(
                 "PDF page {} could not be read completely, so its extracted text may be missing or partial.",
@@ -1564,12 +1571,42 @@ pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<
             ));
             sec.properties.insert("page_error".into(), e.to_string());
         }
+        crate::limits::check_request()?;
+        sec.pdf_warnings = std::mem::replace(&mut doc.warnings, document_warnings);
+        for warning in &sec.pdf_warnings {
+            doc.warn(warning);
+        }
         if let Some(entries) = outlines.get(&idx) {
             apply_outlines(&mut sec, entries);
         }
         doc.sections.push(sec)
     }
     Ok(doc)
+}
+
+/// Build a range from a complete cached parse, with warnings for these pages.
+pub(crate) fn cached_range(doc: &Document, range: &str) -> Result<Document> {
+    let range = SectionRange::parse(range)?;
+    let mut selected = Document::new("pdf");
+    selected.metadata.clone_from(&doc.metadata);
+    for index in section_indices(Some(&range), doc.sections.len())? {
+        crate::limits::check_request()?;
+        let page = &doc.sections[index];
+        for warning in &page.pdf_warnings {
+            selected.warn(warning);
+        }
+        selected.sections.push(Section {
+            kind: page.kind.clone(),
+            source: page.source.clone(),
+            index: page.index,
+            title: page.title.clone(),
+            properties: page.properties.clone(),
+            blocks: page.blocks.clone(),
+            ..Section::default()
+        });
+    }
+    crate::visibility::annotate(&mut selected);
+    Ok(selected)
 }
 
 /// Reads one page into `sec`. Failures are returned to the caller so that the

@@ -34,11 +34,20 @@ impl Query {
     }
 
     pub fn find<'a>(&self, doc: &'a Document) -> SearchResult<'a> {
+        self.find_up_to(doc, self.limit)
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
+    pub(crate) fn find_up_to<'a>(&self, doc: &'a Document, limit: usize) -> SearchResult<'a> {
         let mut matches = Vec::new();
         let mut path = Vec::new();
         for (i, section) in doc.sections.iter().enumerate() {
             let mut traversal = Search {
                 query: self,
+                limit,
                 section,
                 index: section.index.unwrap_or(i + 1),
                 matches: &mut matches,
@@ -66,7 +75,13 @@ pub struct SearchResult<'a> {
     format: &'a str,
     warnings: &'a [String],
     matches: Vec<Match<'a>>,
-    truncated: bool,
+    pub(crate) truncated: bool,
+}
+
+impl SearchResult<'_> {
+    pub(crate) fn match_count(&self) -> usize {
+        self.matches.len()
+    }
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -116,6 +131,7 @@ struct BoundingBox {
 
 struct Search<'a, 'b> {
     query: &'b Query,
+    limit: usize,
     section: &'a Section,
     index: usize,
     matches: &'b mut Vec<Match<'a>>,
@@ -151,6 +167,9 @@ impl<'a> Search<'a, '_> {
         address: Option<&'a str>,
     ) -> bool {
         for (i, block) in blocks.iter().enumerate() {
+            if crate::limits::request_interrupted() {
+                return true;
+            }
             path.push(Step::Block { block: i + 1 });
             match block {
                 Block::Paragraph {
@@ -194,6 +213,9 @@ impl<'a> Search<'a, '_> {
         path: &[Step],
         address: Option<&'a str>,
     ) -> bool {
+        if crate::limits::request_interrupted() {
+            return true;
+        }
         let text: Cow<'_, str> = match runs {
             [] => return false,
             [run] => Cow::Borrowed(&run.text),
@@ -237,7 +259,7 @@ impl<'a> Search<'a, '_> {
             if !start_boundary || offsets.folded != end {
                 continue;
             }
-            if self.matches.len() == self.query.limit {
+            if self.matches.len() == self.limit {
                 return true;
             }
             let before = &text[..start_byte];

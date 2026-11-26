@@ -1,86 +1,44 @@
 ---
 name: rdocs2md
-description: Convert and read local documents (PDF, HWP/HWPX, DOC/DOCX, PPT/PPTX, XLS/XLSX, ODT/ODS/ODP, RTF, EPUB) to UTF-8 Markdown, HTML, JSON, or CSV with the offline rdocs2md CLI. Use when a task needs to extract, inspect, search, summarize, or re-render the content of a document file instead of guessing from the extension.
+description: Read, search, or convert local PDF (.pdf), Hangul (.hwp, .hwpx), Office (.doc, .docx, .ppt, .pptx, .xls, .xlsx), OpenDocument (.odt, .ods, .odp), RTF (.rtf), and EPUB (.epub) files with the offline rdocs2md CLI.
 license: MIT
 ---
 
 # rdocs2md
 
-Offline Windows x64 CLI that converts 14 document formats — PDF, HWP, HWPX, DOC, DOCX, PPT, PPTX, XLS, XLSX, ODT, ODS, ODP, RTF, EPUB — to UTF-8 Markdown, HTML, JSON, or CSV. The format comes from the file signature, not the extension. No OCR.
-
-`rdocs2md` is on `PATH`; if it is not resolvable, ask for the install directory and run `.\rdocs2md.exe` there. `--help` prints usage and `--list-formats` the JSON feature matrix.
-
-## Quick start
+Run `rdocs2md INPUT... [OPTIONS]` from PATH or use the installed `rdocs2md.exe` by its path. The tool detects formats by content. `--list-formats` lists supported features and limitations.
 
 ```powershell
-rdocs2md "report.pdf"                                     # writes report.md beside the input
-rdocs2md "meeting-notes.hwpx" --stdout
-rdocs2md "presentation.pptx" --slides 2-3 --mode layout --json "layout.json"
-rdocs2md "report.pdf" --search "revenue" --pages 2-5 --limit 10
-rdocs2md "book.xlsx" --format csv --sheet "Summary" -o "Summary.csv"
-rdocs2md "reports/**/*.pdf" --recursive --out-dir "converted"
+rdocs2md "report.pdf" --pages 2-5 --stdout
+rdocs2md "reports/**/*.pdf" --search "revenue" --limit 10
+rdocs2md "book.xlsx" --format csv --sheet "Sales" -o "sales.csv"
 ```
 
-Default output is a UTF-8 `.md` file next to the input. Existing results may be overwritten; an output that resolves to an input file is an error.
-
-## Options
+## Conversion and batch options
 
 | Option | Behavior |
 |---|---|
-| `-o`, `--output PATH`, `--out-dir DIR` | Result file for one input, directory for many |
-| `--stdout` | Print one document, or JSON Lines per input (`input`, `content`) for a batch |
-| `-r`, `--recursive` | Recurse into directories and wildcard scans |
-| `--format md\|html\|json\|csv` | Output format, default `md` |
-| `--mode semantic\|hybrid\|layout` | Rendering mode, default `hybrid` |
-| `--pages RANGE` (`--slides`, `--sheets`, `--chapters`, `--range`) | 1-based inclusive units, e.g. `1-3,5` |
-| `--sheet NAME\|NUMBER` | Only this workbook sheet, by title or 1-based number; repeatable |
-| `--json PATH` | Also write the JSON IR |
-| `--extract-images`, `--image-dir DIR` | Export graphic assets as separate files |
-| `--include-images` | Inline images into HTML results as `data:` URIs |
-| `--search QUERY`, `--case-sensitive`, `--limit N` | Search text, return JSON |
-| `-j`, `--jobs N` | Batch workers, 1-64, default CPU count |
-| `--max-inflight-bytes SIZE` | Cap on input bytes converted at once, default `1GiB`, `0` removes it |
-| `--timeout SECONDS` | Stop page or section parsing after this long, `0` removes it |
-| `--version`, `--licenses`, `--help`, `--list-formats` | Info commands |
+| `--stdout` | Write one result to stdout. Batch output is JSON Lines with `input` and `content`. |
+| `-o` / `--output PATH`, `--out-dir DIR` | Save a single file or write a batch to a directory. |
+| `--format FORMAT` | `md` (default), `html`, `json`, or `csv` for XLS/XLSX/ODS. Select one sheet for plain CSV. |
+| `--mode MODE` | Markdown rendering. `semantic` favors structure, `hybrid` (default) uses HTML for vertical or RTL text, and `layout` retains spacing and placement where supported. |
+| `--pages RANGE` | Select 1-based inclusive units, e.g. `1-3,5`. Aliases are `--slides`, `--sheets`, `--chapters`, and `--range`. |
+| `--sheet NAME_OR_NUMBER` | Repeatable workbook sheet filter by title or 1-based number. Applies after the range. |
+| `--json PATH` | Also save the structured document as JSON. Use a directory for a batch. |
+| `--extract-images`, `--image-dir DIR` | Save separate images. `--image-dir` sets the destination and implies extraction. |
+| `--include-images` | Keep images embedded in HTML when exporting copies. HTML embeds supported images by default. |
+| `-r` / `--recursive` | Include subdirectories when scanning folders or globs. |
+| `-j` / `--jobs N`, `--max-inflight-bytes SIZE` | Batch workers (1–64, default CPU count) and concurrent input-byte budget (default 1 GiB, `0` disables). |
+| `--timeout SECONDS` | Optional per-file PDF parsing budget. Expiration can leave partial output with warnings. `0` disables it. |
 
-Exit codes: `0` success, `1` conversion or batch failure (each failed input is reported and the rest still run), `2` invalid option.
+By default, conversion writes beside the input and can overwrite existing results. For read-only work, use `--stdout` without file or image exports. Use `--format json --stdout` to see original range indexes in `sections`.
 
-Batch inputs are files, directories, and quoted globs such as `"reports/**/*.pdf"`. Results keep the expanded input order, duplicates run once, and repeated base names get suffixes such as `report-2`. `--` stops option and wildcard parsing.
-
-## Choosing a mode
-
-- `semantic` — headings, lists, paragraphs, tables. Prefer it for summarizing, searching, and Markdown-aware tooling.
-- `hybrid` (default) — logical structure plus HTML for vertical text and RTL paragraphs. Best general choice.
-- `layout` — HTML paragraphs keeping line breaks, spacing, alignment, and character attributes. Only when placement matters.
-
-## Ranges
-
-A unit is a PDF page, slide, workbook sheet, EPUB spine item, or a stored section or page break in flow formats; some Word files split footnote and endnote groups into separate sections. Indexed formats skip units outside the range, so pass `--pages` instead of converting a whole large file. Sections keep their original 1-based `index`, and `sections` lists the selectable units.
+Pass files, folders, or quoted globs. `**` spans subdirectories. Use `--` before literal filenames that look like flags or globs. A batch deduplicates inputs and reports results in input order. Exit code `1` signals failed inputs, so check stderr and retain successful results. Exit code `2` signals invalid options.
 
 ## Search
 
-`--search QUERY` matches literal text inside paragraphs and table cells and writes JSON to stdout instead of a converted file. Matching is case-insensitive unless `--case-sensitive`, `--limit` caps matches per file (default 50, max 200), and `--pages` narrows the searched units. It cannot be combined with `-o`, `--out-dir`, `--json`, or image extraction.
+`--search QUERY` matches literal text in paragraphs and table cells and writes JSON to stdout. Use `--case-sensitive` for exact case, `--limit N` for matches per file (default 50, range 1–200), and `--pages` to narrow the search. Search runs without output destinations, `--json`, or image options.
 
-Cite from a hit using `block_id` (`s2-b1`, plus `-r2c3` for a table cell), `source_page` for PDFs and slides, and `address` for spreadsheet cells. Each hit carries `before`/`text`/`after` with up to 60 characters of context per side and `start_char`/`end_char` offsets. The reply reports `format`, `warnings`, `matches`, and `truncated`, which is `true` when hits exist beyond `--limit`.
+A batch writes one `{input, result}` JSON line per successful file. Read `matches`, `warnings`, and `truncated` before treating results as complete. Cite the file and available `source_page`, `source_section_index`, `block_id`, or spreadsheet `address`. Use `before`, `text`, and `after` for context.
 
-## CSV and sheets
-
-`--format csv` writes xls, xlsx, and ods workbooks as RFC 4180, quoting fields that contain a comma, a double quote, or a line break. Values are the displayed text, so cached formula results, dates, and percentages appear as shown; `--mode` has no effect and CSV is rejected for other formats.
-
-`--sheet` takes a title (ASCII case-insensitive) or a 1-based workbook sheet number such as `--sheet 2`; titles win when a sheet is literally named like a number, and an unknown selector fails with the available titles. It is repeatable, and `--sheets RANGE` selects by workbook position. Without either, every sheet is written in workbook order, each preceded by a `# Sheet: NAME` line — convert one sheet at a time when a consumer needs plain CSV. `--sheet` filters after the range.
-
-## Images
-
-HTML embeds supported images and HWP 3.x vector drawings by default. `--extract-images` writes those assets next to the output and links to them using converter-generated filenames. `--image-dir` sets the destination (a subdirectory per document in a batch).
-
-`--include-images` embeds assets in the HTML. Combine it with `--extract-images` or `--image-dir` to also save copies and record their paths in `data-path`. Other formats keep plain file links when extracting images.
-
-## Memory and limits
-
-Parsers hold each input and its major parts in memory. A single input is limited to 2 GiB, and reaching any limit fails that input with an error while the rest of a batch continues.
-
-For large files or batches, lower `--jobs` or `--max-inflight-bytes` (default 1 GiB of input bytes in flight, `0` removes the cap). It counts input file bytes, not the parsed working set, so it reduces the peak without bounding it exactly; an input larger than the budget still runs alone. `--timeout SECONDS` bounds parsing time, not memory, and a parse that hits it stops early.
-
-## Warnings
-
-`warnings` in the JSON IR, and on stderr during conversion, flag recoverable problems. Hidden, white, sub-3 pt, and out-of-bounds text stays in the IR with `visibility_flags`; hidden sheets and `hidden_rows`/`hidden_columns` are marked. `ocr_needed_for_image_text` means a PDF page has pictures but no text layer — this tool does not run OCR, so report the gap instead of inferring the content.
+The input limit is 2 GiB per file. Check warnings and `visibility_flags` when citing hidden or obscured text. A PDF page marked `ocr_needed_for_image_text` needs OCR to recover text from images.

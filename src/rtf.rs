@@ -413,7 +413,12 @@ pub fn parse(data: &[u8], images: bool, range: Option<&SectionRange>) -> Result<
         inst: String::new(),
     };
     let mut i = 0;
+    let mut next_check = 0;
     while i < data.len() {
+        if i >= next_check {
+            crate::limits::check_request()?;
+            next_check = i + 16 * 1024;
+        }
         let b = data[i];
         i += 1;
         match b {

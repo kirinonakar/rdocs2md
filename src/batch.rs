@@ -41,6 +41,7 @@ pub fn expand(
     literal: bool,
     resolve: impl Fn(&Path) -> Result<PathBuf>,
 ) -> Result<Expansion> {
+    crate::limits::check_request()?;
     let direct = resolve(spec);
     let pattern = !literal && direct.is_err() && spec.components().any(pattern_component);
     let (root, mut segments) = if pattern {
@@ -96,6 +97,7 @@ pub fn expand(
     let mut files = HashSet::new();
     let mut errors = Vec::new();
     while let Some((dir, i)) = pending.pop() {
+        crate::limits::check_request()?;
         if !visited.insert((dir.clone(), i)) {
             continue;
         }
@@ -116,6 +118,7 @@ pub fn expand(
         };
         let leaf = next == segments.len();
         for entry in entries {
+            crate::limits::check_request()?;
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {

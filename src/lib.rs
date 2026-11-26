@@ -44,6 +44,7 @@ pub fn load_sheets(
     range: Option<&str>,
     sheets: &[String],
 ) -> Result<Document> {
+    limits::check_request()?;
     let range = range.map(SectionRange::parse).transpose()?;
     let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let m = f.metadata()?;
@@ -53,6 +54,7 @@ pub fn load_sheets(
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(m.len() as usize)?;
     (&mut f).take(FILE_LIMIT as u64).read_to_end(&mut bytes)?;
+    limits::check_request()?;
     if bytes.len() == FILE_LIMIT && f.read(&mut [0])? != 0 {
         return Err("file limit exceeded".into());
     }
@@ -102,6 +104,7 @@ fn convert_selected(
     } else {
         return Err("unrecognized document signature".into());
     };
+    limits::check_request()?;
     d.select_sheets(sheets)?;
     if d.sections.is_empty() {
         return Err(format!("{} contains no supported document sections", d.format).into());

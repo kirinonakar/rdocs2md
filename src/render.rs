@@ -1073,6 +1073,7 @@ fn csv(doc: &Document) -> Result<String> {
     let marked = doc.sections.len() > 1;
     let mut out = String::new();
     for (i, section) in doc.sections.iter().enumerate() {
+        crate::limits::check_request()?;
         if marked {
             if i > 0 {
                 out.push('\n');
@@ -1091,6 +1092,7 @@ fn csv(doc: &Document) -> Result<String> {
             writeln!(out, "# Sheet: {title}")?;
         }
         for block in &section.blocks {
+            crate::limits::check_request()?;
             let Block::Table { rows } = block else {
                 continue;
             };
@@ -1196,6 +1198,7 @@ fn page_divider(out: &mut String, html: bool) {
 }
 
 pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> Result<String> {
+    crate::limits::check_request()?;
     if !matches!(mode, "semantic" | "layout" | "hybrid") {
         return Err("mode must be semantic, layout or hybrid".into());
     }
@@ -1252,6 +1255,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
     }
     let mut next_slide_number = 0;
     for (i, s) in doc.sections.iter().enumerate() {
+        crate::limits::check_request()?;
         let hwp3 = doc.format == "hwp" && s.source == "document";
         let table_style = if !html {
             TableStyle::Markdown
@@ -1350,6 +1354,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             .flat_map(|page| &page.replaced_blocks)
             .peekable();
         for (index, block) in s.blocks.iter().enumerate() {
+            crate::limits::check_request()?;
             let page_break = block.is_page_break();
             if page_break {
                 if let Some(old) = html_list.take() {

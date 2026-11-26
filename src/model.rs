@@ -188,6 +188,9 @@ pub struct Section {
     pub index: Option<usize>,
     #[serde(skip)]
     pub slide_number: Option<usize>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub pdf_warnings: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub title: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
