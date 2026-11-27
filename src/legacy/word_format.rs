@@ -1,3 +1,4 @@
+use super::word_lists::WordListRef;
 use super::{
     u16le, u32le, utf16, word_color, word_fib_table, word_fkp_pages, word_palette, word_shd,
     word_sprm_operand,
@@ -14,6 +15,7 @@ pub(super) struct WordFormatting<'a> {
 
 struct WordStyle<'a> {
     base: usize,
+    papx: &'a [u8],
     chpx: &'a [u8],
 }
 
@@ -108,14 +110,7 @@ impl<'a> WordFormatting<'a> {
         let mut chars = base.clone();
         let direct = index.map_or(&[][..], |i| self.chpx[i].2);
         let mut short = [0; 3];
-        let piece = if prm & 1 != 0 {
-            self.piece_modifiers
-                .get(usize::from(prm >> 1))
-                .copied()
-                .unwrap_or_default()
-        } else {
-            short_grpprl(prm, &mut short)
-        };
+        let piece = self.piece_properties(prm, &mut short);
         let edits = word_prls(direct).chain(word_prls(piece));
         if let Some(id) = edits
             .clone()
@@ -172,6 +167,38 @@ impl<'a> WordFormatting<'a> {
         for (code, operand) in word_prls(style.chpx) {
             chars.apply(code, operand, &base);
         }
+    }
+
+    fn piece_properties<'b>(&'b self, prm: u16, short: &'b mut [u8; 3]) -> &'b [u8] {
+        if prm & 1 != 0 {
+            self.piece_modifiers
+                .get(usize::from(prm >> 1))
+                .copied()
+                .unwrap_or_default()
+        } else {
+            short_grpprl(prm, short)
+        }
+    }
+
+    pub(super) fn paragraph_list(&self, style: u16, direct: WordListRef, prm: u16) -> WordListRef {
+        let mut reference = self.style_list(usize::from(style), 0);
+        reference.id = direct.id.or(reference.id);
+        reference.depth = direct.depth.or(reference.depth);
+        for (code, operand) in word_prls(self.piece_properties(prm, &mut [0; 3])) {
+            reference.apply(code, operand);
+        }
+        reference
+    }
+
+    fn style_list(&self, index: usize, depth: usize) -> WordListRef {
+        let Some(Some(style)) = self.styles.get(index).filter(|_| depth < 32) else {
+            return WordListRef::default();
+        };
+        let mut reference = self.style_list(style.base, depth + 1);
+        for (code, operand) in word_prls(style.papx) {
+            reference.apply(code, operand);
+        }
+        reference
     }
 }
 
@@ -236,6 +263,7 @@ impl WordChars {
 
 fn short_grpprl(prm: u16, out: &mut [u8; 3]) -> &[u8] {
     let code: u16 = match (prm >> 1) & 0x7f {
+        0x0c => 0x260a,
         0x4d => 0x2a0c,
         0x53 => 0x2a33,
         0x55 => 0x0835,
@@ -288,15 +316,20 @@ fn read_style(record: &[u8], base_len: usize) -> Option<WordStyle<'_>> {
     let flags = u16le(record, 2).ok()?;
     let name_len = usize::from(u16le(record, base_len).ok()?);
     let mut upx = record.get(base_len + 2 + (name_len + 1) * 2..)?;
-    if flags & 0xf == 1 {
+    let papx = if flags & 0xf == 1 {
         let papx_len = usize::from(u16le(upx, 0).ok()?);
+        let papx = upx.get(4..2 + papx_len).unwrap_or_default();
         upx = upx.get(2 + papx_len.next_multiple_of(2)..)?;
+        papx
     } else if flags & 0xf != 2 {
         return None;
-    }
+    } else {
+        &[]
+    };
     let chpx_len = usize::from(u16le(upx, 0).ok()?);
     Some(WordStyle {
         base: usize::from(flags >> 4),
+        papx,
         chpx: upx.get(2..2 + chpx_len)?,
     })
 }

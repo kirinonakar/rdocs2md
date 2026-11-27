@@ -794,6 +794,106 @@ fn direction(props: &Properties) -> &'static str {
     }
 }
 
+fn list_number(properties: &Properties) -> Option<i32> {
+    properties.get("list-number")?.parse().ok()
+}
+
+#[derive(Default)]
+struct HtmlLists<'a> {
+    levels: Vec<HtmlListLevel<'a>>,
+}
+
+struct HtmlListLevel<'a> {
+    depth: usize,
+    tag: &'static str,
+    identity: Option<&'a str>,
+    kind: Option<&'a str>,
+    next_number: i32,
+}
+
+impl<'a> HtmlLists<'a> {
+    fn close_last(&mut self, out: &mut String) -> Result<()> {
+        if let Some(level) = self.levels.pop() {
+            write!(out, "</li></{}>", level.tag)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, out: &mut String) -> Result<()> {
+        let closed = !self.levels.is_empty();
+        while !self.levels.is_empty() {
+            self.close_last(out)?;
+        }
+        if closed {
+            out.push('\n');
+        }
+        Ok(())
+    }
+
+    fn item(
+        &mut self,
+        out: &mut String,
+        list: &List,
+        properties: &'a Properties,
+        hwp3: bool,
+    ) -> Result<Option<i32>> {
+        let depth = list.depth.min(32);
+        let tag = if list.ordered { "ol" } else { "ul" };
+        let identity = properties.get("list-id").map(String::as_str);
+        let kind = properties
+            .get("list-type")
+            .map(String::as_str)
+            .filter(|kind| matches!(*kind, "a" | "A" | "i" | "I"));
+        let number = list_number(properties);
+        while self.levels.last().is_some_and(|level| level.depth > depth) {
+            self.close_last(out)?;
+        }
+        if let Some(level) = self.levels.last_mut().filter(|level| level.depth == depth) {
+            if level.tag == tag && level.identity == identity && level.kind == kind {
+                writeln!(out, "</li>")?;
+                let value = number.filter(|&value| value != level.next_number);
+                level.next_number = number.unwrap_or(level.next_number).saturating_add(1);
+                return Ok(value);
+            }
+            self.close_last(out)?;
+        }
+        write!(out, "<{tag}")?;
+        if hwp3 {
+            write!(out, " style=\"margin-block:0\"")?;
+        }
+        let start = number.unwrap_or(1);
+        if list.ordered {
+            if start != 1 {
+                write!(out, " start=\"{start}\"")?;
+            }
+            if let Some(kind) = kind {
+                write!(out, " type=\"{kind}\"")?;
+            }
+        }
+        out.push('>');
+        if self.levels.is_empty() {
+            out.push('\n');
+        }
+        self.levels.push(HtmlListLevel {
+            depth,
+            tag,
+            identity,
+            kind,
+            next_number: start.saturating_add(1),
+        });
+        Ok(None)
+    }
+}
+
+struct MarkdownListLevel<'a> {
+    depth: usize,
+    width: usize,
+    ordered: bool,
+    identity: Option<&'a str>,
+    next_number: Option<i32>,
+    delimiter: char,
+}
+
 fn cell_width(cell: &Cell) -> Option<f64> {
     cell.properties
         .get("width")
@@ -1376,9 +1476,9 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             })
             .min_by(f32::total_cmp)
             .unwrap_or(0.);
-        let mut html_list = None;
+        let mut html_lists = HtmlLists::default();
         let mut in_list = false;
-        let mut list_indents = Vec::<usize>::new();
+        let mut list_indents = Vec::<MarkdownListLevel<'_>>::new();
         let mut padding = (!html)
             .then(|| markdown_page_padding(&s.blocks, i > 0, i + 1 < doc.sections.len()))
             .into_iter()
@@ -1403,9 +1503,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             crate::limits::check_request()?;
             let page_break = block.is_page_break();
             if page_break {
-                if let Some(old) = html_list.take() {
-                    writeln!(out, "</{old}>")?;
-                }
+                html_lists.finish(&mut out)?;
                 blank_lines = 0;
                 previous_pdf_line = None;
                 in_list = false;
@@ -1462,28 +1560,8 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                 continue;
             }
             markdown_blank_lines(&mut out, std::mem::take(&mut blank_lines));
-            let list_type = if html
-                && let Block::Paragraph {
-                    list: Some(list), ..
-                } = block
-            {
-                Some(if list.ordered { "ol" } else { "ul" })
-            } else {
-                None
-            };
-            if list_type != html_list {
-                if let Some(old) = html_list {
-                    writeln!(out, "</{old}>")?
-                }
-                if let Some(new) = list_type {
-                    let attrs = if hwp3 {
-                        " style=\"margin-block:0\""
-                    } else {
-                        ""
-                    };
-                    writeln!(out, "<{new}{attrs}>")?
-                }
-                html_list = list_type;
+            if !matches!(block, Block::Paragraph { list: Some(_), .. }) {
+                html_lists.finish(&mut out)?;
             }
             match block {
                 Block::Paragraph {
@@ -1492,7 +1570,9 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                     runs: items,
                     properties,
                 } => {
-                    if let Some(anchor) = properties.get("anchor") {
+                    if let Some(anchor) =
+                        properties.get("anchor").filter(|_| !html || list.is_none())
+                    {
                         writeln!(out, "<a id=\"{}\"></a>", escape(anchor))?
                     }
                     let bullet = if markdown_structure && *heading == 0 && list.is_none() {
@@ -1555,17 +1635,65 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                             (mode == "layout").then_some(left),
                         )?;
                         let dir = direction(properties);
-                        if list.is_some() {
-                            writeln!(out, "<li{dir} style=\"{attrs}\">{val}</li>")?;
+                        if let Some(list) = list {
+                            let value = html_lists.item(&mut out, list, properties, hwp3)?;
+                            write!(out, "<li{dir} style=\"{attrs}\"")?;
+                            if let Some(value) = value {
+                                write!(out, " value=\"{value}\"")?;
+                            }
+                            out.push('>');
+                            if let Some(anchor) = properties.get("anchor") {
+                                write!(out, "<a id=\"{}\"></a>", escape(anchor))?;
+                            }
+                            out.push_str(&val);
                         } else {
                             writeln!(out, "<{elem}{dir} style=\"{attrs}\">{val}</{elem}>\n")?
                         }
                     } else if let Some(l) = list {
                         previous_pdf_line = None;
-                        list_indents.truncate(l.depth.min(32));
-                        let indent: usize = list_indents.iter().sum();
-                        let marker = if l.ordered { "1. " } else { "- " };
-                        list_indents.push(marker.len());
+                        let depth = l.depth.min(32);
+                        let parent_count =
+                            list_indents.partition_point(|level| level.depth < depth);
+                        let previous = list_indents
+                            .get(parent_count)
+                            .filter(|level| level.depth == depth);
+                        let identity = properties.get("list-id").map(String::as_str);
+                        let number =
+                            list_number(properties).filter(|n| (0..=999_999_999).contains(n));
+                        // Markdown starts a new ordered list when the delimiter changes.
+                        let delimiter = if l.ordered
+                            && let Some(previous) = previous.filter(|level| level.ordered)
+                        {
+                            if number.is_some()
+                                && (previous.identity != identity || previous.next_number != number)
+                            {
+                                if previous.delimiter == '.' { ')' } else { '.' }
+                            } else {
+                                previous.delimiter
+                            }
+                        } else {
+                            '.'
+                        };
+                        if identity.is_some()
+                            && previous.is_some_and(|level| level.ordered != l.ordered)
+                        {
+                            out.push('\n');
+                        }
+                        list_indents.truncate(parent_count);
+                        let indent: usize = list_indents.iter().map(|level| level.width).sum();
+                        let marker = if l.ordered {
+                            format!("{}{delimiter} ", number.unwrap_or(1))
+                        } else {
+                            "- ".into()
+                        };
+                        list_indents.push(MarkdownListLevel {
+                            depth,
+                            width: marker.len(),
+                            ordered: l.ordered,
+                            identity,
+                            next_number: number.map(|n| n.saturating_add(1)),
+                            delimiter,
+                        });
                         writeln!(
                             out,
                             "{}{marker}{}",
@@ -1662,9 +1790,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                 return Err("rendered document exceeds output limit".into());
             }
         }
-        if let Some(old) = html_list {
-            writeln!(out, "</{old}>")?
-        }
+        html_lists.finish(&mut out)?;
         markdown_blank_lines(&mut out, blank_lines);
         for (paper, page) in pages {
             hwp3_page(&mut out, paper, page, links)?;

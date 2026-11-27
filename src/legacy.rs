@@ -5,7 +5,9 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom},
 };
 mod word_format;
+mod word_lists;
 use word_format::WordFormatting;
+use word_lists::{WordListItem, WordListRef, WordLists};
 
 type Ole<'a> = cfb::CompoundFile<Cursor<&'a [u8]>>;
 pub fn u16le(b: &[u8], i: usize) -> Result<u16> {
@@ -736,6 +738,7 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     }
     let base = p + 2;
     let mut formatting = WordFormatting::new(&data, &table, base);
+    let mut lists = WordLists::new(&data, &table, base, pairs);
     // Table structure lives in paragraph properties, outside the text stream.
     let mut extra = ole.open_stream("/Data").ok();
     let paps = word_paps(&data, &table, base, &mut |offset| {
@@ -771,6 +774,11 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     let mut sec = Section::new("section", "WordDocument");
     let mut line = Vec::new();
     let mut line_pap = None;
+    let mut line_prm = 0;
+    let mut next_list = |pap: Option<&WordPap>, prm| {
+        let (style, direct) = pap.map(|pap| (pap.style, pap.list)).unwrap_or_default();
+        lists.next_item(formatting.paragraph_list(style, direct, prm))
+    };
     let mut fields = Vec::new();
     let mut index = 1;
     let mut selected = range.is_none_or(|r| r.contains(index));
@@ -838,7 +846,15 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
                         sec.blocks.push(block);
                     }
                     if selected {
-                        word_paragraph(&mut sec, std::mem::take(&mut line), line_pap.take());
+                        let pap = line_pap.take();
+                        if !line.is_empty() {
+                            word_paragraph(
+                                &mut sec,
+                                std::mem::take(&mut line),
+                                pap,
+                                next_list(pap, line_prm),
+                            );
+                        }
                         doc.sections.push(sec.indexed(index - 1));
                         sec = Section::new("section", "WordDocument");
                     }
@@ -848,9 +864,24 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
                     index += 1;
                     selected = range.is_none_or(|r| r.contains(index));
                 }
-                _ if !selected => {}
+                _ if !selected => {
+                    if matches!(c, '\r' | '\u{7}') && !pap.is_some_and(|p| p.ttp || p.inner_ttp) {
+                        next_list(pap, prm);
+                    }
+                }
                 _ if tables.enter_table(pap) => {
-                    word_paragraph(&mut sec, std::mem::take(&mut line), line_pap.take());
+                    let previous_pap = line_pap.take();
+                    if !line.is_empty() {
+                        word_paragraph(
+                            &mut sec,
+                            std::mem::take(&mut line),
+                            previous_pap,
+                            next_list(previous_pap, line_prm),
+                        );
+                    }
+                    if matches!(c, '\r' | '\u{7}') && !pap.is_some_and(|p| p.ttp || p.inner_ttp) {
+                        next_list(pap, prm);
+                    }
                     tables.push(c, pap, style);
                 }
                 _ => {
@@ -858,9 +889,16 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
                         sec.blocks.push(block);
                     }
                     line_pap = pap.or(line_pap);
+                    line_prm = prm;
                     match c {
                         '\r' | '\u{7}' => {
-                            word_paragraph(&mut sec, std::mem::take(&mut line), line_pap.take())
+                            let pap = line_pap.take();
+                            word_paragraph(
+                                &mut sec,
+                                std::mem::take(&mut line),
+                                pap,
+                                next_list(pap, prm),
+                            );
                         }
                         '\u{b}' => word_push_char(&mut line, '\n', style),
                         '\t' => word_push_char(&mut line, '\t', style),
@@ -878,7 +916,9 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
         for block in tables.finish() {
             sec.blocks.push(block);
         }
-        word_paragraph(&mut sec, line, line_pap);
+        if !line.is_empty() {
+            word_paragraph(&mut sec, line, line_pap, next_list(line_pap, line_prm));
+        }
         doc.sections.push(sec.indexed(index - 1));
     }
     Ok(doc)
@@ -898,17 +938,33 @@ fn word_push_char(runs: &mut Vec<Run>, c: char, style: &Style) {
     }
 }
 
-fn word_paragraph(section: &mut Section, runs: Vec<Run>, pap: Option<&WordPap>) {
-    if !runs.is_empty() {
+fn word_paragraph(
+    section: &mut Section,
+    runs: Vec<Run>,
+    pap: Option<&WordPap>,
+    item: Option<WordListItem>,
+) {
+    if !runs.is_empty() || item.is_some() {
         let heading = pap.map_or(0, |pap| match pap.style {
             1..=9 => pap.style.min(6) as u8,
             _ => pap.outline,
         });
+        let mut properties = Properties::new();
+        let list = item.map(|item| {
+            properties.insert("list-id".into(), item.identity.to_string());
+            if let Some(number) = item.number {
+                properties.insert("list-number".into(), number.to_string());
+            }
+            if let Some(html_type) = item.html_type {
+                properties.insert("list-type".into(), html_type.into());
+            }
+            item.list
+        });
         section.blocks.push(Block::Paragraph {
-            heading,
-            list: None,
+            heading: if list.is_some() { 0 } else { heading },
+            list,
             runs,
-            properties: Properties::new(),
+            properties,
         });
     }
 }
@@ -919,6 +975,7 @@ struct WordPap {
     fc_start: usize,
     fc_end: usize,
     style: u16,
+    list: WordListRef,
     outline: u8,
     in_table: bool,
     ttp: bool,
@@ -1123,6 +1180,7 @@ fn word_sprms(
             return;
         };
         match sprm {
+            0x260a | 0x460b => pap.list.apply(sprm, data),
             0x2403 | 0x2461 => {
                 pap.align = match data[0] {
                     0 => Some("left"),
@@ -2045,7 +2103,7 @@ mod tests {
                 &mut |_| None,
                 &mut pap,
             );
-            word_paragraph(&mut section, vec![Run::text(title)], Some(&pap));
+            word_paragraph(&mut section, vec![Run::text(title)], Some(&pap), None);
         }
         let mut doc = Document::new("doc");
         doc.sections.push(section);
