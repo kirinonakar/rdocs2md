@@ -460,6 +460,12 @@ fn runs(
                 format!("![{}](<{}>)", t, uri(src))
             };
         }
+        // Word uses underlined spaces for blanks in forms.
+        if r.style.underline && !t.is_empty() && t.trim_matches([' ', '\t']).is_empty() {
+            t = t
+                .replace(' ', "&nbsp;")
+                .replace('\t', "&nbsp;&nbsp;&nbsp;&nbsp;");
+        }
         for (enabled, tag, md) in [
             (r.style.bold, "strong", "**"),
             (r.style.italic, "em", "*"),
@@ -511,6 +517,9 @@ fn runs(
             }
             if let Some(color) = r.style.color.as_deref().and_then(formatting::color) {
                 let _ = write!(css, "color:{color};");
+            }
+            if let Some(color) = r.style.background.as_deref().and_then(formatting::color) {
+                let _ = write!(css, "background-color:{color};");
             }
             if !css.is_empty() {
                 t = format!("<span style=\"{css}\">{t}</span>")

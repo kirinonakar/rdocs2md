@@ -418,6 +418,8 @@ pub struct Style {
     pub hidden: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub bold: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]

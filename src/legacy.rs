@@ -4,6 +4,9 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     io::{Cursor, Read, Seek, SeekFrom},
 };
+mod word_format;
+use word_format::WordFormatting;
+
 type Ole<'a> = cfb::CompoundFile<Cursor<&'a [u8]>>;
 pub fn u16le(b: &[u8], i: usize) -> Result<u16> {
     Ok(u16::from_le_bytes(
@@ -731,10 +734,11 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     if pairs < 34 {
         return Err("missing Word piece table".into());
     }
-    let clx = p + 2 + 33 * 8;
+    let base = p + 2;
+    let mut formatting = WordFormatting::new(&data, &table, base);
     // Table structure lives in paragraph properties, outside the text stream.
     let mut extra = ole.open_stream("/Data").ok();
-    let paps = word_paps(&data, &table, p + 2, &mut |offset| {
+    let paps = word_paps(&data, &table, base, &mut |offset| {
         let extra = extra.as_mut()?;
         extra.seek(SeekFrom::Start(offset)).ok()?;
         let mut len = [0; 2];
@@ -745,12 +749,14 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     });
     drop(extra);
     let ttp = paps.iter().any(|p| p.ttp || p.inner_ttp);
-    let off = u32le(&data, clx)? as usize;
-    let len = u32le(&data, clx + 4)? as usize;
-    let clx = table.get(off..off + len).ok_or("invalid Word CLX range")?;
+    let clx = word_fib_table(&data, &table, base, 33).ok_or("invalid Word CLX range")?;
     let mut i = 0;
     while clx.get(i) == Some(&1) {
-        i += 3 + u16le(clx, i + 1)? as usize
+        let start = i + 3;
+        i = start + usize::from(u16le(clx, i + 1)?);
+        formatting
+            .piece_modifiers
+            .push(clx.get(start..i).ok_or("invalid Word Prc size")?);
     }
     if clx.get(i) != Some(&2) {
         return Err("Word Pcdt missing".into());
@@ -763,7 +769,7 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     let pieces = (len - 4) / 12;
     let mut doc = Document::new("doc");
     let mut sec = Section::new("section", "WordDocument");
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut line_pap = None;
     let mut fields = Vec::new();
     let mut index = 1;
@@ -780,7 +786,9 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
             break;
         }
         let chars = end.checked_sub(cp).ok_or("unsorted Word piece table")?;
-        let fc = u32le(plc, (pieces + 1) * 4 + n * 8 + 2)?;
+        let pcd = (pieces + 1) * 4 + n * 8;
+        let fc = u32le(plc, pcd + 2)?;
+        let prm = u16le(plc, pcd + 6)?;
         let compressed = fc & 0x40000000 != 0;
         let pos = (fc & 0x3fffffff) as usize;
         let text = if compressed {
@@ -798,11 +806,16 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
         if text_bytes > PART_LIMIT {
             return Err("Word text exceeds limit".into());
         }
-        // Paragraph properties are keyed by file offset, so the offset has to
-        // follow every character of the piece.
+        // Property pages use byte offsets, including for UTF-16 text.
         let mut offset = if compressed { pos / 2 } else { pos };
+        let mut run_style = None;
         for c in text.chars() {
             let pap = word_pap_at(&paps, offset);
+            let style_key = (pap.map_or(0, |p| p.style), formatting.index_at(offset));
+            if run_style.as_ref().is_none_or(|(key, _)| *key != style_key) {
+                run_style = Some((style_key, formatting.resolve(style_key.0, style_key.1, prm)));
+            }
+            let style = run_style.as_ref().unwrap().1.for_char(c);
             offset += if compressed { 1 } else { c.len_utf16() * 2 };
             match c {
                 '\u{13}' => {
@@ -838,7 +851,7 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
                 _ if !selected => {}
                 _ if tables.enter_table(pap) => {
                     word_paragraph(&mut sec, std::mem::take(&mut line), line_pap.take());
-                    tables.push(c, pap);
+                    tables.push(c, pap, style);
                 }
                 _ => {
                     for block in tables.finish() {
@@ -849,9 +862,9 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
                         '\r' | '\u{7}' => {
                             word_paragraph(&mut sec, std::mem::take(&mut line), line_pap.take())
                         }
-                        '\u{b}' => line.push('\n'),
-                        '\t' => line.push('\t'),
-                        _ if !c.is_control() => line.push(c),
+                        '\u{b}' => word_push_char(&mut line, '\n', style),
+                        '\t' => word_push_char(&mut line, '\t', style),
+                        _ if !c.is_control() => word_push_char(&mut line, c, style),
                         _ => {}
                     }
                 }
@@ -871,8 +884,22 @@ fn word(ole: &mut Ole, range: Option<&SectionRange>) -> Result<Document> {
     Ok(doc)
 }
 
-fn word_paragraph(section: &mut Section, text: String, pap: Option<&WordPap>) {
-    if !text.is_empty() {
+fn word_push_char(runs: &mut Vec<Run>, c: char, style: &Style) {
+    if let Some(last) = runs.last_mut()
+        && last.style == *style
+    {
+        last.text.push(c);
+    } else {
+        runs.push(Run {
+            text: c.to_string(),
+            style: style.clone(),
+            ..Run::default()
+        });
+    }
+}
+
+fn word_paragraph(section: &mut Section, runs: Vec<Run>, pap: Option<&WordPap>) {
+    if !runs.is_empty() {
         let heading = pap.map_or(0, |pap| match pap.style {
             1..=9 => pap.style.min(6) as u8,
             _ => pap.outline,
@@ -880,7 +907,7 @@ fn word_paragraph(section: &mut Section, text: String, pap: Option<&WordPap>) {
         section.blocks.push(Block::Paragraph {
             heading,
             list: None,
-            runs: vec![Run::text(text)],
+            runs,
             properties: Properties::new(),
         });
     }
@@ -966,6 +993,30 @@ fn word_paps(
     paps
 }
 
+fn word_fib_table<'a>(data: &[u8], table: &'a [u8], base: usize, index: usize) -> Option<&'a [u8]> {
+    let pair = base + index * 8;
+    let start = u32le(data, pair).ok()? as usize;
+    let len = u32le(data, pair + 4).ok()? as usize;
+    table.get(start..start.checked_add(len)?)
+}
+
+fn word_fkp_pages<'a>(
+    data: &'a [u8],
+    table: &'a [u8],
+    base: usize,
+    index: usize,
+) -> impl Iterator<Item = &'a [u8]> {
+    let plc = word_fib_table(data, table, base, index)
+        .filter(|plc| plc.len() >= 4 && (plc.len() - 4).is_multiple_of(8))
+        .unwrap_or_default();
+    let pages = plc.len().saturating_sub(4) / 8;
+    (0..pages).filter_map(move |n| {
+        let page = u32le(plc, (pages + 1) * 4 + n * 4).ok()?;
+        let start = (page & 0x003f_ffff) as usize * 512;
+        data.get(start..start + 512)
+    })
+}
+
 /// Read every property page named by the `PlcfBtePapx` bin table. Property data
 /// for a page's paragraphs sits behind their forward links, at the page offset
 /// recorded for each of them.
@@ -976,28 +1027,7 @@ fn word_papx(
     extra: &mut impl FnMut(u64) -> Option<Vec<u8>>,
     paps: &mut Vec<WordPap>,
 ) {
-    let Ok(off) = u32le(data, base + 13 * 8) else {
-        return;
-    };
-    let Ok(len) = u32le(data, base + 13 * 8 + 4) else {
-        return;
-    };
-    let (off, len) = (off as usize, len as usize);
-    let Some(plc) = table
-        .get(off..off + len)
-        .filter(|_| len >= 4 && (len - 4).is_multiple_of(8))
-    else {
-        return;
-    };
-    let pages = (len - 4) / 8;
-    for n in 0..pages {
-        let Ok(page) = u32le(plc, (pages + 1) * 4 + n * 4) else {
-            return;
-        };
-        let start = (page & 0x003f_ffff) as usize * 512;
-        let Some(page) = data.get(start..start + 512) else {
-            return;
-        };
+    for page in word_fkp_pages(data, table, base, 13) {
         let count = page[511] as usize;
         let rgbx = 4 * (count + 1);
         if count > 0x1d || rgbx + 13 * count > 511 {
@@ -1022,6 +1052,23 @@ fn word_papx(
             paps.push(pap);
         }
     }
+}
+
+fn word_sprm_operand(sprm: u16, b: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (size, skip) = match sprm >> 13 {
+        0 | 1 => (1, 0),
+        2 | 4 | 5 => (2, 0),
+        3 => (4, 0),
+        7 => (3, 0),
+        _ if matches!(sprm, 0xd606 | 0xd608) => (usize::from(u16le(b, 0).ok()?.checked_sub(1)?), 2),
+        _ if sprm == 0xc615 && b.first() == Some(&0xff) => {
+            let deleted = 4 * usize::from(*b.get(1)?);
+            let added = 3 * usize::from(*b.get(2 + deleted)?);
+            (2 + deleted + added, 1)
+        }
+        _ => (usize::from(*b.first()?), 1),
+    };
+    Some((b.get(skip..skip + size)?, &b[skip + size..]))
 }
 
 /// Apply one `PapxInFkp` record. The record holds the style index of the
@@ -1072,23 +1119,9 @@ fn word_sprms(
             b = &b[used..];
             continue;
         }
-        let (size, skip) = match sprm >> 13 {
-            0 | 1 => (1, 0),
-            2 | 4 | 5 => (2, 0),
-            3 => (4, 0),
-            7 => (3, 0),
-            _ if sprm == 0xc615 && b.first() == Some(&0xff) => (
-                b.get(1..3)
-                    .map_or(0, |v| usize::from(u16::from_le_bytes([v[0], v[1]]))),
-                2,
-            ),
-            _ => (usize::from(b[0]), 1),
-        };
-        let total = size.saturating_add(skip);
-        if total == 0 || b.len() < total {
+        let Some((data, rest)) = word_sprm_operand(sprm, b) else {
             return;
-        }
-        let data = &b[skip..total];
+        };
         match sprm {
             0x2403 | 0x2461 => {
                 pap.align = match data[0] {
@@ -1141,7 +1174,7 @@ fn word_sprms(
             }
             _ => {}
         }
-        b = &b[total..];
+        b = rest;
     }
     // PTableProps holds the full row formatting. Keep the inline TDefTable as
     // the cell grid for files that use TInsert in the referenced modifiers.
@@ -1270,25 +1303,48 @@ fn word_table_borders(b: &[u8], size: usize) -> Option<[Option<WordBorder>; 6]> 
 }
 
 fn word_shd(b: &[u8]) -> Option<String> {
-    match b {
+    let (pattern, foreground, background) = match b {
         [lo, hi] => {
             let shade = u16::from_le_bytes([*lo, *hi]);
-            let color = if shade >> 10 == 1 {
-                shade & 31
-            } else {
-                (shade >> 5) & 31
-            };
-            word_palette(color as u8).map(str::to_owned)
-        }
-        [fore @ .., r, g, b, auto, lo, hi] if fore.len() == 4 => {
-            match u16::from_le_bytes([*lo, *hi]) {
-                0xffff => None,
-                1 => word_color(fore),
-                _ => word_color(&[*r, *g, *b, *auto]),
+            if shade == 0xffff {
+                return None;
             }
+            (
+                shade >> 10,
+                word_palette((shade & 31) as u8).map(str::to_owned),
+                word_palette(((shade >> 5) & 31) as u8).map(str::to_owned),
+            )
         }
-        _ => None,
-    }
+        [fr, fg, fb, fa, r, g, b, a, lo, hi] => (
+            u16::from_le_bytes([*lo, *hi]),
+            word_color(&[*fr, *fg, *fb, *fa]),
+            word_color(&[*r, *g, *b, *a]),
+        ),
+        _ => return None,
+    };
+    // Percentage patterns render as a uniform mix of the ink and paper colors.
+    let coverage = match pattern {
+        0xffff => return None,
+        0x0001 => return foreground.or_else(|| Some("#000000".into())),
+        0x0002..=0x000d => {
+            [10u16, 20, 40, 50, 60, 80, 100, 120, 140, 150, 160, 180][usize::from(pattern - 2)]
+        }
+        0x0023..=0x003d => [
+            5u16, 15, 25, 30, 35, 45, 55, 65, 70, 75, 85, 90, 95, 105, 110, 115, 125, 130, 135,
+            145, 155, 165, 170, 175, 185, 190, 195,
+        ][usize::from(pattern - 0x23)],
+        _ => return background,
+    };
+    let rgb = |value: &str| u32::from_str_radix(&value[1..], 16).ok();
+    let foreground = foreground.as_deref().and_then(rgb).unwrap_or(0);
+    let background = background.as_deref().and_then(rgb).unwrap_or(0xff_ff_ff);
+    let mix = |shift: u32| -> u32 {
+        let ink = (foreground >> shift) & 255u32;
+        let paper = (background >> shift) & 255u32;
+        let coverage = u32::from(coverage);
+        (ink * coverage + paper * (200 - coverage) + 100) / 200
+    };
+    Some(format!("#{:02x}{:02x}{:02x}", mix(16), mix(8), mix(0)))
 }
 
 fn word_vertical_align(value: u8) -> Option<&'static str> {
@@ -1419,12 +1475,21 @@ fn word_apply_cell_range(cells: &mut [WordTc], code: u16, b: &[u8]) {
 
 /// Build the cell for a run of text collected from the text stream. Cell marks
 /// also end the paragraph around them, so a trailing break is dropped.
-fn table_cell(text: String, align: Option<&str>) -> Cell {
-    let text = text.trim_end_matches('\n');
-    if text.is_empty() {
+fn table_cell(mut runs: Vec<Run>, align: Option<&str>) -> Cell {
+    while let Some(last) = runs.last_mut() {
+        last.text.truncate(last.text.trim_end_matches('\n').len());
+        if !last.text.is_empty() {
+            break;
+        }
+        runs.pop();
+    }
+    if runs.is_empty() {
         Cell::default()
     } else {
-        let mut cell = Cell::text(text);
+        let mut cell = Cell {
+            runs,
+            ..Cell::default()
+        };
         if let Some(align) = align {
             cell.properties.insert("text-align".into(), align.into());
         }
@@ -1438,7 +1503,7 @@ fn table_cell(text: String, align: Option<&str>) -> Cell {
 #[derive(Default)]
 struct WordTables {
     open: Vec<WordTable>,
-    text: String,
+    text: Vec<Run>,
     align: Option<&'static str>,
     /// Whether the document records row marks as paragraph properties.
     ttp: bool,
@@ -1508,7 +1573,7 @@ impl WordTables {
         }
     }
 
-    fn push(&mut self, c: char, pap: Option<&WordPap>) {
+    fn push(&mut self, c: char, pap: Option<&WordPap>, style: &Style) {
         if self.open.is_empty() {
             return;
         }
@@ -1538,16 +1603,16 @@ impl WordTables {
         match c {
             '\r' | '\u{c}' | '\u{b}' => {
                 self.mark = false;
-                self.text.push('\n');
+                word_push_char(&mut self.text, '\n', style);
             }
             '\t' => {
                 self.mark = false;
-                self.text.push('\t');
+                word_push_char(&mut self.text, '\t', style);
             }
             c if !c.is_control() => {
                 self.mark = false;
                 self.align = self.align.or(pap.and_then(|p| p.align));
-                self.text.push(c);
+                word_push_char(&mut self.text, c, style);
             }
             _ => {}
         }
@@ -1571,7 +1636,9 @@ impl WordTables {
                             .entry("text-align".into())
                             .or_insert_with(|| align.into());
                     }
-                    push_run(&mut cell.runs, Run::text(text));
+                    for run in text {
+                        push_run(&mut cell.runs, run);
+                    }
                 }
                 return;
             }
@@ -1978,7 +2045,7 @@ mod tests {
                 &mut |_| None,
                 &mut pap,
             );
-            word_paragraph(&mut section, title.into(), Some(&pap));
+            word_paragraph(&mut section, vec![Run::text(title)], Some(&pap));
         }
         let mut doc = Document::new("doc");
         doc.sections.push(section);
@@ -2077,8 +2144,9 @@ mod tests {
     fn word_converts_rows_with_separate_property_streams_and_differing_boundaries() {
         const TEXT: usize = 1024;
         const FKP: usize = 2048;
+        const CHPX: usize = FKP + 512;
         const FIB_PAIRS: usize = 154;
-        let mut word = vec![0; FKP + 512];
+        let mut word = vec![0; CHPX + 512];
         let mut table = vec![0; 12];
         word[..4].copy_from_slice(&[0xec, 0xa5, 0xc1, 0]);
         word[32..34].copy_from_slice(&14u16.to_le_bytes());
@@ -2110,7 +2178,7 @@ mod tests {
         data.extend_from_slice(&(indirect.len() as u16).to_le_bytes());
         data.extend_from_slice(&indirect);
         let paragraphs: &[(&[u8], &[u8])] = &[
-            (b"Before\r", &[]),
+            (b"Before \r", &[]),
             (b"Grade\x07", &main),
             (b"Count\x07", &main),
             (b"\x07", &huge),
@@ -2141,6 +2209,38 @@ mod tests {
         table[4..8].copy_from_slice(&(TEXT as u32).to_le_bytes());
         table[8..12].copy_from_slice(&(fc as u32).to_le_bytes());
         table.extend_from_slice(&((FKP / 512) as u32).to_le_bytes());
+        let chpx = FIB_PAIRS + 12 * 8;
+        word[chpx..chpx + 4].copy_from_slice(&(table.len() as u32).to_le_bytes());
+        word[chpx + 4..chpx + 8].copy_from_slice(&12u32.to_le_bytes());
+        for value in [TEXT, fc, CHPX / 512] {
+            table.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        let format_runs: &[(usize, &[u8])] = &[
+            (
+                TEXT,
+                &[
+                    0x35, 0x08, 0x81, 0x71, 0xca, 10, 0, 0, 0, 255, 0, 0, 0, 255, 0x26, 0,
+                ],
+            ),
+            (TEXT + 6, &[0x3e, 0x2a, 1]),
+            (TEXT + 8, &[0x35, 0x08, 1, 0x3e, 0x2a, 1]),
+            (TEXT + 13, &[]),
+        ];
+        let mut offset = 510;
+        let offsets = CHPX + 4 * (format_runs.len() + 1);
+        word[CHPX + 511] = format_runs.len() as u8;
+        for (index, &(start, props)) in format_runs.iter().enumerate() {
+            word[CHPX + 4 * index..CHPX + 4 * (index + 1)]
+                .copy_from_slice(&(start as u32).to_le_bytes());
+            if !props.is_empty() {
+                offset = (offset - 1 - props.len()) & !1;
+                word[offsets + index] = (offset / 2) as u8;
+                word[CHPX + offset] = props.len() as u8;
+                word[CHPX + offset + 1..CHPX + offset + 1 + props.len()].copy_from_slice(props);
+            }
+        }
+        word[offsets - 4..offsets].copy_from_slice(&(fc as u32).to_le_bytes());
+
         let clx = FIB_PAIRS + 33 * 8;
         word[clx..clx + 4].copy_from_slice(&(table.len() as u32).to_le_bytes());
         word[clx + 4..clx + 8].copy_from_slice(&21u32.to_le_bytes());
@@ -2158,9 +2258,14 @@ mod tests {
         }
         let doc = crate::convert(&file.into_inner().into_inner(), false).unwrap();
         let md = crate::render::render(&doc, "md", "hybrid", &Properties::new()).unwrap();
-        assert!(md.starts_with("Before\n\n<table>\n"), "{md}");
         assert!(
-            md.contains("<td colspan=\"2\">Grade</td><td rowspan=\"2\">Count</td>"),
+            md.starts_with("**Before**<u>&nbsp;</u>\n\n<table>\n"),
+            "{md}"
+        );
+        assert!(
+            md.contains(
+                "<td colspan=\"2\"><u><strong>Grade</strong></u></td><td rowspan=\"2\">Count</td>"
+            ),
             "{md}"
         );
         assert!(
@@ -2168,6 +2273,10 @@ mod tests {
             "{md}"
         );
         let html = crate::render::render(&doc, "html", "hybrid", &Properties::new()).unwrap();
+        assert!(
+            html.contains("<span style=\"background-color:#d9d9d9;\"><strong>Before</strong></span><u>&nbsp;</u>"),
+            "{html}"
+        );
         assert!(
             html.contains("width:150.0000pt;table-layout:fixed\"><colgroup>"),
             "{html}"
@@ -2222,10 +2331,10 @@ mod tests {
         });
         for c in "가\u{7}나\u{7}".chars() {
             assert!(tables.enter(&cell));
-            tables.push(c, Some(&cell));
+            tables.push(c, Some(&cell), &Style::default());
         }
         assert!(tables.enter(&mark));
-        tables.push('\u{7}', Some(&mark));
+        tables.push('\u{7}', Some(&mark), &Style::default());
         let blocks = tables.finish();
         let [Block::Table { rows }] = blocks.as_slice() else {
             panic!("expected one table: {blocks:?}");
@@ -2271,16 +2380,16 @@ mod tests {
         let (first, second) = (row(2), row(1));
         for c in "위\u{7}".chars() {
             tables.enter(&cell);
-            tables.push(c, Some(&cell));
+            tables.push(c, Some(&cell), &Style::default());
         }
         tables.enter(&first);
-        tables.push('\u{7}', Some(&first));
+        tables.push('\u{7}', Some(&first), &Style::default());
         for c in "아래\u{7}".chars() {
             tables.enter(&cell);
-            tables.push(c, Some(&cell));
+            tables.push(c, Some(&cell), &Style::default());
         }
         tables.enter(&second);
-        tables.push('\u{7}', Some(&second));
+        tables.push('\u{7}', Some(&second), &Style::default());
         let blocks = tables.finish();
         let [Block::Table { rows }] = blocks.as_slice() else {
             panic!("expected one table: {blocks:?}");
@@ -2336,20 +2445,20 @@ mod tests {
         });
         for c in "바깥".chars() {
             tables.enter(&outer);
-            tables.push(c, Some(&outer));
+            tables.push(c, Some(&outer), &Style::default());
         }
         for c in "안".chars() {
             tables.enter(&inner);
-            tables.push(c, Some(&inner));
+            tables.push(c, Some(&inner), &Style::default());
         }
         tables.enter(&inner_cell);
-        tables.push('\r', Some(&inner_cell));
+        tables.push('\r', Some(&inner_cell), &Style::default());
         tables.enter(&end);
-        tables.push('\r', Some(&end));
+        tables.push('\r', Some(&end), &Style::default());
         tables.enter(&outer);
-        tables.push('\u{7}', Some(&outer));
+        tables.push('\u{7}', Some(&outer), &Style::default());
         tables.enter(&mark);
-        tables.push('\u{7}', Some(&mark));
+        tables.push('\u{7}', Some(&mark), &Style::default());
         let blocks = tables.finish();
         let [Block::Table { rows }] = blocks.as_slice() else {
             panic!("expected one table: {blocks:?}");
@@ -2373,7 +2482,7 @@ mod tests {
         };
         for c in "하나\u{7}둘\u{7}\u{7}".chars() {
             tables.enter(&cell);
-            tables.push(c, Some(&cell));
+            tables.push(c, Some(&cell), &Style::default());
         }
         let blocks = tables.finish();
         let [Block::Table { rows }] = blocks.as_slice() else {
