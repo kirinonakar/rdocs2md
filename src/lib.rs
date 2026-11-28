@@ -59,10 +59,7 @@ pub fn load_sheets(
     if bytes.len() == FILE_LIMIT && f.read(&mut [0])? != 0 {
         return Err("file limit exceeded".into());
     }
-    let hwp_path = path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("hwp"));
-    convert_selected(&bytes, images, range.as_ref(), sheets, hwp_path)
+    convert_selected(&bytes, images, range.as_ref(), sheets, Some(path))
 }
 pub fn convert(b: &[u8], images: bool) -> Result<Document> {
     convert_sheets(b, images, None, &[])
@@ -80,7 +77,7 @@ pub fn convert_sheets(
     sheets: &[String],
 ) -> Result<Document> {
     let range = range.map(SectionRange::parse).transpose()?;
-    convert_selected(b, images, range.as_ref(), sheets, false)
+    convert_selected(b, images, range.as_ref(), sheets, None)
 }
 
 fn convert_selected(
@@ -88,7 +85,7 @@ fn convert_selected(
     images: bool,
     range: Option<&SectionRange>,
     sheets: &[String],
-    hwp_path: bool,
+    path: Option<&Path>,
 ) -> Result<Document> {
     if b.len() > FILE_LIMIT {
         return Err("document input exceeds 2 GiB".into());
@@ -101,12 +98,16 @@ fn convert_selected(
         if let Some(range) = range {
             range.validate(1)?;
         }
-        hwp3::parse(b, images)?
+        hwp3::parse(b, images, path)?
     } else if b.starts_with(b"PK\x03\x04") {
         office::package(b, images, range)?
     } else if b.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") {
         legacy::parse(b, images, range)?
-    } else if hwp_path && let Some(doc) = plain_text_hwp(b) {
+    } else if path
+        .and_then(Path::extension)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("hwp"))
+        && let Some(doc) = plain_text_hwp(b)
+    {
         if let Some(range) = range {
             range.validate(1)?;
         }

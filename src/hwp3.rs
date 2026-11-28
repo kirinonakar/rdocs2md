@@ -3,7 +3,11 @@ use crate::{
     structure::{self, HeadingEvidence, Headings},
 };
 use flate2::{Crc, bufread::DeflateDecoder};
-use std::{borrow::Cow, io::Read};
+use std::{
+    borrow::Cow,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 mod drawing;
 mod picture;
@@ -35,7 +39,7 @@ fn font_groups(data: &[u8]) -> Option<usize> {
     }
 }
 
-pub fn parse(data: &[u8], images: bool) -> Result<Document> {
+pub fn parse(data: &[u8], images: bool, path: Option<&Path>) -> Result<Document> {
     let font_groups = font_groups(data).ok_or("expected HWP 2.00, 2.10 or 3.00 signature")?;
     // Font, width and spacing each use one byte per language group.
     let char_shape_size = 10 + 3 * font_groups;
@@ -113,6 +117,9 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
         trailing_page_breaks: font_groups == 7,
         images,
         paper: paper.filter(|_| images),
+        linked_dir: path
+            .filter(|_| images)
+            .and_then(|path| crate::output::parent(path).canonicalize().ok()),
         damaged_body,
         ..ParseState::default()
     };
@@ -186,6 +193,8 @@ struct ParseState {
     asset_bytes: usize,
     assets: std::collections::BTreeMap<String, Vec<u8>>,
     embedded: std::collections::BTreeMap<Vec<u8>, String>,
+    linked_dir: Option<PathBuf>,
+    linked: std::collections::BTreeMap<String, Option<String>>,
     partial_graphics: bool,
     damaged_body: bool,
     recovered_prefix: bool,
@@ -275,6 +284,25 @@ impl ParseState {
         let key = format!("hwp3/picture/{}", self.embedded.len() + 1);
         self.embedded.insert(name.to_vec(), key.clone());
         Some(key)
+    }
+
+    fn linked_picture(&mut self, header: &[u8]) -> Option<String> {
+        let dir = self.linked_dir.as_deref()?;
+        let filename = picture::linked_name(&header[83..339])?;
+        if let Some(key) = self.linked.get(&filename) {
+            return key.clone();
+        }
+        if self.linked.len() >= 16_384 || self.asset_bytes >= PART_LIMIT {
+            return None;
+        }
+        let bytes = picture::linked_raster(dir, &filename, PART_LIMIT - self.asset_bytes);
+        let key = bytes.and_then(|bytes| {
+            let key = format!("hwp3/linked/{}", self.linked.len() + 1);
+            self.insert_asset(key.clone(), bytes)?;
+            Some(key)
+        });
+        self.linked.insert(filename, key.clone());
+        key
     }
 
     fn read_embedded_pictures(&mut self, cursor: &mut Cursor<'_>) -> Result<()> {
@@ -584,12 +612,20 @@ fn parse_paragraph<'a>(
                 ];
                 let graphic = if state.images {
                     match header[74] {
-                        2 => state.embedded_picture(header).map(|key| {
-                            let [width, height] = box_size;
-                            let order =
-                                i32::MIN + i32::from(u16::from_le_bytes([header[72], header[73]]));
-                            (key, [0, 0, width, height], order)
-                        }),
+                        kind @ (0 | 2) => {
+                            let key = if kind == 0 {
+                                crate::limits::check_request()?;
+                                state.linked_picture(header)
+                            } else {
+                                state.embedded_picture(header)
+                            };
+                            key.map(|key| {
+                                let [width, height] = box_size;
+                                let order = i32::MIN
+                                    + i32::from(u16::from_le_bytes([header[72], header[73]]));
+                                (key, [0, 0, width, height], order)
+                            })
+                        }
                         3 => state.drawing(extra),
                         _ => None,
                     }

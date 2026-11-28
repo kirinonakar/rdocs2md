@@ -104,6 +104,54 @@ fn plain_text_hwp_keeps_korean_and_line_breaks() {
 }
 
 #[test]
+fn hwp3_resolves_linked_pictures_next_to_the_document() {
+    fn linked_paragraph(out: &mut Vec<u8>, reference: &[u8]) {
+        let mut paragraph = [0_u8; 43 + 14];
+        paragraph[0] = 1;
+        paragraph[1] = 5; // Four units for the picture control, then CR.
+        paragraph[3] = 1;
+        paragraph[12..14].copy_from_slice(&250_u16.to_le_bytes());
+        out.extend(paragraph);
+        out.extend([11, 0, 0, 0, 0, 0, 11, 0]);
+        let mut picture = [0_u8; 348];
+        picture[42..44].copy_from_slice(&500_u16.to_le_bytes());
+        picture[44..46].copy_from_slice(&250_u16.to_le_bytes());
+        picture[83..83 + reference.len()].copy_from_slice(reference);
+        out.extend(picture);
+        out.extend([0; 43]); // Empty caption list.
+        out.extend(13_u16.to_le_bytes());
+    }
+
+    let work = Scratch::new();
+    fs::create_dir(work.path("document")).unwrap();
+    let image = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b";
+    fs::write(work.path("document/diagram.gif"), image).unwrap();
+    fs::write(work.path("outside.gif"), image).unwrap();
+    let mut doc = b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05".to_vec();
+    doc.resize(30 + 128 + 1008 + 16, 0);
+    linked_paragraph(&mut doc, br"D:\Old Documents\diagram.gif");
+    linked_paragraph(&mut doc, br"..\outside.gif");
+    doc.extend([0; 43]);
+    fs::write(work.path("document/linked.hwp"), doc).unwrap();
+
+    let result = work.run(&[
+        "document/linked.hwp",
+        "--format",
+        "html",
+        "--layout",
+        "document",
+        "--include-images",
+        "--stdout",
+    ]);
+    assert!(result.status.success(), "{:?}", result.stderr);
+    let html = String::from_utf8(result.stdout).unwrap();
+    assert_eq!(html.matches("src=\"data:image/gif;base64,").count(), 1);
+    assert!(html.contains("width:20.0000pt;aspect-ratio:20.0000/10.0000;"));
+    assert_eq!(html.matches("[그림]").count(), 1);
+    assert!(!html.contains("Old Documents"));
+}
+
+#[test]
 fn document_layout_preserves_page_breaks_and_requires_html() {
     let work = Scratch::new();
     fs::write(work.path("pages.rtf"), br"{\rtf1 first\page second}").unwrap();

@@ -1,8 +1,55 @@
 use super::{Cursor, read_u16_at};
-use crate::{model::PART_LIMIT, raster};
+use crate::{
+    model::{PART_LIMIT, image_ext},
+    raster,
+};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Component, Path},
+};
 
 pub(super) fn name(bytes: &[u8]) -> &[u8] {
     bytes.split(|&byte| byte == 0).next().unwrap_or_default()
+}
+
+pub(super) fn linked_name(bytes: &[u8]) -> Option<String> {
+    let bytes = name(bytes);
+    let path = std::str::from_utf8(bytes)
+        .map(std::borrow::Cow::Borrowed)
+        .ok()
+        .or_else(|| {
+            encoding_rs::EUC_KR.decode_without_bom_handling_and_without_replacement(bytes)
+        })?;
+    let filename = path.rsplit(['\\', '/']).next()?;
+    if filename.contains(':') || filename.chars().any(char::is_control) {
+        return None;
+    }
+    let mut parts = Path::new(filename).components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(_)), None) => Some(filename.into()),
+        _ => None,
+    }
+}
+
+pub(super) fn linked_raster(dir: &Path, filename: &str, limit: usize) -> Option<Vec<u8>> {
+    // Use only the filename from the stored path. The canonical target must
+    // stay next to the HWP, including when the sibling is a symlink.
+    let path = dir.join(filename).canonicalize().ok()?;
+    if path.parent()? != dir {
+        return None;
+    }
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= limit && image_ext(&bytes).is_some()).then_some(bytes)
 }
 
 const STRETCH_DIB: u16 = 0x0f43;
