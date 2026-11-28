@@ -59,7 +59,10 @@ pub fn load_sheets(
     if bytes.len() == FILE_LIMIT && f.read(&mut [0])? != 0 {
         return Err("file limit exceeded".into());
     }
-    convert_selected(&bytes, images, range.as_ref(), sheets)
+    let hwp_path = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("hwp"));
+    convert_selected(&bytes, images, range.as_ref(), sheets, hwp_path)
 }
 pub fn convert(b: &[u8], images: bool) -> Result<Document> {
     convert_sheets(b, images, None, &[])
@@ -77,7 +80,7 @@ pub fn convert_sheets(
     sheets: &[String],
 ) -> Result<Document> {
     let range = range.map(SectionRange::parse).transpose()?;
-    convert_selected(b, images, range.as_ref(), sheets)
+    convert_selected(b, images, range.as_ref(), sheets, false)
 }
 
 fn convert_selected(
@@ -85,6 +88,7 @@ fn convert_selected(
     images: bool,
     range: Option<&SectionRange>,
     sheets: &[String],
+    hwp_path: bool,
 ) -> Result<Document> {
     if b.len() > FILE_LIMIT {
         return Err("document input exceeds 2 GiB".into());
@@ -102,6 +106,11 @@ fn convert_selected(
         office::package(b, images, range)?
     } else if b.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") {
         legacy::parse(b, images, range)?
+    } else if hwp_path && let Some(doc) = plain_text_hwp(b) {
+        if let Some(range) = range {
+            range.validate(1)?;
+        }
+        doc
     } else {
         return Err("unrecognized document signature".into());
     };
@@ -113,6 +122,40 @@ fn convert_selected(
     visibility::annotate(&mut d);
     Ok(d)
 }
+
+fn plain_text_hwp(bytes: &[u8]) -> Option<Document> {
+    if bytes.len() > PART_LIMIT {
+        return None;
+    }
+    let (text, encoding) = if let Some(utf8) = bytes.strip_prefix(b"\xef\xbb\xbf") {
+        (std::str::from_utf8(utf8).ok()?.into(), "UTF-8")
+    } else if let Ok(utf8) = std::str::from_utf8(bytes) {
+        (utf8.into(), "UTF-8")
+    } else {
+        (
+            encoding_rs::EUC_KR.decode_without_bom_handling_and_without_replacement(bytes)?,
+            "CP949",
+        )
+    };
+    if text.trim().is_empty()
+        || text
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\r' | '\n' | '\t'))
+    {
+        return None;
+    }
+    let mut doc = Document::new("txt");
+    doc.metadata.insert("encoding".into(), encoding.into());
+    let mut section = Section::new("section", "plain text");
+    section.paragraph(if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.into_owned()
+    });
+    doc.sections.push(section);
+    Some(doc)
+}
+
 pub const FORMATS: &[(&str, &str, &str)] = &[
     (
         "pdf",
@@ -121,7 +164,7 @@ pub const FORMATS: &[(&str, &str, &str)] = &[
     ),
     (
         "hwp",
-        "HWP 2.00 text and tables; HWP 3.x text, tables, vector drawings as SVG and positioned HTML pages; HWP 5 BodyText, Unicode paragraphs, tables and embedded raster pictures",
+        "HWP 2.00 and 2.10 text and tables; HWP 3.x text, tables, vector drawings as SVG and positioned HTML pages; HWP 5 BodyText, Unicode paragraphs, tables and embedded raster pictures",
         "Legacy HWP picture encodings, advanced drawing effects and typography are partial; HWP 5 distribution-protected files and general vector drawings are unsupported",
     ),
     (

@@ -79,6 +79,31 @@ fn stdout_json_batch_and_input_collision() {
     assert_eq!(work.run(&["--bad"]).status.code(), Some(2));
 }
 #[test]
+fn plain_text_hwp_keeps_korean_and_line_breaks() {
+    let work = Scratch::new();
+    let bytes = b"\xc7\xd1\xb1\xdb \x8c\x63\r\n\r\n <tag> & text\r\n";
+    fs::write(work.path("novel.HWP"), bytes).unwrap();
+    let result = work.run(&[
+        "novel.HWP",
+        "--format",
+        "html",
+        "--layout",
+        "document",
+        "--stdout",
+    ]);
+    assert!(result.status.success(), "{:?}", result.stderr);
+    let html = String::from_utf8(result.stdout).unwrap();
+    assert!(html.contains("data-rdocs-layout=\"document\" data-format=\"txt\""));
+    assert!(html.contains("한글 똠<br><br> &lt;tag&gt; &amp; text<br>"));
+
+    fs::write(work.path("same.bin"), bytes).unwrap();
+    fs::write(work.path("binary.hwp"), b"text\0hidden").unwrap();
+    for name in ["same.bin", "binary.hwp"] {
+        assert_eq!(work.run(&[name, "--stdout"]).status.code(), Some(1));
+    }
+}
+
+#[test]
 fn document_layout_preserves_page_breaks_and_requires_html() {
     let work = Scratch::new();
     fs::write(work.path("pages.rtf"), br"{\rtf1 first\page second}").unwrap();

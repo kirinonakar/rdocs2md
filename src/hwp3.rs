@@ -2,7 +2,7 @@ use crate::{
     model::*,
     structure::{self, HeadingEvidence, Headings},
 };
-use flate2::read::DeflateDecoder;
+use flate2::{Crc, bufread::DeflateDecoder};
 use std::{borrow::Cow, io::Read};
 
 mod drawing;
@@ -10,6 +10,7 @@ mod picture;
 pub(crate) use drawing::SVG_START as GENERATED_SVG_START;
 
 const SIGNATURE_2: &[u8; 30] = b"HWP Document File V2.00 \x1a\x01\x02\x03\x04\x05";
+const SIGNATURE_21: &[u8; 30] = b"HWP Document File V2.10 \x1a\x01\x02\x03\x04\x05";
 const SIGNATURE_3: &[u8; 30] = b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05";
 const DOCUMENT_INFO_SIZE: usize = 128;
 const DOCUMENT_SUMMARY_SIZE: usize = 1008;
@@ -26,7 +27,8 @@ pub fn matches(data: &[u8]) -> bool {
 fn font_groups(data: &[u8]) -> Option<usize> {
     if data.starts_with(SIGNATURE_2) {
         Some(5)
-    } else if data.starts_with(SIGNATURE_3) {
+    } else if data.starts_with(SIGNATURE_21) || data.starts_with(SIGNATURE_3) {
+        // HWP 2.10 already uses the seven-language character shape.
         Some(7)
     } else {
         None
@@ -34,7 +36,7 @@ fn font_groups(data: &[u8]) -> Option<usize> {
 }
 
 pub fn parse(data: &[u8], images: bool) -> Result<Document> {
-    let font_groups = font_groups(data).ok_or("expected HWP 2.00 or 3.00 signature")?;
+    let font_groups = font_groups(data).ok_or("expected HWP 2.00, 2.10 or 3.00 signature")?;
     // Font, width and spacing each use one byte per language group.
     let char_shape_size = 10 + 3 * font_groups;
     let style_size = STYLE_NAME_SIZE + char_shape_size + PARAGRAPH_SHAPE_SIZE;
@@ -54,13 +56,24 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
         return Err("truncated HWP info blocks".into());
     }
 
+    let mut damaged_body = false;
     let body = if info[124] != 0 {
         let mut decoded = Vec::new();
-        DeflateDecoder::new(&data[body_start..])
+        let mut decoder = DeflateDecoder::new(&data[body_start..]);
+        (&mut decoder)
             .take(EXPANSION_LIMIT as u64 + 1)
             .read_to_end(&mut decoded)?;
         if decoded.len() > EXPANSION_LIMIT {
             return Err("HWP expansion limit exceeded".into());
+        }
+        if data.starts_with(SIGNATURE_21)
+            && decoder.get_ref().len() == 8
+            && let [crc, size] = decoder.get_ref().as_chunks::<4>().0
+        {
+            let mut actual = Crc::new();
+            actual.update(&decoded);
+            damaged_body = u32::from_le_bytes(*size) as usize != decoded.len()
+                || u32::from_le_bytes(*crc) != actual.sum();
         }
         Cow::Owned(decoded)
     } else {
@@ -97,13 +110,27 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
     section.document_paper = paper.as_ref().and_then(|paper| paper.document_paper(info));
     let mut state = ParseState {
         char_shape_size,
-        version3: font_groups == 7,
+        trailing_page_breaks: font_groups == 7,
         images,
         paper: paper.filter(|_| images),
+        damaged_body,
         ..ParseState::default()
     };
     section.blocks = paragraph_list(&mut cursor, 0, &mut state)?;
-    state.read_embedded_pictures(&mut cursor)?;
+    if !state.recovered_prefix {
+        state.read_embedded_pictures(&mut cursor)?;
+    }
+    if damaged_body {
+        let warning = if state.recovered_prefix {
+            "This HWP file is damaged. Only complete paragraphs before the damaged portion are shown."
+        } else {
+            "This HWP file failed its compression integrity check. Some content may be damaged."
+        };
+        section
+            .properties
+            .insert("recovery_warning".into(), warning.into());
+        doc.warn(warning);
+    }
     classify_paragraphs(&mut section.blocks);
     section.hwp3_layout = state.layout(section.blocks.len());
     if section.hwp3_layout.is_none() {
@@ -153,13 +180,15 @@ impl Paper {
 #[derive(Default)]
 struct ParseState {
     char_shape_size: usize,
-    version3: bool,
+    trailing_page_breaks: bool,
     nodes: usize,
     images: bool,
     asset_bytes: usize,
     assets: std::collections::BTreeMap<String, Vec<u8>>,
     embedded: std::collections::BTreeMap<Vec<u8>, String>,
     partial_graphics: bool,
+    damaged_body: bool,
+    recovered_prefix: bool,
     paper: Option<Paper>,
     page: usize,
     break_after: bool,
@@ -346,11 +375,16 @@ fn paragraph_list<'a>(
         if state.nodes > NODE_LIMIT {
             return Err("HWP paragraph limit exceeded".into());
         }
-        let Some(mut paragraph) = parse_paragraph(cursor, depth, state, blocks.len(), &mut shape)?
-        else {
-            return Ok(blocks);
-        };
-        blocks.append(&mut paragraph);
+        match parse_paragraph(cursor, depth, state, blocks.len(), &mut shape) {
+            Ok(Some(mut paragraph)) => blocks.append(&mut paragraph),
+            Ok(None) => return Ok(blocks),
+            Err(_) if depth == 0 && state.damaged_body && !blocks.is_empty() => {
+                crate::limits::check_request()?;
+                state.recovered_prefix = true;
+                return Ok(blocks);
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -401,7 +435,7 @@ fn parse_paragraph<'a>(
         // A cached Y that is still on that page distinguishes it from the
         // boundary on the first line of the new page.
         let explicit_break = flags & 2 != 0;
-        let break_after = state.version3
+        let break_after = state.trailing_page_breaks
             && explicit_break
             && flags & 4 == 0
             && first_y.is_some_and(|y| y > 0 && state.previous_line_y.is_none_or(|prev| y >= prev));
@@ -716,6 +750,9 @@ fn parse_paragraph<'a>(
         if consumed > char_count {
             return Err("invalid HWP control character length".into());
         }
+        if state.damaged_body && (code == 13) != (consumed == char_count) {
+            return Err("invalid HWP paragraph terminator".into());
+        }
         if replaces && code != 9 && (code == 32 || paragraph.text.len() > text_start) {
             let value = if code == 32 {
                 " "
@@ -770,8 +807,13 @@ fn parse_paragraph<'a>(
 
 fn skip_reserved(cursor: &mut Cursor<'_>, code: u16) -> Result<()> {
     let size = usize::try_from(cursor.u32()?)?;
-    if cursor.u16()? != code {
-        return Err("invalid HWP control character marker".into());
+    let marker = cursor.u16()?;
+    if marker != code {
+        return Err(format!(
+            "invalid HWP control character marker at byte {}: expected {code}, found {marker}",
+            cursor.pos - 2
+        )
+        .into());
     }
     cursor.skip(size)
 }

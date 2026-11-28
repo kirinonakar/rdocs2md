@@ -1653,6 +1653,10 @@ pub fn render_with_layout(
         {
             writeln!(out, "<!-- page {page} incomplete -->\n")?;
         }
+        if html && let Some(warning) = s.properties.get("recovery_warning") {
+            document_pages.start(&mut out, paper)?;
+            writeln!(out, "<aside role=\"note\">{}</aside>", escape(warning))?;
+        }
         if let Some(anchor) = s.properties.get("anchor") {
             writeln!(out, "<a id=\"{}\"></a>\n", escape(anchor))?;
         }

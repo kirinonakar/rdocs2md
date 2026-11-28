@@ -960,6 +960,59 @@ fn hwp2_reads_kana_and_styled_table_cells() {
 }
 
 #[test]
+fn hwp21_reads_compressed_text_and_reports_partial_recovery() {
+    fn paragraph(body: &mut Vec<u8>, units: &[u16]) {
+        let mut header = [0_u8; 43];
+        header[0] = 1;
+        header[1..3].copy_from_slice(&(units.len() as u16).to_le_bytes());
+        header[3] = 1;
+        header[12..14].copy_from_slice(&250_u16.to_le_bytes());
+        body.extend(header);
+        body.extend([0; 14]);
+        body.extend(units.iter().flat_map(|unit| unit.to_le_bytes()));
+    }
+
+    fn file(body: &[u8], original: &[u8]) -> Vec<u8> {
+        let mut hwp = b"HWP Document File V2.10 \x1a\x01\x02\x03\x04\x05".to_vec();
+        hwp.resize(30 + 128 + 1008, 0);
+        hwp[30 + 124] = 1;
+        let mut encoder = flate2::write::DeflateEncoder::new(hwp, flate2::Compression::default());
+        encoder.write_all(body).unwrap();
+        let mut hwp = encoder.finish().unwrap();
+        let mut crc = flate2::Crc::new();
+        crc.update(original);
+        hwp.extend(crc.sum().to_le_bytes());
+        hwp.extend((original.len() as u32).to_le_bytes());
+        hwp
+    }
+
+    let mut first = vec![0; 16]; // Seven font groups and the style count.
+    paragraph(&mut first, &[0x8861, 0x8741, 13]);
+    let mut valid = first.clone();
+    paragraph(&mut valid, &[u16::from(b'A'), 13]);
+    valid.extend([0; 43]);
+    let doc = convert(&file(&valid, &valid), true).unwrap();
+    assert!(doc.warnings.is_empty());
+    assert!(md(&doc).contains("\n\nA\n"));
+
+    let mut damaged = first;
+    paragraph(&mut damaged, &[0, 0, 0, 42, 13]);
+    assert!(convert(&file(&damaged, &damaged), true).is_err());
+    let partial = convert(&file(&damaged, &valid), true).unwrap();
+    assert_eq!(partial.sections[0].blocks.len(), 1);
+    assert!(partial.warnings[0].contains("complete paragraphs"));
+    let html = render_with_layout(
+        &partial,
+        "html",
+        "hybrid",
+        HtmlLayout::Document,
+        &Properties::new(),
+    )
+    .unwrap();
+    assert!(html.contains("<aside role=\"note\">This HWP file is damaged."));
+}
+
+#[test]
 fn hwp3_restores_character_shapes_table_spacing_and_markdown_structure() {
     fn paragraph(
         out: &mut Vec<u8>,

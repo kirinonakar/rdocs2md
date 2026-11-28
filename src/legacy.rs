@@ -633,19 +633,30 @@ fn hwp_block<'a>(
     Ok(())
 }
 
-fn hwp_stream(ole: &mut Ole, path: &str, compressed: bool) -> Result<Vec<u8>> {
-    let bytes = stream(ole, path)?;
-    if !compressed {
-        return Ok(bytes);
+fn hwp_reader<'a>(ole: &mut Ole<'a>, path: &str, compressed: bool) -> Result<Box<dyn Read + 'a>> {
+    let stream = ole.open_stream(path)?;
+    if stream.len() > PART_LIMIT as u64 {
+        return Err("OLE stream exceeds limit".into());
     }
-    let mut decoded = Vec::new();
-    flate2::read::DeflateDecoder::new(&bytes[..])
-        .take(PART_LIMIT as u64 + 1)
-        .read_to_end(&mut decoded)?;
-    if decoded.len() > PART_LIMIT {
+    if compressed {
+        Ok(Box::new(flate2::read::DeflateDecoder::new(stream)))
+    } else {
+        Ok(Box::new(stream))
+    }
+}
+
+fn read_hwp_stream(reader: impl Read, mut bytes: Vec<u8>) -> Result<Vec<u8>> {
+    reader
+        .take((PART_LIMIT + 1 - bytes.len()) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > PART_LIMIT {
         return Err("HWP stream expansion limit exceeded".into());
     }
-    Ok(decoded)
+    Ok(bytes)
+}
+
+fn hwp_stream(ole: &mut Ole, path: &str, compressed: bool) -> Result<Vec<u8>> {
+    read_hwp_stream(hwp_reader(ole, path, compressed)?, Vec::new())
 }
 
 fn hwp_images(
@@ -695,14 +706,19 @@ fn hwp_images(
             0x20 => false,
             _ => compressed,
         };
-        let bytes = hwp_stream(ole, &path, packed)?;
+        crate::limits::check_request()?;
+        let mut reader = hwp_reader(ole, &path, packed)?;
+        let mut prefix = Vec::new();
+        reader.by_ref().take(12).read_to_end(&mut prefix)?;
+        if image_ext(&prefix).is_none() {
+            continue;
+        }
+        let bytes = read_hwp_stream(reader, prefix)?;
         total += bytes.len();
         if total > EXPANSION_LIMIT {
             return Err("HWP expansion limit exceeded".into());
         }
-        if image_ext(&bytes).is_some() {
-            doc.assets.insert(key, bytes);
-        }
+        doc.assets.insert(key, bytes);
     }
     Ok(())
 }

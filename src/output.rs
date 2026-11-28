@@ -204,16 +204,29 @@ fn base64(bytes: &[u8]) -> String {
 pub fn inline(d: &Document, links: &Properties) -> Result<Properties> {
     let mut out = links.clone();
     let mut encoded_len = 0usize;
-    for key in image_sources(d) {
-        if !links.is_empty() && !links.contains_key(&key) {
-            continue;
+    let sources = image_sources(d);
+    let assets = sources.iter().filter_map(|key| {
+        if !links.is_empty() && !links.contains_key(key) {
+            return None;
         }
-        let Some(bytes) = d.assets.get(&key) else {
-            continue;
+        let bytes = d.assets.get(key)?;
+        Some((key, bytes.as_slice(), asset_ext(key, bytes)?))
+    });
+    let compact = d.format == "hwp"
+        && assets
+            .clone()
+            .map(|(_, bytes, _)| bytes.len().div_ceil(3) * 4)
+            .sum::<usize>()
+            > EXPANSION_LIMIT;
+    for (key, bytes, ext) in assets {
+        let optimized = if compact && ext == "bmp" {
+            crate::raster::compact_bmp(bytes)?
+        } else {
+            None
         };
-        let Some(ext) = asset_ext(&key, bytes) else {
-            continue;
-        };
+        let (bytes, ext) = optimized
+            .as_deref()
+            .map_or((bytes, ext), |png| (png, "png"));
         encoded_len = encoded_len.saturating_add(bytes.len().div_ceil(3).saturating_mul(4));
         if encoded_len > EXPANSION_LIMIT {
             return Err(
@@ -222,7 +235,7 @@ pub fn inline(d: &Document, links: &Properties) -> Result<Properties> {
             );
         }
         out.insert(
-            inline_key(&key),
+            inline_key(key),
             format!("data:{};base64,{}", mime(ext), base64(bytes)),
         );
     }
