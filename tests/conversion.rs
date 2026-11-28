@@ -636,6 +636,7 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     fn paragraph(out: &mut Vec<u8>, level: u32, text: &str) {
         let styled = text == "After";
         let mut header = [0; 12];
+        header[8] = u8::from(text == "Saved page");
         header[11] = if styled { 4 } else { 0 };
         record(out, 66, level, &header);
         let text: Vec<_> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -723,6 +724,11 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
         .flat_map(u32::to_le_bytes)
         .collect();
     record(&mut info, 25, 0, &shape);
+    let hanging: Vec<_> = [12_i32, 1_200, 400, -8_000, 200, 100, 160]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect();
+    record(&mut info, 25, 0, &hanging);
     file.create_stream("/DocInfo")
         .unwrap()
         .write_all(&info)
@@ -797,8 +803,20 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     assert!(document.contains("@page rdocs0 { size: 842pt 595pt; margin: 0; }"));
     assert!(document.contains("--paper-padding:45pt 40pt 35pt 55pt"));
     assert!(document.contains("margin-left:6pt;margin-right:2pt;text-indent:2.5pt;margin-top:1pt;margin-bottom:0.5pt;line-height:1.6;"));
+    assert!(document.contains("margin-left:86pt;margin-right:2pt;text-indent:-80pt;"));
     assert!(document.contains("src=\"data:image/bmp;base64,"));
     assert!(document.contains("rowspan=\"2\""));
+    for expected in [
+        "width:min(180.0000pt, 100%);table-layout:fixed",
+        "width:min(120.0000pt, 100%);table-layout:fixed",
+        "<col style=\"width:33.33333%\">",
+        "<col style=\"width:16.66667%\">",
+        "colspan=\"3\" rowspan=\"2\"",
+    ] {
+        assert!(document.contains(expected), "missing {expected}");
+    }
+    assert!(!document.contains("<div class=\"hwp-table-scroll\">"));
+    assert!(!document.contains("width:60pt;"));
     let Block::Table { rows } = &doc.sections[0].blocks[1] else {
         panic!("expected HWP table");
     };
@@ -1201,9 +1219,10 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
     short(&mut input, 30 + 14, 2000);
     let mut paragraph = [0u8; 43 + 14];
     paragraph[0] = 1;
-    short(&mut paragraph, 1, 23);
+    short(&mut paragraph, 1, 31);
     short(&mut paragraph, 3, 1);
     short(&mut paragraph, 12, 250);
+    short(&mut paragraph, 43 + 2, 5);
     short(&mut paragraph, 43 + 6, 400);
     input.extend(paragraph);
     for (kind, order, x) in [(1, 4, 900), (3, 2, 800)] {
@@ -1222,7 +1241,7 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
     for unit in [9, 450, 0, 9]
         .into_iter()
         .chain([0x2050, 0x25c0, 0x25c8, 0x25d2, 0x25d3])
-        .chain("Label".encode_utf16())
+        .chain("Label    Note".encode_utf16())
         .chain([13])
     {
         input.extend(unit.to_le_bytes());
@@ -1243,6 +1262,7 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
     assert_eq!(html.matches("href=\"data:image/svg+xml;base64,").count(), 2);
     assert!(html.find("<image x=\"2790\"").unwrap() < html.find("<image x=\"2890\"").unwrap());
     assert!(html.contains("width:450px\"></span>✡\u{f0088}\u{f008e}☼\u{f0091}Label"));
+    assert!(html.contains("Label<span style=\"display:inline-block;width:520px\">    </span>Note"));
     assert!(html.contains("unicode-range: U+F0088, U+F008E, U+F0091;"));
     assert_eq!(html.matches("Label").count(), 1);
     assert!(!html.contains("[그림]"));

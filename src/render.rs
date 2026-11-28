@@ -594,15 +594,39 @@ fn hwp3_page(out: &mut String, paper: [i32; 2], page: &Hwp3Page, links: &Propert
             match part {
                 Hwp3Text::Text(run) => {
                     let mut run = (**run).clone();
-                    run.style.size = run
+                    let run_size = run
                         .style
                         .size
                         .as_deref()
                         .and_then(formatting::length_in_points)
-                        .map(|pt| pt * 25. / f64::from(*size))
-                        .filter(|scale| (*scale - 1.).abs() > f64::EPSILON)
-                        .map(|scale| format!("{scale}em"));
-                    out.push_str(&runs(std::slice::from_ref(&run), None, links, true));
+                        .map_or(f64::from(*size), |pt| pt * 25.);
+                    let scale = run_size / f64::from(*size);
+                    run.style.size =
+                        ((scale - 1.).abs() > f64::EPSILON).then(|| format!("{scale}em"));
+                    // Runs of spaces can position labels against drawings. Use
+                    // the legacy half-em advance plus the saved line adjustment.
+                    let space_width = (run_size / 2. + f64::from(*word_spacing)).max(0.);
+                    let text = std::mem::take(&mut run.text);
+                    let mut rest = text.as_str();
+                    while let Some(start) = rest.find("  ") {
+                        let count = rest[start..].bytes().take_while(|&b| b == b' ').count();
+                        if start > 0 {
+                            run.text.push_str(&rest[..start]);
+                            out.push_str(&runs(std::slice::from_ref(&run), None, links, true));
+                            run.text.clear();
+                        }
+                        let width = space_width * count as f64;
+                        let padding = &rest[start..start + count];
+                        write!(
+                            out,
+                            "<span style=\"display:inline-block;width:{width}px\">{padding}</span>"
+                        )?;
+                        rest = &rest[start + count..];
+                    }
+                    if !rest.is_empty() {
+                        run.text.push_str(rest);
+                        out.push_str(&runs(std::slice::from_ref(&run), None, links, true));
+                    }
                 }
                 Hwp3Text::Tab(width) => write!(
                     out,
@@ -718,13 +742,16 @@ fn pptx_shape(out: &mut String, shape: &SlideShape, w: f64, h: f64) -> Result<()
     Ok(())
 }
 
-fn cell_attributes(out: &mut String, props: &Properties, content_height: bool) -> Result<()> {
+fn cell_attributes(out: &mut String, props: &Properties, style: TableStyle) -> Result<()> {
     let mut css = Properties::new();
     for (key, value) in props {
-        // HWP cell heights come from the paginated layout. In HTML a row
-        // should grow with the text and nested tables inside it.
-        if key != "border" && !(content_height && key == "height") {
-            formatting::box_property(&mut css, key, value);
+        match key.as_str() {
+            // HWP rows grow with their contents. In document layout the column
+            // grid also owns the widths, including the width of merged cells.
+            "border" => continue,
+            "height" if style.is_hwp() => continue,
+            "width" if style == TableStyle::HwpDocument => continue,
+            _ => formatting::box_property(&mut css, key, value),
         }
     }
     if !css.is_empty() {
@@ -1065,6 +1092,13 @@ enum TableStyle {
     Markdown,
     Html,
     Hwp5,
+    HwpDocument,
+}
+
+impl TableStyle {
+    fn is_hwp(self) -> bool {
+        matches!(self, Self::Hwp5 | Self::HwpDocument)
+    }
 }
 
 fn html_table(
@@ -1074,7 +1108,7 @@ fn html_table(
     style: TableStyle,
 ) -> Result<()> {
     let styled = style != TableStyle::Markdown;
-    let hwp = style == TableStyle::Hwp5;
+    let hwp = style.is_hwp();
     let source_borders = styled
         && rows.iter().flatten().any(|c| {
             formatting::BORDERS
@@ -1095,13 +1129,20 @@ fn html_table(
     };
     if let Some(widths) = widths.filter(|v| !v.is_empty()) {
         let total = widths.iter().sum::<f64>();
-        let layout = if hwp { "auto" } else { "fixed" };
-        writeln!(
-            out,
-            " style=\"width:{total:.4}pt;table-layout:{layout}\"><colgroup>"
-        )?;
+        if style == TableStyle::HwpDocument {
+            writeln!(
+                out,
+                " style=\"width:min({total:.4}pt, 100%);table-layout:fixed\"><colgroup>"
+            )?;
+        } else {
+            let layout = if hwp { "auto" } else { "fixed" };
+            writeln!(
+                out,
+                " style=\"width:{total:.4}pt;table-layout:{layout}\"><colgroup>"
+            )?;
+        }
         for width in widths {
-            let (width, unit) = if hwp {
+            let (width, unit) = if style == TableStyle::Hwp5 {
                 (width, "pt")
             } else {
                 (width / total * 100., "%")
@@ -1109,6 +1150,8 @@ fn html_table(
             writeln!(out, "<col style=\"width:{width:.5}{unit}\">")?;
         }
         out.push_str("</colgroup>\n");
+    } else if style == TableStyle::HwpDocument {
+        out.push_str(" style=\"width:100%;table-layout:fixed\">\n");
     } else {
         out.push_str(">\n");
     }
@@ -1128,7 +1171,7 @@ fn html_table(
                 write!(out, " rowspan=\"{n}\"")?
             }
             if styled {
-                cell_attributes(out, &c.properties, hwp)?;
+                cell_attributes(out, &c.properties, style)?;
             }
             out.push('>');
             out.push_str(&runs(&c.runs, None, links, styled));
@@ -1372,6 +1415,8 @@ body:has(> .rdocs-document) { margin: 0; background: #f4f6f8; }
 }
 .rdocs-document .document-page > p { margin: 0 0 .72em; }
 .rdocs-document[data-format="hwp"] .document-page > p { margin: 0; }
+.rdocs-document article table.hwp-table { box-sizing: border-box; max-width: 100%; }
+.rdocs-document article .hwp-table > tbody > tr > :is(td, th) { word-break: keep-all; overflow-wrap: anywhere; }
 .rdocs-document .document-canvas { min-height: 0; padding: 0; }
 .rdocs-document .document-canvas > .source-page { margin: 0; }
 .rdocs-document .document-canvas > :not(.source-page) { margin-inline: 20mm; }
@@ -1386,7 +1431,6 @@ body:has(> .rdocs-document) { margin: 0; background: #f4f6f8; }
     .rdocs-document .document-canvas { min-height: 0; }
     .rdocs-document .document-canvas > .source-page { max-height: calc(var(--paper-height) - 1px); }
     .rdocs-document .document-page + .document-page { break-before: page; }
-    .rdocs-document .hwp-table-scroll { overflow: visible; }
 }
 @page { size: A4; margin: 0; }
 "#;
@@ -1576,7 +1620,11 @@ pub fn render_with_layout(
         let table_style = if !html {
             TableStyle::Markdown
         } else if doc.format == "hwp" && !hwp3 {
-            TableStyle::Hwp5
+            if document_pages.enabled {
+                TableStyle::HwpDocument
+            } else {
+                TableStyle::Hwp5
+            }
         } else {
             TableStyle::Html
         };

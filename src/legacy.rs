@@ -175,18 +175,28 @@ impl HwpParagraphStyle {
         let flags =
             u32le(data, 0).unwrap_or_else(|_| u32::from(data.first().copied().unwrap_or(0)));
         let mut css = String::new();
-        for (name, offset, divisor) in [
-            ("margin-left", 4, 200.),
-            ("margin-right", 8, 200.),
-            ("text-indent", 12, 100.),
-            ("margin-top", 16, 200.),
-            ("margin-bottom", 20, 200.),
+        let points = |offset: usize, divisor: f64| {
+            u32le(data, offset)
+                .ok()
+                .map(|raw| f64::from(raw as i32) / divisor)
+                .filter(|pt| pt.abs() <= 1000.)
+        };
+        // HWP hanging indentation moves the continuation lines inward and
+        // keeps the first line at the source left margin.
+        let indent = points(12, 100.);
+        let hanging = -indent.unwrap_or_default().min(0.);
+        let left = points(4, 200.)
+            .map(|left| left + hanging)
+            .or_else(|| (hanging > 0.).then_some(hanging));
+        for (name, value) in [
+            ("margin-left", left),
+            ("margin-right", points(8, 200.)),
+            ("text-indent", indent),
+            ("margin-top", points(16, 200.)),
+            ("margin-bottom", points(20, 200.)),
         ] {
-            if let Ok(raw) = u32le(data, offset) {
-                let pt = f64::from(raw as i32) / divisor;
-                if pt.abs() <= 1000. {
-                    let _ = write!(css, "{name}:{pt}pt;");
-                }
+            if let Some(pt) = value {
+                let _ = write!(css, "{name}:{pt}pt;");
             }
         }
         let (kind, spacing) = if let (Ok(kind), Ok(spacing)) = (u32le(data, 46), u32le(data, 50)) {
