@@ -1,5 +1,9 @@
 use rdocs2md::{
-    batch, load_sheets, model::*, output, parallel, recover_document, render::render, search,
+    batch, load_sheets,
+    model::*,
+    output, parallel, recover_document,
+    render::{HtmlLayout, render_with_layout},
+    search,
 };
 use serde::Serialize;
 use std::{
@@ -23,6 +27,7 @@ Example: rdocs2md "report.pdf" -o "report.md"
   --stdout                 Write the document, or JSON Lines for multiple inputs
   --format md|html|json|csv  Select output format (default: md); csv needs a workbook
   --mode semantic|layout|hybrid   Markdown rendering mode (default: hybrid)
+  --layout flow|document         HTML page layout (default: flow)
   --pages RANGE            Select 1-based section indexes, e.g. 1-3,5
   --slides, --sheets, --chapters, --range   Aliases for --pages
   --sheet NAME|NUMBER      Select workbook sheets by title or 1-based number (repeatable; xls, xlsx, ods)
@@ -52,6 +57,7 @@ struct Args {
     stdout: bool,
     format: String,
     mode: String,
+    html_layout: HtmlLayout,
     range: Option<String>,
     sheets: Vec<String>,
     recursive: bool,
@@ -70,6 +76,7 @@ fn parse(args: Vec<String>) -> Result<Args> {
     let mut query = None;
     let mut case_sensitive = false;
     let mut limit = None;
+    let mut layout = None;
     let mut it = args.into_iter();
     while let Some(s) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("missing value for {s}"));
@@ -99,6 +106,7 @@ fn parse(args: Vec<String>) -> Result<Args> {
             "--timeout" => a.timeout = Some(val()?.parse()?),
             "--format" => a.format = val()?,
             "--mode" => a.mode = val()?,
+            "--layout" => layout = Some(val()?),
             "--range" | "--pages" | "--slides" | "--sheets" | "--chapters" => {
                 a.range = Some(val()?)
             }
@@ -131,8 +139,9 @@ fn parse(args: Vec<String>) -> Result<Args> {
             || a.meta.is_some()
             || a.extract_images
             || a.include_images
+            || layout.is_some()
         {
-            return Err("--search writes JSON to stdout and cannot be combined with conversion destinations or image options".into());
+            return Err("--search writes JSON to stdout and cannot be combined with conversion destinations, image options or --layout".into());
         }
         a.query = Some(search::Query::new(
             &query,
@@ -142,6 +151,7 @@ fn parse(args: Vec<String>) -> Result<Args> {
     } else if case_sensitive || limit.is_some() {
         return Err("--case-sensitive and --limit require --search".into());
     }
+    a.html_layout = HtmlLayout::parse(layout.as_deref(), &a.format)?;
     Ok(a)
 }
 
@@ -247,7 +257,7 @@ fn convert(
             links = output::inline(&d, &links)?;
         }
     }
-    let text = render(&d, &a.format, &a.mode, &links)?;
+    let text = render_with_layout(&d, &a.format, &a.mode, a.html_layout, &links)?;
     if let Some(p) = meta {
         output::save(p, serde_json::to_string_pretty(&d)?.as_bytes(), false)?
     }

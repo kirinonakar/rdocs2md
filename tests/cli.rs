@@ -79,6 +79,51 @@ fn stdout_json_batch_and_input_collision() {
     assert_eq!(work.run(&["--bad"]).status.code(), Some(2));
 }
 #[test]
+fn document_layout_preserves_page_breaks_and_requires_html() {
+    let work = Scratch::new();
+    fs::write(work.path("pages.rtf"), br"{\rtf1 first\page second}").unwrap();
+    let flow = work.run(&["pages.rtf", "--format", "html", "--stdout"]);
+    assert_eq!(
+        flow.stdout,
+        work.run(&[
+            "pages.rtf",
+            "--format",
+            "html",
+            "--layout",
+            "flow",
+            "--stdout"
+        ])
+        .stdout
+    );
+    let paged = work.run(&[
+        "pages.rtf",
+        "--format",
+        "html",
+        "--layout",
+        "document",
+        "--stdout",
+    ]);
+    assert!(paged.status.success(), "{:?}", paged.stderr);
+    let html = String::from_utf8(paged.stdout).unwrap();
+    assert!(html.contains("data-rdocs-layout=\"document\""));
+    assert_eq!(html.matches("<section class=\"document-page\">").count(), 2);
+    assert!(html.contains("first</p>") && html.contains("second</p>"));
+    assert!(!html.contains("<hr class=\"page-break\">"));
+    assert_eq!(
+        work.run(&["pages.rtf", "--layout", "document"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        work.run(&["pages.rtf", "--format", "html", "--layout", "invalid"])
+            .status
+            .code(),
+        Some(2)
+    );
+}
+
+#[test]
 fn extract_raster_and_reuse_existing_result() {
     let d = Scratch::new();
     fs::write(d.path("pic.rtf"),br"{\rtf1{\pict 47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b}}").unwrap();

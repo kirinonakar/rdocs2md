@@ -1,4 +1,9 @@
-use rdocs2md::{convert, convert_range, convert_sheets, model::*, render::render, search::Query};
+use rdocs2md::{
+    convert, convert_range, convert_sheets,
+    model::*,
+    render::{HtmlLayout, render, render_with_layout},
+    search::Query,
+};
 use serde_json::{json, to_value};
 use std::io::{Cursor, Write};
 fn package(entries: &[(&str, &str)]) -> Vec<u8> {
@@ -645,6 +650,14 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     }
     let mut raw = Vec::new();
     paragraph(&mut raw, 0, "Before");
+    record(&mut raw, 71, 1, b"dces");
+    let paper: Vec<_> = [
+        59_500_u32, 84_200, 5_000, 4_000, 3_000, 2_000, 1_500, 1_500, 500, 1,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    record(&mut raw, 73, 2, &paper);
     table(&mut raw, 1, 2, 3, [510, 425, 141, 283]);
     cell(&mut raw, 2, [0, 0, 1, 2], [u16::MAX, 0, 75, u16::MAX]);
     paragraph(&mut raw, 2, "1");
@@ -671,6 +684,12 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     paragraph(&mut raw, 4, "Nested detail");
     paragraph(&mut raw, 2, "Answer continued");
     paragraph(&mut raw, 0, "After");
+    let mut line = [0_u8; 36];
+    line[8..12].copy_from_slice(&1_000_u32.to_le_bytes());
+    line[32..36].copy_from_slice(&1_u32.to_le_bytes());
+    record(&mut raw, 69, 1, &line);
+    paragraph(&mut raw, 0, "Saved page");
+    record(&mut raw, 69, 1, &line);
     let mut file = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
     let mut header = [0; 40];
     header[..17].copy_from_slice(b"HWP Document File");
@@ -699,7 +718,11 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     record(&mut info, 21, 0, &characters);
     characters[42..46].copy_from_slice(&900_u32.to_le_bytes());
     record(&mut info, 21, 0, &characters);
-    record(&mut info, 25, 0, &[12]);
+    let shape: Vec<_> = [12_u32, 1_200, 400, 250, 200, 100, 160]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    record(&mut info, 25, 0, &shape);
     file.create_stream("/DocInfo")
         .unwrap()
         .write_all(&info)
@@ -727,8 +750,8 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     assert!(text.contains("<td>Question</td><td><p>Answer</p>\n<table>"));
     assert!(text.contains("<td colspan=\"3\" rowspan=\"2\">Nested answer</td>"));
     assert!(text.contains("</table>\n<p>Answer continued</p>\n</td>"));
-    assert_eq!(text.matches("\n\n").count(), 4);
-    assert!(text.starts_with("Before\n\n<table>") && text.ends_with("After\n\n"));
+    assert_eq!(text.matches("\n\n").count(), 5);
+    assert!(text.starts_with("Before\n\n<table>") && text.ends_with("After\n\nSaved page\n\n"));
     assert!(text.contains("</table>\n\n---\n\nAfter"));
     assert!(doc.assets.is_empty());
 
@@ -758,6 +781,24 @@ fn hwp_keeps_page_breaks_merged_cells_and_nested_answers() {
     assert_eq!(html.matches("<div class=\"hwp-table-scroll\">").count(), 1);
     assert!(!html.contains("655.35pt"));
     assert!(!html.contains("height:715.73pt;"));
+    assert!(!html.contains("margin-left:6pt;"));
+    let document = render_with_layout(
+        &doc,
+        "html",
+        "hybrid",
+        HtmlLayout::Document,
+        &Properties::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        document.matches("<section class=\"document-page\"").count(),
+        3
+    );
+    assert!(document.contains("@page rdocs0 { size: 842pt 595pt; margin: 0; }"));
+    assert!(document.contains("--paper-padding:45pt 40pt 35pt 55pt"));
+    assert!(document.contains("margin-left:6pt;margin-right:2pt;text-indent:2.5pt;margin-top:1pt;margin-bottom:0.5pt;line-height:1.6;"));
+    assert!(document.contains("src=\"data:image/bmp;base64,"));
+    assert!(document.contains("rowspan=\"2\""));
     let Block::Table { rows } = &doc.sections[0].blocks[1] else {
         panic!("expected HWP table");
     };
@@ -816,6 +857,16 @@ fn hwp2_reads_kana_and_styled_table_cells() {
 
     let mut hwp = b"HWP Document File V2.00 \x1a\x01\x02\x03\x04\x05".to_vec();
     hwp.resize(30 + 128 + 1008, 0);
+    for (offset, value) in [
+        (6, 21_000_u16),
+        (8, 15_000),
+        (10, 700),
+        (12, 800),
+        (14, 900),
+        (16, 1_000),
+    ] {
+        hwp[30 + offset..32 + offset].copy_from_slice(&value.to_le_bytes());
+    }
     hwp.extend(1u16.to_le_bytes());
     hwp.extend([0; 40 + 4 * 2]);
     hwp.extend(1u16.to_le_bytes());
@@ -862,6 +913,20 @@ fn hwp2_reads_kana_and_styled_table_cells() {
     hwp.extend([0; 37]);
 
     let doc = convert(&hwp, false).unwrap();
+    let document = render_with_layout(
+        &doc,
+        "html",
+        "hybrid",
+        HtmlLayout::Document,
+        &Properties::new(),
+    )
+    .unwrap();
+    assert!(
+        document.contains(
+            "--paper-width:600pt;--paper-height:840pt;--paper-padding:28pt 40pt 32pt 36pt"
+        )
+    );
+    assert!(document.contains("<table"));
     assert!(md(&doc).starts_with("Kana ん\n\n"));
     let Block::Table { rows } = &doc.sections[0].blocks[1] else {
         panic!("expected HWP 2.00 table");
@@ -1181,6 +1246,25 @@ fn html_hwp3_restores_page_anchored_vector_pictures_and_label_positions() {
     assert!(html.contains("unicode-range: U+F0088, U+F008E, U+F0091;"));
     assert_eq!(html.matches("Label").count(), 1);
     assert!(!html.contains("[그림]"));
+    let document = render_with_layout(
+        &doc,
+        "html",
+        "hybrid",
+        HtmlLayout::Document,
+        &Properties::new(),
+    )
+    .unwrap();
+    assert!(
+        document
+            .contains("<section class=\"document-page document-canvas\" style=\"page:rdocs0;--paper-width:600pt;--paper-height:840pt\">")
+    );
+    assert_eq!(document.matches("Label").count(), 1);
+    assert_eq!(
+        document
+            .matches("href=\"data:image/svg+xml;base64,")
+            .count(),
+        2
+    );
     assert!(
         serde_json::to_string(&convert(&input, false).unwrap())
             .unwrap()

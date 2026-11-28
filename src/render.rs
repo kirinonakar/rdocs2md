@@ -421,7 +421,7 @@ fn runs(
             .or_else(|| r.mathml.as_deref().and_then(crate::latex::from_mathml))
         {
             t = if html {
-                format!("<span class=\"math\">\\({latex}\\)</span>")
+                format!("<span class=\"math\">\\({}\\)</span>", escape(&latex))
             } else {
                 format!("${latex}$")
             };
@@ -1335,10 +1335,135 @@ fn page_divider(out: &mut String, html: bool) {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum HtmlLayout {
+    #[default]
+    Flow,
+    Document,
+}
+
+impl HtmlLayout {
+    pub fn parse(value: Option<&str>, format: &str) -> Result<Self> {
+        match value {
+            None => Ok(Self::Flow),
+            Some(_) if format != "html" => Err("HTML layout requires format html".into()),
+            Some("flow") => Ok(Self::Flow),
+            Some("document") => Ok(Self::Document),
+            Some(_) => Err("HTML layout must be flow or document".into()),
+        }
+    }
+}
+
+const DOCUMENT_CSS: &str = r#"
+body:has(> .rdocs-document) { margin: 0; background: #f4f6f8; }
+.rdocs-document > article { max-width: none; padding: 28px 16px 44px; min-width: min-content; font: 11pt/1.5 "Segoe UI", "Malgun Gothic", Arial, sans-serif; }
+.rdocs-document[data-format="hwp"] > article { font-family: HwpCompatibility, "Segoe UI", "Malgun Gothic", Arial, sans-serif; }
+.rdocs-document .document-page {
+    box-sizing: border-box;
+    display: flow-root;
+    width: var(--paper-width, 210mm);
+    min-height: var(--paper-height, 297mm);
+    margin: 0 auto 24px;
+    padding: var(--paper-padding, 20mm);
+    background: #fff;
+    color: #111827;
+    outline: 1px solid #d8dee8;
+    box-shadow: 0 18px 44px rgba(15, 23, 42, .12);
+}
+.rdocs-document .document-page > p { margin: 0 0 .72em; }
+.rdocs-document[data-format="hwp"] .document-page > p { margin: 0; }
+.rdocs-document .document-canvas { min-height: 0; padding: 0; }
+.rdocs-document .document-canvas > .source-page { margin: 0; }
+.rdocs-document .document-canvas > :not(.source-page) { margin-inline: 20mm; }
+@media (prefers-color-scheme: dark) {
+    body:has(> .rdocs-document) { background: #15171b; }
+    .rdocs-document .document-page { outline-color: #3a424f; }
+}
+@media print {
+    body:has(> .rdocs-document) { background: #fff; }
+    .rdocs-document > article { padding: 0; min-width: 0; }
+    .rdocs-document .document-page { margin: 0 auto; outline: 0; box-shadow: none; max-width: 100%; min-height: calc(var(--paper-height, 297mm) - 1px); }
+    .rdocs-document .document-canvas { min-height: 0; }
+    .rdocs-document .document-canvas > .source-page { max-height: calc(var(--paper-height) - 1px); }
+    .rdocs-document .document-page + .document-page { break-before: page; }
+    .rdocs-document .hwp-table-scroll { overflow: visible; }
+}
+@page { size: A4; margin: 0; }
+"#;
+
+struct DocumentPages {
+    enabled: bool,
+    open: bool,
+    rule: usize,
+}
+
+impl DocumentPages {
+    fn start(&mut self, out: &mut String, paper: Option<&DocumentPaper>) -> Result<()> {
+        if self.enabled && !self.open {
+            out.push_str("<section class=\"document-page\"");
+            if let Some(paper) = paper {
+                let [width, height] = paper.size.map(|n| f64::from(n) / 100.);
+                let [top, right, bottom, left] = paper.padding.map(|n| f64::from(n) / 100.);
+                write!(
+                    out,
+                    " style=\"page:rdocs{};--paper-width:{width}pt;--paper-height:{height}pt;--paper-padding:{top}pt {right}pt {bottom}pt {left}pt\"",
+                    self.rule
+                )?;
+            }
+            out.push_str(">\n");
+            self.open = true;
+        }
+        Ok(())
+    }
+
+    fn end(&mut self, out: &mut String) {
+        if self.open {
+            out.push_str("</section>\n");
+            self.open = false;
+        }
+    }
+
+    fn canvas(
+        &mut self,
+        out: &mut String,
+        [width, height]: [f64; 2],
+        keep_open: bool,
+        render: impl FnOnce(&mut String) -> Result<()>,
+    ) -> Result<()> {
+        if self.enabled {
+            self.end(out);
+            writeln!(
+                out,
+                "<section class=\"document-page document-canvas\" style=\"page:rdocs{};--paper-width:{width}pt;--paper-height:{height}pt\">",
+                self.rule
+            )?;
+            self.open = true;
+        }
+        render(out)?;
+        if !keep_open {
+            self.end(out);
+        }
+        Ok(())
+    }
+}
+
 pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> Result<String> {
+    render_with_layout(doc, format, mode, HtmlLayout::Flow, links)
+}
+
+pub fn render_with_layout(
+    doc: &Document,
+    format: &str,
+    mode: &str,
+    layout: HtmlLayout,
+    links: &Properties,
+) -> Result<String> {
     crate::limits::check_request()?;
     if !matches!(mode, "semantic" | "layout" | "hybrid") {
         return Err("mode must be semantic, layout or hybrid".into());
+    }
+    if layout == HtmlLayout::Document && format != "html" {
+        return Err("HTML layout requires format html".into());
     }
     if format == "csv" {
         return csv(doc);
@@ -1367,9 +1492,19 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         links
     };
     let mut out = String::new();
+    let mut document_pages = DocumentPages {
+        enabled: layout == HtmlLayout::Document,
+        open: false,
+        rule: 0,
+    };
     if html {
+        if document_pages.enabled {
+            out.push_str("<!doctype html>\n<html>\n<head>\n");
+        } else {
+            out.push_str("<!doctype html>\n");
+        }
         out.push_str(concat!(
-            "<!doctype html>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<style>\n",
+            "<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<style>\n",
             "article { box-sizing: border-box; max-width: 76rem; margin-inline: auto; padding: 1.25rem; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; font-size: 16px; line-height: 1.5; overflow-wrap: break-word; print-color-adjust: exact; -webkit-print-color-adjust: exact; }\n",
             "article hr.page-break { border: 0; border-top: 1px dotted #777; margin-block: 1em; }\n",
             "article table { border-collapse: collapse; max-width: 100%; margin-block: 0.5em; font: inherit; }\n",
@@ -1397,11 +1532,46 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                 "article .source-line { font-family: HwpCompatibility, Batang, 'Malgun Gothic', serif; }\n",
             ));
         }
-        out.push_str("</style>\n<article>\n");
+        if document_pages.enabled {
+            out.push_str(DOCUMENT_CSS);
+            for (index, section) in doc.sections.iter().enumerate() {
+                let size = section
+                    .document_paper
+                    .as_ref()
+                    .map(|paper| paper.size.map(|n| f64::from(n) / 100.))
+                    .or_else(|| {
+                        section
+                            .slide_layout
+                            .as_ref()
+                            .map(|slide| slide.size.map(|px| px * 0.75))
+                    })
+                    .or_else(|| {
+                        section
+                            .hwp3_layout
+                            .as_ref()
+                            .map(|layout| layout.paper.map(|n| f64::from(n) / 25.))
+                    });
+                if let Some([width, height]) = size {
+                    writeln!(
+                        out,
+                        "@page rdocs{index} {{ size: {width}pt {height}pt; margin: 0; }}"
+                    )?;
+                }
+            }
+            writeln!(
+                out,
+                "</style>\n</head>\n<body>\n<main class=\"page rdocs-document\" data-rdocs-layout=\"document\" data-format=\"{}\">",
+                escape(&doc.format)
+            )?;
+        } else {
+            out.push_str("</style>\n");
+        }
+        out.push_str("<article>\n");
     }
     let mut next_slide_number = 0;
     for (i, s) in doc.sections.iter().enumerate() {
         crate::limits::check_request()?;
+        document_pages.rule = i;
         let hwp3 = doc.format == "hwp" && s.source == "document";
         let table_style = if !html {
             TableStyle::Markdown
@@ -1418,7 +1588,9 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         } else {
             None
         };
-        if i > 0 && !out.is_empty() {
+        let paper = s.document_paper.as_ref();
+        let hwp5 = s.hwp5_layout.as_ref().filter(|_| document_pages.enabled);
+        if !document_pages.enabled && i > 0 && !out.is_empty() {
             page_divider(&mut out, html);
         }
         // Warnings travel as a separate block, so a page that stopped early or
@@ -1436,18 +1608,24 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         if let Some(anchor) = s.properties.get("anchor") {
             writeln!(out, "<a id=\"{}\"></a>\n", escape(anchor))?;
         }
+        let slide = s.slide_layout.as_ref().filter(|_| html);
+        let document_canvas = document_pages.enabled && slide.is_some();
         if let Some(number) = slide_number {
             if html {
-                writeln!(
-                    out,
-                    "<p class=\"slide-number\"><strong>Slide {number}</strong></p>"
-                )?;
+                if !document_canvas {
+                    document_pages.start(&mut out, paper)?;
+                    writeln!(
+                        out,
+                        "<p class=\"slide-number\"><strong>Slide {number}</strong></p>"
+                    )?;
+                }
             } else {
                 writeln!(out, "**Slide {number}**\n")?;
             }
         }
-        if !s.title.is_empty() {
+        if !s.title.is_empty() && !document_canvas {
             if html {
+                document_pages.start(&mut out, paper)?;
                 writeln!(out, "<h1>{}</h1>", escape(&s.title))?
             } else {
                 let title = MarkdownEscaper::new(&s.title, MarkdownContext::Heading, &[])
@@ -1455,9 +1633,10 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                 writeln!(out, "# {title}\n")?
             }
         }
-        let slide = s.slide_layout.as_ref().filter(|_| html);
         if let Some(slide) = slide {
-            pptx_slide(&mut out, slide, &s.blocks, links)?;
+            document_pages.canvas(&mut out, slide.size.map(|px| px * 0.75), false, |out| {
+                pptx_slide(out, slide, &s.blocks, links)
+            })?;
         }
         let mut placed_frames = slide
             .into_iter()
@@ -1502,20 +1681,33 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         for (index, block) in s.blocks.iter().enumerate() {
             crate::limits::check_request()?;
             let page_break = block.is_page_break();
-            if page_break {
+            if page_break || hwp5.is_some_and(|layout| layout.page_starts.contains(&index)) {
                 html_lists.finish(&mut out)?;
                 blank_lines = 0;
                 previous_pdf_line = None;
                 in_list = false;
                 list_indents.clear();
-                page_divider(&mut out, html);
+                if document_pages.enabled {
+                    document_pages.end(&mut out);
+                } else {
+                    page_divider(&mut out, html);
+                }
             }
             while pages
                 .peek()
                 .is_some_and(|(_, page)| page.first_block <= index)
             {
                 let (paper, page) = pages.next().unwrap();
-                hwp3_page(&mut out, paper, page, links)?;
+                if document_pages.enabled {
+                    html_lists.finish(&mut out)?;
+                }
+                // Any blocks that could not be positioned still belong to this paper.
+                document_pages.canvas(
+                    &mut out,
+                    paper.map(|n| f64::from(n) / 25.),
+                    true,
+                    |out| hwp3_page(out, paper, page, links),
+                )?;
             }
             while padding.peek().is_some_and(|range| range.end <= index) {
                 padding.next();
@@ -1563,6 +1755,7 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
             if !matches!(block, Block::Paragraph { list: Some(_), .. }) {
                 html_lists.finish(&mut out)?;
             }
+            document_pages.start(&mut out, paper)?;
             match block {
                 Block::Paragraph {
                     heading,
@@ -1629,11 +1822,15 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
                         } else {
                             "p".into()
                         };
-                        let attrs = paragraph_css(
+                        let mut attrs = paragraph_css(
                             properties,
                             mode == "layout" || html,
                             (mode == "layout").then_some(left),
                         )?;
+                        if let Some(css) = hwp5.and_then(|layout| layout.paragraph_css.get(&index))
+                        {
+                            attrs.push_str(css);
+                        }
                         let dir = direction(properties);
                         if let Some(list) = list {
                             let value = html_lists.item(&mut out, list, properties, hwp3)?;
@@ -1793,14 +1990,20 @@ pub fn render(doc: &Document, format: &str, mode: &str, links: &Properties) -> R
         html_lists.finish(&mut out)?;
         markdown_blank_lines(&mut out, blank_lines);
         for (paper, page) in pages {
-            hwp3_page(&mut out, paper, page, links)?;
+            document_pages.canvas(&mut out, paper.map(|n| f64::from(n) / 25.), true, |out| {
+                hwp3_page(out, paper, page, links)
+            })?;
         }
+        document_pages.end(&mut out);
         if out.len() > EXPANSION_LIMIT {
             return Err("rendered document exceeds output limit".into());
         }
     }
     if html {
-        out.push_str("</article>\n")
+        out.push_str("</article>\n");
+        if document_pages.enabled {
+            out.push_str("</main>\n</body>\n</html>\n");
+        }
     }
     Ok(out)
 }

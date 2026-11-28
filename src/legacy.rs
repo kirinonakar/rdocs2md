@@ -2,7 +2,9 @@ use crate::{formatting, model::*};
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet},
+    fmt::Write as _,
     io::{Cursor, Read, Seek, SeekFrom},
+    sync::Arc,
 };
 mod word_format;
 mod word_lists;
@@ -159,8 +161,53 @@ fn hwp_record<'a>(raw: &mut &'a [u8]) -> Result<HwpRecord<'a>> {
 #[derive(Default)]
 struct HwpFormatting {
     borders: Vec<Properties>,
-    paragraphs: Vec<u32>,
+    paragraphs: Vec<HwpParagraphStyle>,
     characters: Vec<Style>,
+}
+
+struct HwpParagraphStyle {
+    flags: u32,
+    css: Option<Arc<str>>,
+}
+
+impl HwpParagraphStyle {
+    fn read(data: &[u8]) -> Self {
+        let flags =
+            u32le(data, 0).unwrap_or_else(|_| u32::from(data.first().copied().unwrap_or(0)));
+        let mut css = String::new();
+        for (name, offset, divisor) in [
+            ("margin-left", 4, 200.),
+            ("margin-right", 8, 200.),
+            ("text-indent", 12, 100.),
+            ("margin-top", 16, 200.),
+            ("margin-bottom", 20, 200.),
+        ] {
+            if let Ok(raw) = u32le(data, offset) {
+                let pt = f64::from(raw as i32) / divisor;
+                if pt.abs() <= 1000. {
+                    let _ = write!(css, "{name}:{pt}pt;");
+                }
+            }
+        }
+        let (kind, spacing) = if let (Ok(kind), Ok(spacing)) = (u32le(data, 46), u32le(data, 50)) {
+            (kind & 31, spacing)
+        } else {
+            (flags & 3, u32le(data, 24).unwrap_or_default())
+        };
+        match (kind, spacing) {
+            (0, 50..=1000) => {
+                let _ = write!(css, "line-height:{};", f64::from(spacing) / 100.);
+            }
+            (1, 1..=100_000) => {
+                let _ = write!(css, "line-height:{}pt;", f64::from(spacing) / 100.);
+            }
+            _ => {}
+        }
+        Self {
+            flags,
+            css: (!css.is_empty()).then(|| Arc::from(css)),
+        }
+    }
 }
 
 fn hwp_color(bytes: &[u8]) -> String {
@@ -258,11 +305,7 @@ impl HwpFormatting {
                     });
                 }
                 25 if styles.paragraphs.len() <= u16::MAX as usize => {
-                    styles.paragraphs.push(
-                        u32le(record.data, 0).unwrap_or_else(|_| {
-                            u32::from(record.data.first().copied().unwrap_or(0))
-                        }),
-                    );
+                    styles.paragraphs.push(HwpParagraphStyle::read(record.data));
                 }
                 _ => {}
             }
@@ -504,8 +547,9 @@ fn hwp_block<'a>(
                         ..
                     } = &mut block
                         && let Ok(index) = u16le(record.data, 8)
-                        && let Some(&flags) = styles.paragraphs.get(usize::from(index))
+                        && let Some(shape) = styles.paragraphs.get(usize::from(index))
                     {
+                        let flags = shape.flags;
                         let align = match (flags >> 2) & 7 {
                             0 | 4 | 5 => Some("justify"),
                             1 => Some("left"),
@@ -653,6 +697,26 @@ fn hwp_images(
     Ok(())
 }
 
+fn hwp_paper(data: &[u8]) -> Option<DocumentPaper> {
+    let unit = |offset| u32le(data, offset).ok();
+    let mut size = [unit(0)?, unit(4)?];
+    let flags = unit(36)?;
+    if flags & 1 != 0 {
+        size.swap(0, 1);
+    }
+    let mut left = unit(8)?;
+    let right = unit(12)?;
+    let mut top = unit(16)?.checked_add(unit(24)?)?;
+    let bottom = unit(20)?.checked_add(unit(28)?)?;
+    let gutter = unit(32)?;
+    if flags >> 1 & 3 == 2 {
+        top = top.checked_add(gutter)?;
+    } else {
+        left = left.checked_add(gutter)?;
+    }
+    DocumentPaper::new(size, [top, right, bottom, left])
+}
+
 fn hwp(ole: &mut Ole, images: bool, range: Option<&SectionRange>) -> Result<Document> {
     let head = stream(ole, "/FileHeader")?;
     if !head.starts_with(b"HWP Document File") || head.get(35) != Some(&5) {
@@ -700,9 +764,50 @@ fn hwp(ole: &mut Ole, images: bool, range: Option<&SectionRange>) -> Result<Docu
             Some(hwp_record(&mut remaining))
         })
         .peekable();
+        let mut layout = Hwp5Layout::default();
         while let Some(record) = records.next() {
-            hwp_block(&mut records, record?, 0, &mut sec.blocks, &styles)?;
+            let record = record?;
+            if sec.document_paper.is_none() && record.tag == 73 && record.level == 2 {
+                sec.document_paper = hwp_paper(record.data);
+            }
+            let first_block = sec.blocks.len();
+            hwp_block(&mut records, record, 0, &mut sec.blocks, &styles)?;
+            if record.tag != 66 || record.level != 0 {
+                continue;
+            }
+            let paragraph = first_block
+                + usize::from(
+                    sec.blocks
+                        .get(first_block)
+                        .is_some_and(Block::is_page_break),
+                );
+            if paragraph < sec.blocks.len()
+                && let Ok(id) = u16le(record.data, 8)
+                && let Some(css) = styles
+                    .paragraphs
+                    .get(usize::from(id))
+                    .and_then(|shape| shape.css.as_ref())
+            {
+                layout.paragraph_css.insert(paragraph, Arc::clone(css));
+            }
+            // Bit 0 marks the first line of a saved page. Only use the first
+            // segment of a top-level paragraph, never a line inside a table cell.
+            if first_block > 0
+                && first_block == paragraph
+                && !sec.blocks[first_block - 1].is_page_break()
+                && records.peek().is_some_and(|next| {
+                    next.as_ref().is_ok_and(|line| {
+                        line.tag == 69
+                            && line.level == 1
+                            && u32le(line.data, 8).is_ok_and(|height| height > 0)
+                            && u32le(line.data, 32).is_ok_and(|flags| flags & 1 != 0)
+                    })
+                })
+            {
+                layout.page_starts.insert(first_block);
+            }
         }
+        sec.hwp5_layout = Some(Box::new(layout));
         doc.sections.push(sec)
     }
     if images {

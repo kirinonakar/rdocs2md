@@ -22,6 +22,7 @@ rdocs2md "book.xlsx" --format csv --sheet "Sales" -o "sales.csv"
 | `-o` / `--output PATH`, `--out-dir DIR` | Save a single file or write a batch to a directory. |
 | `--format FORMAT` | `md` (default), `html`, `json`, or `csv` for XLS/XLSX/ODS. Select one sheet for plain CSV. |
 | `--mode MODE` | Markdown rendering. `semantic` favors structure, `hybrid` (default) uses HTML for vertical or RTL text, and `layout` retains spacing and placement where supported. |
+| `--layout flow\|document` | HTML only. `flow` is the default. `document` emits paper-style pages for document viewers. |
 | `--pages RANGE` | Select 1-based inclusive units, e.g. `1-3,5`. Aliases are `--slides`, `--sheets`, `--chapters`, and `--range`. |
 | `--sheet NAME_OR_NUMBER` | Repeatable workbook sheet filter by title or 1-based number. Applies after the range. |
 | `--json PATH` | Also save the structured document as JSON. Use a directory for a batch. |

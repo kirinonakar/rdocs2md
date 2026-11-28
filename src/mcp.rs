@@ -3,7 +3,10 @@ use stdio::Progress;
 pub use stdio::{serve, serve_with_access};
 
 use crate::{
-    batch, limits, load_sheets, model::*, output, parallel, recover_document, render::render,
+    batch, limits, load_sheets,
+    model::*,
+    output, parallel, recover_document,
+    render::{HtmlLayout, render_with_layout},
     search,
 };
 use serde::Serialize;
@@ -104,6 +107,7 @@ fn definitions(root: &Path, allow_outside_root: bool) -> Vec<Value> {
                 "description":"CSV requires XLS, XLSX or ODS."
             });
             props["mode"] = json!({"type":"string","enum":["semantic","hybrid","layout"]});
+            props["layout"] = json!({"type":"string","enum":["flow","document"],"default":"flow","description":"Page layout for HTML output."});
             props["extract_images"] = json!({"type":"boolean"});
             props["include_images"] = json!({"type":"boolean","description":"Keep images embedded in HTML when exporting copies."});
             props["image_dir"] =
@@ -385,6 +389,7 @@ fn document_bytes(d: &Document) -> usize {
 struct Conversion<'a> {
     format: &'a str,
     mode: &'a str,
+    layout: HtmlLayout,
     range: Option<&'a str>,
     sheet: Option<&'a str>,
     inline_images: bool,
@@ -425,7 +430,7 @@ impl Conversion<'_> {
         if self.inline_images && !links.is_empty() {
             links = output::inline(document, &links)?;
         }
-        render(document, self.format, self.mode, &links)
+        render_with_layout(document, self.format, self.mode, self.layout, &links)
     }
 
     fn validate_output(&self, out: &Path) -> Result<()> {
@@ -673,6 +678,7 @@ fn call(
     let conversion = Conversion {
         format,
         mode: text("mode").unwrap_or("hybrid"),
+        layout: HtmlLayout::parse(text("layout"), format)?,
         range: text("range"),
         sheet: text("sheet"),
         // Inlining only applies to HTML; other formats keep plain file links.

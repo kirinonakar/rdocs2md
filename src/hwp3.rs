@@ -92,14 +92,16 @@ pub fn parse(data: &[u8], images: bool) -> Result<Document> {
             doc.metadata.insert("title".into(), title.trim().into());
         }
     }
+    let paper = Paper::read(info);
+    let mut section = Section::new("section", "document");
+    section.document_paper = paper.as_ref().and_then(|paper| paper.document_paper(info));
     let mut state = ParseState {
         char_shape_size,
         version3: font_groups == 7,
         images,
-        paper: if images { Paper::read(info) } else { None },
+        paper: paper.filter(|_| images),
         ..ParseState::default()
     };
-    let mut section = Section::new("section", "document");
     section.blocks = paragraph_list(&mut cursor, 0, &mut state)?;
     state.read_embedded_pictures(&mut cursor)?;
     classify_paragraphs(&mut section.blocks);
@@ -133,6 +135,18 @@ impl Paper {
         let left = get(14)?;
         let top = get(10)? + get(18)?;
         (size[0] > left && size[1] > top).then_some(Self { size, left, top })
+    }
+
+    fn document_paper(&self, info: &[u8]) -> Option<DocumentPaper> {
+        let right = i32::from(read_u16_at(info, 16).ok()?);
+        let bottom =
+            i32::from(read_u16_at(info, 12).ok()?) + i32::from(read_u16_at(info, 20).ok()?);
+        // HWP 2/3 uses 1/1800 inch, or four hundredths of a point.
+        let to_hundredths = |n: i32| n as u32 * 4;
+        DocumentPaper::new(
+            self.size.map(to_hundredths),
+            [self.top, right, bottom, self.left].map(to_hundredths),
+        )
     }
 }
 

@@ -201,7 +201,35 @@ pub struct Section {
     pub hwp3_layout: Option<Hwp3Layout>,
     #[serde(skip)]
     #[doc(hidden)]
+    pub document_paper: Option<DocumentPaper>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub hwp5_layout: Option<Box<Hwp5Layout>>,
+    #[serde(skip)]
+    #[doc(hidden)]
     pub slide_layout: Option<SlideLayout>,
+}
+
+#[derive(Default)]
+pub struct Hwp5Layout {
+    pub(crate) paragraph_css: BTreeMap<usize, std::sync::Arc<str>>,
+    pub(crate) page_starts: std::collections::BTreeSet<usize>,
+}
+
+pub struct DocumentPaper {
+    pub(crate) size: [u32; 2],
+    // Top, right, bottom, left, in hundredths of a point.
+    pub(crate) padding: [u32; 4],
+}
+
+impl DocumentPaper {
+    pub(crate) fn new(size: [u32; 2], padding: [u32; 4]) -> Option<Self> {
+        let [top, right, bottom, left] = padding;
+        (size.iter().all(|n| (1_000..=1_000_000).contains(n))
+            && left.saturating_add(right) < size[0]
+            && top.saturating_add(bottom) < size[1])
+            .then_some(Self { size, padding })
+    }
 }
 
 pub struct SlideLayout {
